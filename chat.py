@@ -856,16 +856,29 @@ def _try_parse_text_tool_calls(text: str) -> list[dict] | None:
     if not calls:
         return None
 
-    # Guard against false positives: if significant prose surrounds the tool call
-    # patterns, the model is probably *describing* a call, not making one.
-    # Strip all detected markup and check what's left.
-    residual = text
-    residual = _re.sub(r'<tool_call>.*?</tool_call>', '', residual, flags=_re.DOTALL)
-    residual = _re.sub(r'<function=\w+>.*?</function>', '', residual, flags=_re.DOTALL)
-    residual = _re.sub(r'<function=\w+>(?:\s*<parameter=\w+>[^<\n]*\n?)+', '', residual)
-    residual = _re.sub(r'<think>.*?</think>', '', residual, flags=_re.DOTALL)
-    if len(residual.strip()) > 120:
-        # Too much non-tool-call text — treat the whole response as prose
+    # Gate 1 — tool name validation.
+    # Every parsed name must be a real tool. This is the strongest guard: a false
+    # positive requires prose that uses <function=exact_real_tool_name> syntax, which
+    # is very unlikely compared to generic description of tools.
+    known = {t["function"]["name"] for t in TOOLS}
+    if not all(c["function"]["name"] in known for c in calls):
+        return None
+
+    # Gate 2 — trailing text check.
+    # Strip thinking blocks, find the end of the last matched pattern, and check
+    # what follows. Prose BEFORE the first call is fine (intro sentence). Prose
+    # AFTER the last call means the model is describing, not calling.
+    body = _re.sub(r'<think>.*?</think>', '', text, flags=_re.DOTALL)
+    last_end = 0
+    for pattern in (
+        r'<tool_call>.*?</tool_call>',
+        r'<function=\w+>.*?</function>',
+        r'<function=\w+>(?:\s*<parameter=\w+>[^<\n]*\n?)+',
+    ):
+        for m in _re.finditer(pattern, body, _re.DOTALL):
+            last_end = max(last_end, m.end())
+    after = body[last_end:].strip() if last_end else ""
+    if len(after) > 80:
         return None
 
     return calls
