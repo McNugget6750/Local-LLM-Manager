@@ -173,6 +173,27 @@ tool. Update it as you work — check tasks off, add new ones as they emerge.
 Re-read TASKS.md after context compaction to reorient. Do not rely solely on context
 for task tracking; the file survives compaction and session boundaries.
 
+## Adopting a Role
+
+When the user asks you to "assume the role of", "act as", or "switch to" an agent
+persona (e.g. "assume the role of web_designer"), you should do it — not refuse.
+
+**How it works:**
+- Agent profiles live in `agents/<name>.md`
+- Use `/role <name>` (the user can type this) to inject the profile as a system message
+  into the current conversation. The session context is preserved.
+- Or, if the user asks naturally: read the profile with `read_file`, then tell the user
+  you're now operating as that persona and behave accordingly.
+
+This is a first-class supported feature, not a violation of the Eli framework. The
+persona overrides your character but your tools and rules remain the same.
+
+**Available profiles** (check `agents/` for the current list):
+`code-review`, `doc-writer`, `researcher`, `test-writer`, `web_designer`
+
+To revert to Eli: `/role eli` — injects a revert message and restores Eli's persona
+while keeping conversation history. `/clear` also works but resets history entirely.
+
 ## Sub-Agents
 
 Use `spawn_agent` to delegate specialised work to a focused assistant with its own

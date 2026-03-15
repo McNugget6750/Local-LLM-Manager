@@ -2589,6 +2589,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                     "[bold]/cd \\[path\\][/bold]             Set working directory for bash commands",
                     "[bold]/pwd[/bold]                   Show current working directory",
                     "[bold]/model \\[id\\][/bold]             Switch model or list available models",
+                    "[bold]/role \\[name\\][/bold]            Adopt an agent persona in the current session",
                     "[bold]/config[/bold]                Show loaded eli.toml project config",
                     "[bold]/skills[/bold]                List available skills",
                     "[bold]/skill <name> \\[args\\][/bold]   Invoke a skill explicitly",
@@ -2780,6 +2781,60 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
             console.print(Panel("\n".join(lines), title="Models", border_style="cyan"))
         except Exception as e:
             console.print(f"[dim]Current: {session.model}  ({e})[/dim]")
+        return True
+
+    elif name == "/role":
+        agents_dir = Path(__file__).parent / "agents"
+        if len(parts) < 2:
+            profiles = sorted(p.stem for p in agents_dir.glob("*.md")) if agents_dir.exists() else []
+            if profiles:
+                lines = ["[bold cyan]eli[/bold cyan]  [dim](default — revert to Eli)[/dim]"]
+                lines += [f"[bold magenta]{p}[/bold magenta]" for p in profiles]
+                lines.append("\n[dim]Usage: /role <name>  — adopt this persona in the current session[/dim]")
+                console.print(Panel("\n".join(lines), title="Agent Profiles", border_style="magenta"))
+            else:
+                console.print("[dim]No agent profiles found in agents/[/dim]")
+            return True
+        role_name = parts[1].lower().replace("-", "_")
+
+        # "eli" reverts to the base system prompt
+        if role_name == "eli":
+            session.messages.append({
+                "role": "system",
+                "content": (
+                    "[Role Revert — Eli]\n\n"
+                    "Discard any previous role overrides. You are Eli again, operating under "
+                    "your original system instructions. Conversation context is preserved."
+                ),
+            })
+            console.print(Panel(
+                "Reverted to [bold cyan]Eli[/bold cyan].\n"
+                "[dim]Conversation context preserved.[/dim]",
+                border_style="cyan",
+            ))
+            return True
+
+        agent_file = agents_dir / f"{role_name}.md"
+        if not agent_file.exists():
+            agent_file = agents_dir / f"{parts[1].lower()}.md"
+        if not agent_file.exists():
+            console.print(f"[yellow]No profile found: agents/{role_name}.md — try /role with no args to list[/yellow]")
+            return True
+        profile = agent_file.read_text(encoding="utf-8")
+        session.messages.append({
+            "role": "system",
+            "content": (
+                f"[Role Override — {role_name}]\n\n"
+                f"The user has asked you to adopt the following agent persona for the remainder of "
+                f"this conversation. Read and embody it fully. Your tools and capabilities remain "
+                f"unchanged. Continue the current conversation context.\n\n{profile}"
+            ),
+        })
+        console.print(Panel(
+            f"Persona loaded: [bold magenta]{role_name}[/bold magenta]\n"
+            f"[dim]Profile injected as system message. Conversation context preserved.[/dim]",
+            border_style="magenta",
+        ))
         return True
 
     elif name == "/config":
