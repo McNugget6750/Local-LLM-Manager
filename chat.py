@@ -65,6 +65,71 @@ def _load_memory() -> str | None:
         return mem.read_text(encoding="utf-8")
     return None
 
+def _load_commands() -> dict:
+    """Load model profiles from commands.json. Skips meta keys (starting with _)."""
+    commands_file = Path(__file__).parent / "commands.json"
+    if not commands_file.exists():
+        return {}
+    try:
+        data = json.loads(commands_file.read_text(encoding="utf-8"))
+        return {k: v for k, v in data.items() if not k.startswith("_") and isinstance(v, list)}
+    except Exception:
+        return {}
+
+async def _find_active_profile() -> tuple[str, list] | None:
+    """Query running server for its model path, match to a commands.json profile."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"{BASE_URL}/v1/models", timeout=5)
+        if r.status_code != 200:
+            return None
+        model_id = r.json()["data"][0]["id"]
+        base = Path(__file__).parent
+        for name, cmd in _load_commands().items():
+            try:
+                idx = cmd.index("-m")
+                mp = (base / cmd[idx + 1]).resolve()
+                if mp == Path(model_id).resolve() or Path(cmd[idx + 1]).name == Path(model_id).name:
+                    return name, cmd
+            except (ValueError, IndexError):
+                pass
+    except Exception:
+        pass
+    return None
+
+async def _switch_server(cmd: list, label: str, timeout: int = 120) -> bool:
+    """Kill llama-server, start new instance, poll /health until ready."""
+    console.print(f"[dim yellow]  Stopping current server...[/dim yellow]")
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         "Stop-Process -Name llama-server -Force -ErrorAction SilentlyContinue"],
+        capture_output=True,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    await asyncio.sleep(2)
+
+    console.print(f"[dim yellow]  Starting {label}...[/dim yellow]")
+    subprocess.Popen(
+        cmd,
+        cwd=str(Path(__file__).parent),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+
+    for i in range(timeout):
+        await asyncio.sleep(1)
+        try:
+            async with httpx.AsyncClient() as probe:
+                r = await probe.get(f"{BASE_URL}/health", timeout=2)
+                if r.status_code == 200:
+                    console.print(f"[dim green]  Ready after {i + 1}s[/dim green]")
+                    return True
+        except Exception:
+            pass
+    console.print(f"[red]  Server failed to start within {timeout}s[/red]")
+    return False
+
 def _build_initial_messages() -> list[dict]:
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     memory = _load_memory()
@@ -358,8 +423,11 @@ TOOLS = [
                 "The agent has its own message history and tool-use loop. "
                 "Results are returned as a string. Use this to delegate specialized "
                 "work (code review, documentation, research, test writing) to a "
-                "focused assistant. Profile names: code-review, doc-writer, "
-                "researcher, test-writer."
+                "focused assistant. Agent profiles: code-review, doc-writer, "
+                "researcher, test-writer, web_designer. "
+                "Optionally specify a model profile name from commands.json to run "
+                "the agent on a different model — the server switches automatically "
+                "and restores the original model when the agent finishes."
             ),
             "parameters": {
                 "type": "object",
@@ -388,6 +456,14 @@ TOOLS = [
                     "max_iterations": {
                         "type": "integer",
                         "description": "Max tool-use iterations (default 10, hard max 10).",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "Optional model profile name from commands.json to use for this agent. "
+                            "The server switches to this model before the agent runs and restores "
+                            "the original model afterward. Profile names match the keys in commands.json."
+                        ),
                     },
                 },
                 "required": ["system_prompt", "task"],
@@ -1591,6 +1667,7 @@ class ChatSession:
                     args.get("tools"),
                     args.get("think_level"),
                     min(args.get("max_iterations", 10), 10),
+                    args.get("model"),
                 )
             else:
                 return f"[unknown tool: {name}]"
@@ -1604,6 +1681,7 @@ class ChatSession:
         tools: list[str] | None = None,
         think_level: str | None = None,
         max_iterations: int = 10,
+        model: str | None = None,
     ) -> str:
         """Run an isolated sub-agent loop and return its final text response."""
         if self._in_subagent:
@@ -1623,6 +1701,29 @@ class ChatSession:
 
         think = think_level or self.think_level
         max_iter = min(max_iterations, 10)
+
+        # ── Model switch ──────────────────────────────────────────────────────
+        restore_cmd: list | None = None
+        restore_label: str = "original model"
+        if model:
+            commands = _load_commands()
+            if model not in commands:
+                available = ", ".join(f'"{k}"' for k in commands) or "(none — commands.json missing or empty)"
+                return f"[error: model profile '{model}' not found in commands.json. Available: {available}]"
+            target_cmd = commands[model]
+            # Capture what's running now so we can restore it
+            active = await _find_active_profile()
+            if active:
+                restore_label, restore_cmd = active
+            console.print(Panel(
+                f"[yellow]Switching server to:[/yellow] {model}\n"
+                f"[dim]Will restore '{restore_label}' after agent finishes.[/dim]",
+                title="[yellow]Model Switch[/yellow]",
+                border_style="yellow",
+            ))
+            ready = await _switch_server(target_cmd, model)
+            if not ready:
+                return f"[error: server failed to start model '{model}' — agent aborted]"
 
         messages: list[dict] = [
             {"role": "system", "content": system_prompt},
@@ -1832,6 +1933,17 @@ class ChatSession:
                     break
         finally:
             self._in_subagent = False
+            if model and restore_cmd:
+                console.print(Panel(
+                    f"[dim]Restoring server: {restore_label}[/dim]",
+                    title="[yellow]Model Restore[/yellow]",
+                    border_style="yellow",
+                ))
+                await _switch_server(restore_cmd, restore_label)
+            elif model and not restore_cmd:
+                console.print(
+                    "[dim yellow]  Note: could not identify original model — server left on '{model}'[/dim yellow]"
+                )
 
         if self.compact_mode and final_text:
             first_line = final_text.split("\n")[0][:120]
