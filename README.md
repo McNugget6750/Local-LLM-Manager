@@ -2,14 +2,14 @@
 
 A local LLM chat CLI + server manager GUI for [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (a high-performance fork of llama.cpp).
 
-Includes **Eli** — a coding assistant persona with tool use, sub-agents, plan mode, slash commands, and persistent memory.
+Includes **Eli** — a coding assistant persona with tool use, sub-agents, agent queues, vision analysis, plan mode, slash commands, and persistent memory.
 
 ---
 
 ## What this is
 
-- **`server_manager.py`** — Tkinter GUI for launching and monitoring llama-server instances. Tracks t/s, VRAM, GPU load, RAM. Supports multiple named model profiles loaded from `commands.json`.
-- **`chat.py`** — Terminal chat client (Eli). Connects to a running llama-server, supports tool use (bash, file read/write/edit, glob, grep, web search/fetch), slash commands, plan mode, and sub-agents.
+- **`server_manager.py`** — Tkinter GUI for launching and monitoring llama-server instances. Tracks t/s, VRAM, GPU load, RAM, and CPU in real time. Supports multiple named model profiles loaded from `commands.json`. Includes a loopback control API so Eli can switch models automatically.
+- **`chat.py`** — Terminal chat client (Eli). Connects to a running llama-server, supports tool use, slash commands, plan mode, sub-agents, agent queues, and image analysis via a local vision model.
 
 ---
 
@@ -43,7 +43,7 @@ copy USER_PROFILE.example.md USER_PROFILE.md
 :: Start server manager GUI
 run.bat
 
-:: Start Eli chat (in a separate terminal, after server is running)
+:: Start Eli chat — or click "Open Chat" in the GUI once a model is loaded
 chat.bat
 ```
 
@@ -58,6 +58,10 @@ run.bat
 ```
 
 Opens the GUI. Select a model profile, click **Start**. The GUI monitors t/s, VRAM, GPU, RAM, and CPU in real time. Add new model profiles with **+ Add Model** — they are saved to `commands.json`.
+
+Once a server is running, click **Open Chat** to launch Eli in a new terminal.
+
+The server manager also exposes a loopback control API on port 1235. Eli uses this to switch models automatically when running agents on different model profiles — the GUI stays in sync with start/stop state throughout.
 
 ### Eli chat CLI
 
@@ -75,15 +79,67 @@ Connects to `http://localhost:1234` by default. Type naturally or use slash comm
 | `/commit` | Generate a conventional commit message |
 | `/review <file>` | Spawn code-review sub-agent on a file |
 | `/research <topic>` | Spawn researcher sub-agent |
-| `/model` | List or switch models |
+| `/queue-results [label]` | List recent agent queue runs or show one by label |
+| `/model` | List available model profiles |
 | `/config` | Show loaded eli.toml config |
 | `/cd <path>` | Change working directory |
+| `/think [off\|on\|deep]` | Set thinking level |
+| `/compact` | Summarise older messages to free context |
+| `/status` | Show token usage and context window info |
 
 **Keyboard shortcuts:**
 
 - `Ctrl+C` — cancel current response (stays in session)
 - `Ctrl+D` — exit
 - `Shift+Tab` — toggle plan mode (Eli plans but doesn't execute)
+- `Ctrl+O` — toggle compact mode (collapse thinking/tool output)
+
+---
+
+## Model switching
+
+Eli knows which model profiles are available at startup — descriptions, strengths, weaknesses, and speed are injected from `commands.json` as a system message. Eli can switch models automatically before spawning a sub-agent and restores the original model when done.
+
+The switch goes through the Server Manager control API, so all logging, UI state, and Stop button behaviour remain correct.
+
+---
+
+## Agent queues
+
+Eli can run a sequence of agents — each with its own task, model, and time budget — without manual intervention:
+
+```
+Queue two agents:
+  1. researcher on the fast model — "what are the tradeoffs of MoE quantization?" (120s)
+  2. code-review on the high-quality model — "review _tool_queue_agents in chat.py" (240s)
+```
+
+Model switches between agents are skipped when consecutive agents share the same model. The original model is restored after the entire queue completes. Results are written to `sessions/queue_{ts}_{label}/results.json` and browsable with `/queue-results`.
+
+---
+
+## Vision
+
+Eli can analyse images using a local vision-language model. The vision model runs on the same port as text models — the server switches automatically, processes all queued images, then restores the text model.
+
+```
+Eli, analyse these screenshots and tell me which UI layout looks cleaner.
+```
+
+For batch processing, pass multiple image paths in one call — the model loads once and processes them all before restoring.
+
+**`commands.json` vision config:**
+
+```json
+{
+  "_meta": {
+    "vision_url": "http://192.168.x.x:1234",
+    "vision_external": false
+  }
+}
+```
+
+Set `vision_external: true` if your vision model runs on a separate machine — Eli will call it directly without switching the local server.
 
 ---
 
@@ -91,14 +147,27 @@ Connects to `http://localhost:1234` by default. Type naturally or use slash comm
 
 ### `commands.json` (gitignored)
 
-Model profiles for the server manager. Copy from `commands.example.json` and add your own:
+Model profiles for the server manager, plus optional metadata. Copy from `commands.example.json`:
 
 ```json
 {
-  "Qwen3-30B  ·  237 t/s  ·  Q4_K_M": [
-    "C:\\path\\to\\llama-server.exe",
-    "-m", "C:\\path\\to\\model.gguf",
-    "-ngl", "999", "-c", "128000",
+  "_meta": {
+    "vision_url": "http://192.168.x.x:1234",
+    "vision_external": false,
+    "profiles": {
+      "My Model  ·  ?? t/s  ·  Notes": {
+        "description": "One-line description.",
+        "strengths": "What it excels at",
+        "weaknesses": "What to avoid",
+        "speed": "~?? t/s",
+        "vision": false
+      }
+    }
+  },
+  "My Model  ·  ?? t/s  ·  Notes": [
+    "path/to/llama-server.exe",
+    "-m", "path/to/model.gguf",
+    "-ngl", "999", "-c", "32768",
     "-ctk", "q4_1", "-ctv", "q4_1",
     "--no-mmap", "--jinja",
     "-b", "4096", "-ub", "4096", "-t", "16",
@@ -107,6 +176,8 @@ Model profiles for the server manager. Copy from `commands.example.json` and add
   ]
 }
 ```
+
+Profile metadata (description, strengths, weaknesses, speed) is injected into Eli's context at startup so he can make informed model-selection decisions.
 
 ### `eli.toml` (gitignored)
 
@@ -142,6 +213,7 @@ Sub-agents are spawned by Eli for specialized tasks. Profiles live in `agents/`:
 | `doc-writer` | Write docstrings or README sections |
 | `researcher` | Research a library, API, or technical question |
 | `test-writer` | Write unit tests |
+| `web_designer` | UI/UX and web design feedback |
 
 ---
 
