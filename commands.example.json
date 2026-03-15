@@ -1,6 +1,7 @@
 {
   "_meta": {
-    "vision_url": "http://localhost:1236",
+    "vision_url": "http://192.168.x.x:1234",
+    "vision_external": false,
     "profiles": {
       "My Model  ·  ?? t/s  ·  Notes": {
         "description": "One-line description of this model and quantization.",

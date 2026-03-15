@@ -103,15 +103,18 @@ def _get_gpu_stats():
 
 
 
+PREFERRED_MODEL = "Qwen3-Coder-Next  \u00b7  Q6_K  \u00b7  128k ctx"
+
 def _load_models():
     if os.path.exists(COMMANDS_FILE):
         try:
             with open(COMMANDS_FILE) as f:
                 saved = json.load(f)
-            models = dict(MODELS_DEFAULT)
-            for k, v in saved.items():
-                models[k] = v
-            return models
+            # Only keep list entries with non-_ keys (skips _meta and similar)
+            models = {k: v for k, v in saved.items()
+                      if not k.startswith("_") and isinstance(v, list)}
+            if models:
+                return models
         except Exception:
             pass
     return dict(MODELS_DEFAULT)
@@ -205,7 +208,8 @@ class ServerManager(tk.Tk):
         self._small_btn(sel_hdr, "＋ Add Model", "#1a5c3a",
                         self._add_model).pack(side="right")
 
-        self._model_var = tk.StringVar(value=list(self._models.keys())[0])
+        _default = PREFERRED_MODEL if PREFERRED_MODEL in self._models else list(self._models.keys())[0]
+        self._model_var = tk.StringVar(value=_default)
         self._combo = ttk.Combobox(sel, textvariable=self._model_var,
                                    values=list(self._models.keys()),
                                    state="readonly", font=("Segoe UI", 9))
@@ -246,7 +250,10 @@ class ServerManager(tk.Tk):
         self._btn_stop = self._btn(btns, "■  Stop", "#c0392b", self._stop_server)
         self._btn_stop.pack(side="left", padx=(0, 6))
         self._btn_stop.config(state="disabled")
-        self._btn(btns, "⟳  Check Now", "#1a6fa3", self._check_now).pack(side="left")
+        self._btn(btns, "⟳  Check Now", "#1a6fa3", self._check_now).pack(side="left", padx=(0, 6))
+        self._btn_chat = self._btn(btns, "💬  Open Chat", "#5a3a7e", self._open_chat)
+        self._btn_chat.pack(side="left")
+        self._btn_chat.config(state="disabled")
 
         # Status card — left: model stats  |  right: system stats
         card = tk.Frame(self, bg=PANEL, padx=14, pady=10)
@@ -645,6 +652,7 @@ class ServerManager(tk.Tk):
         self._external = False
         self._btn_start.config(state="normal")
         self._btn_stop.config(state="disabled")
+        self._btn_chat.config(state="disabled")
         self._combo.config(state="readonly")
         self._lbl_dot.config(fg=RED)
         self._lbl_status.config(text="  Stopped")
@@ -656,6 +664,7 @@ class ServerManager(tk.Tk):
     def _set_running(self):
         self._lbl_dot.config(fg=GREEN)
         self._lbl_status.config(text="  Running")
+        self._btn_chat.config(state="normal")
 
     def _read_proc(self):
         for line in self._proc.stdout:
@@ -817,6 +826,7 @@ class ServerManager(tk.Tk):
             self._lbl_dot.config(fg=GREEN)
             self._lbl_status.config(text="  Running (external)")
             self._btn_stop.config(state="normal")
+            self._btn_chat.config(state="normal")
             self._log_put(f"Detected running server: {result['model']}", "beat")
             self._schedule_heartbeat()
         else:
@@ -938,6 +948,16 @@ class ServerManager(tk.Tk):
 
         srv = http.server.HTTPServer(("127.0.0.1", CONTROL_PORT), _Handler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    # ── Open Chat ────────────────────────────────────────────────────────────
+    def _open_chat(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        chat_bat = os.path.join(here, "chat.bat")
+        subprocess.Popen(
+            ["cmd", "/c", "start", "cmd", "/k", chat_bat],
+            cwd=here,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
 
     # ── Close ────────────────────────────────────────────────────────────────
     def _on_close(self):

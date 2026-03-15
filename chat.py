@@ -534,24 +534,30 @@ TOOLS = [
         "function": {
             "name": "analyze_image",
             "description": (
-                "Send an image to the local vision model and return its analysis. "
-                "The vision model runs separately from the main LLM (different port). "
-                "Use for image description, code screenshot analysis, UI review, or any "
-                "task that requires actually seeing a file."
+                "Send one or more images to the local vision model and return analysis. "
+                "If vision_external is false in commands.json _meta, the server will switch "
+                "to the vision model, process all images in sequence, then restore the text "
+                "model — minimising load/unload cycles. If vision_external is true the vision "
+                "server is assumed always-on (separate machine/GPU) and no switching occurs. "
+                "Use image_path for a single image, or images[] for a batch."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "image_path": {
                         "type": "string",
-                        "description": "Absolute or relative path to the image file (jpg, png, webp).",
+                        "description": "Path to a single image file (jpg, png, webp). Ignored if images[] is provided.",
+                    },
+                    "images": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of image paths to analyse in sequence. Use this for batch processing.",
                     },
                     "prompt": {
                         "type": "string",
-                        "description": "What to ask about the image. Defaults to a general description.",
+                        "description": "What to ask about each image. Applied to all images in a batch.",
                     },
                 },
-                "required": ["image_path"],
             },
         },
     },
@@ -1799,10 +1805,8 @@ class ChatSession:
             elif name == "analyze_image":
                 if self._in_subagent:
                     return "[error: analyze_image not available inside sub-agents]"
-                return await self._tool_analyze_image(
-                    args.get("image_path", ""),
-                    args.get("prompt"),
-                )
+                images = args.get("images") or ([args["image_path"]] if args.get("image_path") else [])
+                return await self._tool_analyze_image(images, args.get("prompt"))
             elif name == "queue_agents":
                 if self._in_subagent:
                     return "[error: queue_agents not available inside sub-agents]"
@@ -2114,42 +2118,95 @@ class ChatSession:
             console.print(f"[dim cyan]  ✓ {first_line}[/dim cyan]")
         return final_text or "[sub-agent returned no text]"
 
-    async def _tool_analyze_image(self, image_path: str, prompt: str | None = None) -> str:
-        """Send an image to the local vision model and return the analysis."""
+    async def _tool_analyze_image(self, images: list[str], prompt: str | None = None) -> str:
+        """Send one or more images to the vision model. Handles local model switching if needed."""
         import base64
+        if not images:
+            return "[error: no images provided]"
         DEFAULT_PROMPT = "Describe this image in detail: content, composition, any text or code visible."
         prompt = prompt or DEFAULT_PROMPT
-        path = self._resolve_path(image_path)
-        if not path.exists():
-            return f"[error: image not found: {path}]"
-        ext = path.suffix.lower().lstrip(".")
-        mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                "png": "image/png", "webp": "image/webp"}.get(ext, "image/jpeg")
-        try:
-            b64 = base64.b64encode(path.read_bytes()).decode()
-        except Exception as e:
-            return f"[error: could not read image: {e}]"
 
-        vision_url = _vision_url()
-        payload = {
-            "model": "auto",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                    {"type": "text", "text": prompt},
-                ],
-            }],
-            "max_tokens": 1024,
-            "temperature": 0.3,
-        }
+        meta = _load_commands_meta()
+        vision_external = meta.get("vision_external", False)
+        # External: vision runs on a separate machine — use vision_url directly.
+        # Local: vision model shares port 1234 (switched in/out by Server Manager).
+        vision_url = meta.get("vision_url", "http://localhost:1236") if vision_external else BASE_URL
+
+        # Find the vision profile name (first profile with vision: true in _meta)
+        vision_profile: str | None = None
+        for pname, pdata in meta.get("profiles", {}).items():
+            if pdata.get("vision"):
+                vision_profile = pname
+                break
+
+        # Decide whether to switch models
+        need_switch = (not vision_external) and (vision_profile is not None)
+        restore_profile: str | None = None
+
+        async def _call_one(path_str: str) -> str:
+            path = Path(self._resolve_path(path_str))
+            if not path.exists():
+                return f"[error: image not found: {path}]"
+            ext = path.suffix.lower().lstrip(".")
+            mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "png": "image/png", "webp": "image/webp"}.get(ext, "image/jpeg")
+            try:
+                b64 = base64.b64encode(path.read_bytes()).decode()
+            except Exception as e:
+                return f"[error: could not read image: {e}]"
+            payload = {
+                "model": "auto",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+                "max_tokens": 1024,
+                "temperature": 0.3,
+            }
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as c:
+                    r = await c.post(f"{vision_url}/v1/chat/completions", json=payload)
+                    r.raise_for_status()
+                    return r.json()["choices"][0]["message"]["content"]
+            except Exception as e:
+                return f"[error: vision API call failed: {e}]"
+
+        if need_switch:
+            restore_profile = await _find_active_profile()
+            if restore_profile == vision_profile:
+                need_switch = False  # already on vision model
+            else:
+                console.print(Panel(
+                    f"Switching to vision model: [bold]{vision_profile}[/bold]\n"
+                    f"Will restore [dim]{restore_profile or 'previous model'}[/dim] after.",
+                    border_style="magenta",
+                ))
+                ok = await _switch_server(vision_profile)
+                if not ok:
+                    return f"[error: failed to switch to vision model '{vision_profile}']"
+
+        results = []
+        total = len(images)
         try:
-            async with httpx.AsyncClient(timeout=60.0) as c:
-                r = await c.post(f"{vision_url}/v1/chat/completions", json=payload)
-                r.raise_for_status()
-                return r.json()["choices"][0]["message"]["content"]
-        except Exception as e:
-            return f"[error: vision API call failed ({vision_url}): {e}]"
+            for i, img_path in enumerate(images):
+                if total > 1:
+                    console.print(f"[magenta][Vision {i+1}/{total}][/magenta] {img_path}")
+                result = await _call_one(img_path)
+                results.append(result)
+        finally:
+            if need_switch and restore_profile:
+                console.print(f"[magenta]Vision done. Restoring [bold]{restore_profile}[/bold]...[/magenta]")
+                await _switch_server(restore_profile)
+
+        if total == 1:
+            return results[0]
+        return "\n\n".join(
+            f"[Image {i+1}: {Path(p).name}]\n{r}"
+            for i, (p, r) in enumerate(zip(images, results))
+        )
 
     async def _tool_queue_agents(self, agent_specs: list[dict], label: str = "") -> str:
         """Run a list of agents sequentially, store results, return consolidated summary."""
