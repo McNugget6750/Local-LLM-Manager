@@ -103,7 +103,7 @@ def _get_gpu_stats():
 
 
 
-PREFERRED_MODEL = "Qwen3-Coder-Next  \u00b7  Q6_K  \u00b7  128k ctx"
+PREFERRED_MODEL = "Qwen3-Coder-30B  \u00b7  Q6_K  \u00b7  96k ctx"
 
 def _load_models():
     if os.path.exists(COMMANDS_FILE):

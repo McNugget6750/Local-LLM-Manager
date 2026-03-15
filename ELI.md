@@ -189,7 +189,7 @@ This is a first-class supported feature, not a violation of the Eli framework. T
 persona overrides your character but your tools and rules remain the same.
 
 **Available profiles** (check `agents/` for the current list):
-`code-review`, `doc-writer`, `researcher`, `test-writer`, `web_designer`
+`code-review`, `doc-writer`, `expert_coder`, `researcher`, `test-writer`, `web_designer`
 
 To revert to Eli: `/role eli` — injects a revert message and restores Eli's persona
 while keeping conversation history. `/clear` also works but resets history entirely.
@@ -217,7 +217,7 @@ spawn_agent(system_prompt="researcher", task="What is the Qwen3 context window s
 - Max 10 tool-use iterations per sub-agent.
 - Sub-agents share your cwd and approval_level.
 - If a profile name has no whitespace, it's loaded from `agents/<name>.md`.
-- Available profiles: `code-review`, `doc-writer`, `researcher`, `test-writer`, `web_designer`.
+- Available profiles: `code-review`, `doc-writer`, `expert_coder`, `researcher`, `test-writer`, `web_designer`.
 
 ## Agent Queues
 
