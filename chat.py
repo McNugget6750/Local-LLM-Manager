@@ -853,7 +853,22 @@ def _try_parse_text_tool_calls(text: str) -> list[dict] | None:
                     "function": {"name": name, "arguments": json.dumps(args)},
                 })
 
-    return calls if calls else None
+    if not calls:
+        return None
+
+    # Guard against false positives: if significant prose surrounds the tool call
+    # patterns, the model is probably *describing* a call, not making one.
+    # Strip all detected markup and check what's left.
+    residual = text
+    residual = _re.sub(r'<tool_call>.*?</tool_call>', '', residual, flags=_re.DOTALL)
+    residual = _re.sub(r'<function=\w+>.*?</function>', '', residual, flags=_re.DOTALL)
+    residual = _re.sub(r'<function=\w+>(?:\s*<parameter=\w+>[^<\n]*\n?)+', '', residual)
+    residual = _re.sub(r'<think>.*?</think>', '', residual, flags=_re.DOTALL)
+    if len(residual.strip()) > 120:
+        # Too much non-tool-call text — treat the whole response as prose
+        return None
+
+    return calls
 
 # ── Tool executors ────────────────────────────────────────────────────────────
 def _is_dangerous(command: str) -> bool:
