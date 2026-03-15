@@ -1,0 +1,882 @@
+#!/usr/bin/env python3
+"""
+Qwen3 Server Manager
+Desktop UI for managing ik_llama.cpp server instances.
+"""
+
+import tkinter as tk
+from tkinter import ttk
+import subprocess, threading, queue, json, datetime, shlex, os, re, collections, ctypes
+import urllib.request, urllib.error
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+BINARY      = "llama-server"  # override: add your llama-server path to commands.json
+PORT        = 1234
+URL         = f"http://localhost:{PORT}"
+HB_INTERVAL   = 300    # full heartbeat every 5 min
+MAX_LOG_LINES = 8000   # trim log when it exceeds this many lines
+COMMANDS_FILE = os.path.join(os.path.dirname(__file__), "commands.json")
+
+MODELS_DEFAULT = {
+    "My Model  ·  ?? t/s  ·  Notes": [
+        BINARY,
+        "-m", r"C:\path\to\model.gguf",
+        "-ngl", "999", "-c", "32768",
+        "-ctk", "q4_1", "-ctv", "q4_1",
+        "--no-mmap", "--jinja",
+        "-b", "4096", "-ub", "4096", "-t", "16",
+        "--parallel", "1",
+        "--port", str(PORT), "--host", "0.0.0.0",
+    ],
+}
+
+_DEFAULT_NEW_CMD = [
+    BINARY, "-m", r"C:\path\to\model.gguf",
+    "-ngl", "999", "--n-cpu-moe", "22", "-c", "81920",
+    "-ctk", "q4_1", "-ctv", "q4_1", "--no-mmap", "--jinja",
+    "-b", "4096", "-ub", "4096", "-t", "16",
+    "--parallel", "2",
+    "--port", str(PORT), "--host", "0.0.0.0",
+]
+
+_RE_PRE_TIMING   = re.compile(
+    r'prompt eval time\s*=\s*([\d.]+)\s*ms\s*/\s*(\d+)\s*tokens.*?([\d.]+)\s*tokens per second', re.I)
+_RE_GEN_TIMING   = re.compile(
+    r'eval time\s*=\s*([\d.]+)\s*ms\s*/\s*(\d+)\s*tokens.*?([\d.]+)\s*tokens per second', re.I)
+_RE_TOTAL_TIMING = re.compile(r'total time\s*=\s*([\d.]+)\s*ms', re.I)
+
+# ── Colours ────────────────────────────────────────────────────────────────────
+BG     = "#1e1e1e"
+PANEL  = "#252526"
+BORDER = "#3e3e42"
+FG     = "#d4d4d4"
+FG_DIM = "#808080"
+GREEN  = "#4ec9b0"
+RED    = "#f44747"
+YELLOW = "#dcdcaa"
+BLUE   = "#569cd6"
+PURPLE = "#c678dd"
+LOG_BG = "#0d0d0d"
+GRAPH_FILL = "#0a2520"   # dark teal fill under curve
+
+# ── System stats helpers (stdlib only) ────────────────────────────────────────
+class _MEMSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength",                ctypes.c_ulong),
+        ("dwMemoryLoad",            ctypes.c_ulong),
+        ("ullTotalPhys",            ctypes.c_ulonglong),
+        ("ullAvailPhys",            ctypes.c_ulonglong),
+        ("ullTotalPageFile",        ctypes.c_ulonglong),
+        ("ullAvailPageFile",        ctypes.c_ulonglong),
+        ("ullTotalVirtual",         ctypes.c_ulonglong),
+        ("ullAvailVirtual",         ctypes.c_ulonglong),
+        ("sullAvailExtendedVirtual",ctypes.c_ulonglong),
+    ]
+
+def _get_ram():
+    """Returns (used_gb, total_gb, pct) via Windows GlobalMemoryStatusEx."""
+    stat = _MEMSTATUSEX()
+    stat.dwLength = ctypes.sizeof(stat)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+    total = stat.ullTotalPhys / 1024**3
+    used  = (stat.ullTotalPhys - stat.ullAvailPhys) / 1024**3
+    return used, total, stat.dwMemoryLoad
+
+def _get_gpu_stats():
+    """Returns (vram_used_mib, vram_total_mib, gpu_load_pct, gpu_power_w, gpu_temp_c)
+    via nvidia-smi, or (None, None, None, None, None) on failure."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=memory.used,memory.total,utilization.gpu,power.draw,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if r.returncode == 0:
+            parts = [p.strip() for p in r.stdout.strip().split(",")]
+            return int(parts[0]), int(parts[1]), int(parts[2]), float(parts[3]), int(parts[4])
+    except Exception:
+        pass
+    return None, None, None, None, None
+
+
+
+def _load_models():
+    if os.path.exists(COMMANDS_FILE):
+        try:
+            with open(COMMANDS_FILE) as f:
+                saved = json.load(f)
+            models = dict(MODELS_DEFAULT)
+            for k, v in saved.items():
+                models[k] = v
+            return models
+        except Exception:
+            pass
+    return dict(MODELS_DEFAULT)
+
+
+def _save_models(models):
+    with open(COMMANDS_FILE, "w") as f:
+        json.dump(models, f, indent=2)
+
+
+def _cmd_to_str(cmd: list) -> str:
+    parts = []
+    i = 0
+    while i < len(cmd):
+        arg = cmd[i]
+        if arg.startswith("-") and i + 1 < len(cmd) and not cmd[i + 1].startswith("-"):
+            parts.append(f"{arg} {cmd[i+1]}")
+            i += 2
+        else:
+            parts.append(arg)
+            i += 1
+    return " \\\n  ".join(parts)
+
+
+def _str_to_cmd(s: str) -> list:
+    cleaned = s.replace("\\\n", " ").replace("\\\r\n", " ")
+    return shlex.split(cleaned, posix=False)
+
+
+# ── App ────────────────────────────────────────────────────────────────────────
+class ServerManager(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Qwen3 Server Manager")
+        self.configure(bg=BG)
+        self.geometry("760x940")
+        self.minsize(660, 740)
+
+        self._models   = _load_models()
+        self._proc     = None
+        self._log_q    = queue.Queue()
+        self._running  = False
+        self._external = False
+        self._hb_after = None
+        self._cd_after = None
+        self._hb_secs  = 0
+        self._tps_gen  = 0.0
+        self._tps_pre  = 0.0
+
+        # Rolling graph data (main thread only, max 100 points)
+        self._graph_data = collections.deque(maxlen=100)
+
+        # CPU usage tracking — delta between successive GetSystemTimes calls
+        self._cpu_prev_idle  = 0
+        self._cpu_prev_total = 0
+
+        # Accumulator for the 3-line timing block (background thread only)
+        self._pend_pre_tps = 0.0
+        self._pend_pre_n   = 0
+        self._pend_pre_ms  = 0.0
+        self._pend_gen_tps = 0.0
+        self._pend_gen_n   = 0
+        self._pend_gen_ms  = 0.0
+
+        self._build_ui()
+        self._poll_log()
+        self._startup_probe()
+        self._poll_sysinfo()
+
+    # ── UI ──────────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        self._style_ttk()
+
+        # Header
+        hdr = tk.Frame(self, bg=PANEL, padx=14, pady=10)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="Qwen3 Server Manager", bg=PANEL, fg=FG,
+                 font=("Segoe UI", 13, "bold")).pack(side="left")
+        tk.Label(hdr, text=f"port {PORT}", bg=PANEL, fg=FG_DIM,
+                 font=("Segoe UI", 9)).pack(side="right", padx=4)
+
+        # Model selector
+        sel = tk.Frame(self, bg=BG, padx=14, pady=8)
+        sel.pack(fill="x")
+
+        sel_hdr = tk.Frame(sel, bg=BG)
+        sel_hdr.pack(fill="x")
+        tk.Label(sel_hdr, text="Model", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 8)).pack(side="left", anchor="w")
+        self._small_btn(sel_hdr, "＋ Add Model", "#1a5c3a",
+                        self._add_model).pack(side="right")
+
+        self._model_var = tk.StringVar(value=list(self._models.keys())[0])
+        self._combo = ttk.Combobox(sel, textvariable=self._model_var,
+                                   values=list(self._models.keys()),
+                                   state="readonly", font=("Segoe UI", 9))
+        self._combo.pack(fill="x", pady=(3, 0))
+        self._combo.bind("<<ComboboxSelected>>", self._on_model_change)
+
+        # Command preview
+        cmd_frame = tk.Frame(self, bg=BG, padx=14, pady=4)
+        cmd_frame.pack(fill="x")
+
+        cmd_hdr = tk.Frame(cmd_frame, bg=BG)
+        cmd_hdr.pack(fill="x")
+        tk.Label(cmd_hdr, text="Start Command", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 8, "bold")).pack(side="left", anchor="w")
+        cmd_btns = tk.Frame(cmd_hdr, bg=BG)
+        cmd_btns.pack(side="right")
+        self._small_btn(cmd_btns, "Save Changes",    "#1a6fa3", self._save_command).pack(side="left", padx=(0, 4))
+        self._small_btn(cmd_btns, "Restore Default", "#555",    self._restore_default).pack(side="left")
+
+        cmd_inner = tk.Frame(cmd_frame, bg=LOG_BG, bd=1, relief="flat")
+        cmd_inner.pack(fill="x", pady=(4, 0))
+        sb_cmd = tk.Scrollbar(cmd_inner, bg=PANEL, troughcolor=BG,
+                              activebackground=BORDER, width=10, relief="flat")
+        self._cmd_text = tk.Text(cmd_inner, bg=LOG_BG, fg="#ce9178",
+                                 font=("Consolas", 8), relief="flat", bd=6,
+                                 height=6, wrap="none", yscrollcommand=sb_cmd.set,
+                                 insertbackground=FG, selectbackground="#264f78")
+        sb_cmd.config(command=self._cmd_text.yview)
+        sb_cmd.pack(side="right", fill="y")
+        self._cmd_text.pack(side="left", fill="both", expand=True)
+        self._refresh_cmd_text()
+
+        # Buttons
+        btns = tk.Frame(self, bg=BG, padx=14, pady=6)
+        btns.pack(fill="x")
+        self._btn_start = self._btn(btns, "▶  Start", "#27ae60", self._start_server)
+        self._btn_start.pack(side="left", padx=(0, 6))
+        self._btn_stop = self._btn(btns, "■  Stop", "#c0392b", self._stop_server)
+        self._btn_stop.pack(side="left", padx=(0, 6))
+        self._btn_stop.config(state="disabled")
+        self._btn(btns, "⟳  Check Now", "#1a6fa3", self._check_now).pack(side="left")
+
+        # Status card — left: model stats  |  right: system stats
+        card = tk.Frame(self, bg=PANEL, padx=14, pady=10)
+        card.pack(fill="x", padx=14, pady=(4, 4))
+
+        left = tk.Frame(card, bg=PANEL)
+        left.pack(side="left", fill="both", expand=True)
+
+        tk.Frame(card, bg=BORDER, width=1).pack(side="left", fill="y", padx=10)
+
+        right = tk.Frame(card, bg=PANEL)
+        right.pack(side="left", fill="both", expand=True)
+
+        # Left column — server/model info
+        self._lbl_dot, self._lbl_status = self._make_status_row(left, 0)
+        self._lbl_model  = self._make_label_row(left, "Running",  1, FG)
+        self._lbl_speed  = self._make_label_row(left, "Speed",    2, GREEN)
+        self._lbl_last   = self._make_label_row(left, "Last req", 3, PURPLE)
+        self._lbl_cd     = self._make_label_row(left, "Next chk", 4, FG_DIM)
+
+        # Right column — system resources
+        tk.Label(right, text="System", bg=PANEL, fg=FG_DIM,
+                 font=("Segoe UI", 8, "bold")).grid(
+                     row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self._lbl_sys_ram  = self._make_sys_row(right, "RAM",   1)
+        self._lbl_sys_vram = self._make_sys_row(right, "VRAM",  2)
+        self._lbl_sys_gpu  = self._make_sys_row(right, "GPU",   3)
+        self._lbl_sys_cpu  = self._make_sys_row(right, "CPU",   4)
+        self._lbl_sys_pwr  = self._make_sys_row(right, "Power", 5)
+
+        # t/s graph
+        graph_outer = tk.Frame(self, bg=BG, padx=14)
+        graph_outer.pack(fill="x", pady=(0, 4))
+        graph_hdr = tk.Frame(graph_outer, bg=BG)
+        graph_hdr.pack(fill="x")
+        tk.Label(graph_hdr, text="Generation t/s  (last 100 requests)",
+                 bg=BG, fg=FG_DIM, font=("Segoe UI", 8, "bold")).pack(side="left")
+        self._graph = tk.Canvas(graph_outer, bg=LOG_BG, height=90,
+                                highlightthickness=0, relief="flat")
+        self._graph.pack(fill="x", pady=(3, 0))
+        self._graph.bind("<Configure>", lambda _e: self._redraw_graph())
+
+        # Log
+        log_outer = tk.Frame(self, bg=BG, padx=14, pady=4)
+        log_outer.pack(fill="both", expand=True)
+        tk.Label(log_outer, text="Server Log", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        log_frame = tk.Frame(log_outer, bg=LOG_BG, bd=1, relief="flat")
+        log_frame.pack(fill="both", expand=True, pady=(3, 0))
+        sb = tk.Scrollbar(log_frame, bg=PANEL, troughcolor=BG,
+                          activebackground=BORDER, width=10, relief="flat")
+        self._log = tk.Text(log_frame, bg=LOG_BG, fg=FG, font=("Consolas", 8),
+                            relief="flat", bd=6, state="disabled", wrap="word",
+                            yscrollcommand=sb.set, selectbackground="#264f78",
+                            insertbackground=FG)
+        sb.config(command=self._log.yview)
+        sb.pack(side="right", fill="y")
+        self._log.pack(side="left", fill="both", expand=True)
+
+        self._log.tag_config("info",   foreground=FG_DIM)
+        self._log.tag_config("ok",     foreground=GREEN)
+        self._log.tag_config("err",    foreground=RED)
+        self._log.tag_config("beat",   foreground=BLUE)
+        self._log.tag_config("warn",   foreground=YELLOW)
+        self._log.tag_config("timing", foreground=PURPLE)
+        self._log.tag_config("ts",     foreground="#555555")
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _style_ttk(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        s.configure("TCombobox", fieldbackground=PANEL, background=PANEL,
+                    foreground=FG, selectbackground=PANEL, selectforeground=FG,
+                    bordercolor=BORDER, arrowcolor=FG_DIM, padding=6)
+        s.map("TCombobox", fieldbackground=[("readonly", PANEL)],
+              foreground=[("readonly", FG)])
+
+    @staticmethod
+    def _btn(parent, text, bg, cmd):
+        return tk.Button(parent, text=text, bg=bg, fg="white",
+                         font=("Segoe UI", 9, "bold"), relief="flat",
+                         padx=14, pady=6, cursor="hand2", command=cmd,
+                         activebackground=bg, activeforeground="white")
+
+    @staticmethod
+    def _small_btn(parent, text, bg, cmd):
+        return tk.Button(parent, text=text, bg=bg, fg=FG,
+                         font=("Segoe UI", 8), relief="flat",
+                         padx=8, pady=3, cursor="hand2", command=cmd,
+                         activebackground=bg, activeforeground="white")
+
+    def _make_status_row(self, parent, row):
+        f = tk.Frame(parent, bg=PANEL)
+        f.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
+        tk.Label(f, text="Status", bg=PANEL, fg=FG_DIM,
+                 font=("Segoe UI", 8), width=10, anchor="w").pack(side="left")
+        dot = tk.Label(f, text="●", bg=PANEL, fg=RED, font=("Segoe UI", 10))
+        dot.pack(side="left")
+        status = tk.Label(f, text="  Stopped", bg=PANEL, fg=FG, font=("Segoe UI", 9))
+        status.pack(side="left")
+        return dot, status
+
+    def _make_label_row(self, parent, label, row, fg):
+        f = tk.Frame(parent, bg=PANEL)
+        f.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
+        tk.Label(f, text=label, bg=PANEL, fg=FG_DIM,
+                 font=("Segoe UI", 8), width=10, anchor="w").pack(side="left")
+        val = tk.Label(f, text="—", bg=PANEL, fg=fg, font=("Segoe UI", 9))
+        val.pack(side="left")
+        return val
+
+    def _make_sys_row(self, parent, label, row):
+        tk.Label(parent, text=label, bg=PANEL, fg=FG_DIM,
+                 font=("Segoe UI", 8), width=6, anchor="w").grid(
+                     row=row, column=0, sticky="w", pady=1)
+        val = tk.Label(parent, text="—", bg=PANEL, fg=FG, font=("Segoe UI", 9))
+        val.grid(row=row, column=1, sticky="w", pady=1)
+        return val
+
+    # ── Graph ────────────────────────────────────────────────────────────────
+    def _redraw_graph(self):
+        c = self._graph
+        c.delete("all")
+        data = list(self._graph_data)
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w < 4 or h < 4:
+            return
+
+        PAD_L, PAD_R, PAD_T, PAD_B = 36, 8, 6, 4
+        pw = w - PAD_L - PAD_R   # plot width
+        ph = h - PAD_T - PAD_B   # plot height
+
+        # Background
+        c.create_rectangle(0, 0, w, h, fill=LOG_BG, outline="")
+
+        if not data:
+            c.create_text(w // 2, h // 2, text="no data yet",
+                          fill=FG_DIM, font=("Consolas", 8))
+            return
+
+        top = max(data) * 1.15 or 1.0
+
+        def px(i):
+            """x pixel for data index i in a window of up to 100 points."""
+            n = len(data)
+            if n == 1:
+                return PAD_L + pw // 2
+            return PAD_L + int(i * pw / (n - 1))
+
+        def py(v):
+            return PAD_T + ph - int(v / top * ph)
+
+        # Horizontal grid lines at 25 / 50 / 75 / 100 %
+        for frac in (0.25, 0.5, 0.75, 1.0):
+            gy   = PAD_T + ph - int(frac * ph)
+            gval = top * frac
+            c.create_line(PAD_L, gy, w - PAD_R, gy, fill="#1e2e2a", width=1)
+            c.create_text(PAD_L - 3, gy, text=f"{gval:.0f}",
+                          anchor="e", fill=FG_DIM, font=("Consolas", 7))
+
+        # Filled area under curve
+        if len(data) >= 2:
+            poly = [PAD_L, PAD_T + ph]
+            for i, v in enumerate(data):
+                poly += [px(i), py(v)]
+            poly += [px(len(data) - 1), PAD_T + ph]
+            c.create_polygon(poly, fill=GRAPH_FILL, outline="")
+
+        # Line
+        if len(data) == 1:
+            x0, y0 = px(0), py(data[0])
+            c.create_oval(x0 - 2, y0 - 2, x0 + 2, y0 + 2, fill=GREEN, outline="")
+        else:
+            pts = []
+            for i, v in enumerate(data):
+                pts += [px(i), py(v)]
+            c.create_line(pts, fill=GREEN, width=1, smooth=False)
+
+        # Current value label at right edge
+        last_y = py(data[-1])
+        c.create_text(w - PAD_R, last_y - 2, text=f"{data[-1]:.1f}",
+                      anchor="se", fill=GREEN, font=("Consolas", 7, "bold"))
+
+    # ── Command edit ────────────────────────────────────────────────────────
+    def _refresh_cmd_text(self):
+        name = self._model_var.get()
+        cmd  = self._models.get(name, [])
+        self._cmd_text.config(state="normal")
+        self._cmd_text.delete("1.0", "end")
+        self._cmd_text.insert("1.0", _cmd_to_str(cmd))
+
+    def _on_model_change(self, _event=None):
+        self._refresh_cmd_text()
+
+    def _save_command(self):
+        name = self._model_var.get()
+        raw  = self._cmd_text.get("1.0", "end").strip()
+        try:
+            cmd = _str_to_cmd(raw)
+        except Exception as e:
+            self._write_log(f"Parse error: {e}", "err")
+            return
+        self._models[name] = cmd
+        _save_models(self._models)
+        self._write_log(f"Saved command for: {name}", "beat")
+
+    def _restore_default(self):
+        name = self._model_var.get()
+        if name in MODELS_DEFAULT:
+            self._models[name] = list(MODELS_DEFAULT[name])
+            self._refresh_cmd_text()
+            _save_models(self._models)
+            self._write_log(f"Restored default for: {name}", "warn")
+
+    # ── Add Model dialog ─────────────────────────────────────────────────────
+    def _add_model(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Add Model")
+        dlg.configure(bg=BG)
+        dlg.geometry("700x440")
+        dlg.resizable(True, True)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="Model Name", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=14, pady=(14, 0))
+        name_var   = tk.StringVar()
+        name_entry = tk.Entry(dlg, textvariable=name_var, bg=PANEL, fg=FG,
+                              insertbackground=FG, font=("Segoe UI", 9),
+                              relief="flat", bd=6)
+        name_entry.pack(fill="x", padx=14, pady=(3, 0))
+        name_entry.focus_set()
+
+        tk.Label(dlg, text="Start Command", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=14, pady=(10, 0))
+        cmd_frame = tk.Frame(dlg, bg=LOG_BG)
+        cmd_frame.pack(fill="both", expand=True, padx=14, pady=(3, 0))
+        sb_dlg = tk.Scrollbar(cmd_frame, bg=PANEL, troughcolor=BG,
+                              activebackground=BORDER, width=10, relief="flat")
+        cmd_text = tk.Text(cmd_frame, bg=LOG_BG, fg="#ce9178",
+                           font=("Consolas", 8), relief="flat", bd=6,
+                           wrap="none", insertbackground=FG,
+                           selectbackground="#264f78",
+                           yscrollcommand=sb_dlg.set)
+        sb_dlg.config(command=cmd_text.yview)
+        sb_dlg.pack(side="right", fill="y")
+        cmd_text.pack(side="left", fill="both", expand=True)
+        cmd_text.insert("1.0", _cmd_to_str(_DEFAULT_NEW_CMD))
+
+        btn_row = tk.Frame(dlg, bg=BG)
+        btn_row.pack(fill="x", padx=14, pady=10)
+
+        def _do_add():
+            name = name_var.get().strip()
+            if not name:
+                name_entry.config(bg="#4a1a1a")
+                return
+            raw = cmd_text.get("1.0", "end").strip()
+            try:
+                cmd = _str_to_cmd(raw)
+            except Exception as e:
+                self._log_put(f"Parse error: {e}", "err")
+                return
+            self._models[name] = cmd
+            _save_models(self._models)
+            self._combo["values"] = list(self._models.keys())
+            self._model_var.set(name)
+            self._refresh_cmd_text()
+            self._write_log(f"Added model: {name}", "beat")
+            dlg.destroy()
+
+        self._btn(btn_row, "Add Model", "#27ae60", _do_add).pack(side="left", padx=(0, 6))
+        self._btn(btn_row, "Cancel", "#555555", dlg.destroy).pack(side="left")
+        dlg.bind("<Return>", lambda e: _do_add())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+    # ── Logging ─────────────────────────────────────────────────────────────
+    def _log_put(self, text, tag="info"):
+        self._log_q.put((text, tag))
+
+    def _poll_log(self):
+        try:
+            while True:
+                text, tag = self._log_q.get_nowait()
+
+                if tag == "__timing__":
+                    d       = json.loads(text)
+                    gen     = d.get("gen", 0.0)
+                    pre     = d.get("pre", 0.0)
+                    gen_n   = d.get("gen_n", 0)
+                    pre_n   = d.get("pre_n", 0)
+                    total_s = d.get("total_ms", 0.0) / 1000
+                    ctx_n   = gen_n + pre_n
+
+                    self._tps_gen = gen
+                    self._tps_pre = pre
+                    self._lbl_speed.config(
+                        text=f"gen {gen:.1f} t/s  ·  prefill {pre:.0f} t/s")
+                    self._lbl_last.config(
+                        text=f"{gen_n} tok out  ·  {ctx_n} ctx  ·  {total_s:.1f}s")
+
+                    # Update graph
+                    if gen > 0:
+                        self._graph_data.append(gen)
+                        self._redraw_graph()
+
+                    self._write_log(
+                        f"⚡ gen {gen:.1f} t/s  ·  prefill {pre:.0f} t/s"
+                        f"  ·  {gen_n} tok  ·  {total_s:.1f}s",
+                        "timing")
+                    continue
+
+                self._write_log(text, tag)
+                if "HTTP server listening" in text:
+                    self._set_running()
+                elif "model loaded" in text:
+                    self._log_put("Model loaded — waiting for HTTP…", "ok")
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_log)
+
+    def _write_log(self, text, tag="info"):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self._log.config(state="normal")
+        self._log.insert("end", f"[{ts}] ", "ts")
+        self._log.insert("end", text + "\n", tag)
+        # Keep the buffer bounded — drop oldest lines when over the cap
+        end_line = int(self._log.index("end-1c").split(".")[0])
+        if end_line > MAX_LOG_LINES:
+            self._log.delete("1.0", f"{end_line - MAX_LOG_LINES}.0")
+        self._log.config(state="disabled")
+        self._log.see("end")
+
+    # ── Server control ───────────────────────────────────────────────────────
+    def _start_server(self):
+        if self._running:
+            return
+        name = self._model_var.get()
+        raw = self._cmd_text.get("1.0", "end").strip()
+        try:
+            cmd = _str_to_cmd(raw)
+        except Exception as e:
+            self._log_put(f"Command parse error: {e}", "err")
+            return
+
+        self._log_put(f"Starting {name}", "beat")
+        self._btn_start.config(state="disabled")
+        self._combo.config(state="disabled")
+        self._lbl_status.config(text="  Loading…")
+        self._lbl_dot.config(fg=YELLOW)
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            self._running  = True
+            self._external = False
+            self._btn_stop.config(state="normal")
+            threading.Thread(target=self._read_proc, daemon=True).start()
+            self._schedule_heartbeat(45)
+        except Exception as e:
+            self._log_put(f"Failed to start: {e}", "err")
+            self._btn_start.config(state="normal")
+            self._combo.config(state="readonly")
+            self._lbl_status.config(text="  Error")
+            self._lbl_dot.config(fg=RED)
+
+    def _stop_server(self):
+        self._cancel_all_timers()
+        if self._proc:
+            self._log_put("Terminating server process…", "warn")
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+            self._proc = None
+        else:
+            self._log_put("Killing external llama-server…", "warn")
+            subprocess.run(
+                ["powershell", "-Command",
+                 "Stop-Process -Name llama-server -Force -ErrorAction SilentlyContinue"],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        self._reset_ui()
+        self._log_put("Server stopped", "err")
+
+    def _reset_ui(self):
+        self._running  = False
+        self._external = False
+        self._btn_start.config(state="normal")
+        self._btn_stop.config(state="disabled")
+        self._combo.config(state="readonly")
+        self._lbl_dot.config(fg=RED)
+        self._lbl_status.config(text="  Stopped")
+        self._lbl_model.config(text="—")
+        self._lbl_speed.config(text="—")
+        self._lbl_last.config(text="—")
+        self._lbl_cd.config(text="—")
+
+    def _set_running(self):
+        self._lbl_dot.config(fg=GREEN)
+        self._lbl_status.config(text="  Running")
+
+    def _read_proc(self):
+        for line in self._proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            if self._try_parse_tps(line):
+                continue
+            ll = line.lower()
+            if "error" in ll or "failed" in ll:
+                tag = "err"
+            elif "listening" in ll or "model loaded" in ll:
+                tag = "ok"
+            elif "warning" in ll or "warn" in ll:
+                tag = "warn"
+            else:
+                tag = "info"
+            self._log_q.put((line, tag))
+        self._log_q.put(("Process exited", "err"))
+        self.after(0, self._on_proc_exit)
+
+    def _try_parse_tps(self, line: str) -> bool:
+        """Parse timing data from a server log line.
+
+        Returns True if the line is part of the timing block (suppressed from
+        raw log; a synthesized ⚡ summary is emitted via __timing__ instead).
+        """
+        # JSON structured logging
+        try:
+            obj = json.loads(line)
+            t   = obj.get("timings", {})
+            gen = t.get("predicted_per_second", 0.0)
+            if gen > 0:
+                self._log_q.put((json.dumps({
+                    "gen":      gen,
+                    "pre":      t.get("prompt_per_second", 0.0),
+                    "gen_n":    t.get("predicted_n", 0),
+                    "pre_n":    t.get("prompt_n", 0),
+                    "total_ms": t.get("predicted_ms", 0.0) + t.get("prompt_ms", 0.0),
+                }), "__timing__"))
+                return True
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
+        # Classic 3-line block
+        if "slot print_timing" in line.lower():
+            return True
+
+        m = _RE_PRE_TIMING.search(line)
+        if m:
+            self._pend_pre_ms  = float(m.group(1))
+            self._pend_pre_n   = int(m.group(2))
+            self._pend_pre_tps = float(m.group(3))
+            return True
+
+        # _RE_GEN_TIMING also matches "prompt eval time" lines, but those
+        # were already handled above and returned — so this only runs for pure gen lines.
+        m = _RE_GEN_TIMING.search(line)
+        if m:
+            self._pend_gen_ms  = float(m.group(1))
+            self._pend_gen_n   = int(m.group(2))
+            self._pend_gen_tps = float(m.group(3))
+            return True
+
+        m = _RE_TOTAL_TIMING.search(line)
+        if m:
+            self._log_q.put((json.dumps({
+                "gen":      self._pend_gen_tps,
+                "pre":      self._pend_pre_tps,
+                "gen_n":    self._pend_gen_n,
+                "pre_n":    self._pend_pre_n,
+                "total_ms": float(m.group(1)),
+            }), "__timing__"))
+            return True
+
+        return False
+
+    def _on_proc_exit(self):
+        self._proc = None
+        self._cancel_all_timers()
+        self._reset_ui()
+
+    # ── Timers ──────────────────────────────────────────────────────────────
+    def _cancel_all_timers(self):
+        for attr in ("_hb_after", "_cd_after"):
+            h = getattr(self, attr, None)
+            if h:
+                self.after_cancel(h)
+                setattr(self, attr, None)
+
+    def _schedule_heartbeat(self, delay=HB_INTERVAL):
+        if self._hb_after:
+            self.after_cancel(self._hb_after)
+        self._hb_secs = delay
+        self._tick_countdown()
+        self._hb_after = self.after(delay * 1000, self._run_heartbeat)
+
+    def _tick_countdown(self):
+        if self._hb_secs > 0 and (self._running or self._external):
+            m, s = divmod(self._hb_secs, 60)
+            self._lbl_cd.config(text=f"{m}:{s:02d}")
+            self._hb_secs -= 1
+            self._cd_after = self.after(1000, self._tick_countdown)
+
+    # ── Full heartbeat (every 5 min) ────────────────────────────────────────
+    def _run_heartbeat(self):
+        self._log_put("Heartbeat…", "beat")
+        threading.Thread(target=self._probe_thread, args=(True,), daemon=True).start()
+
+    def _check_now(self):
+        self._cancel_all_timers()
+        self._log_put("Manual check…", "beat")
+        threading.Thread(target=self._probe_thread, args=(True,), daemon=True).start()
+
+    def _probe_thread(self, reschedule=False):
+        result = self._probe()
+        self.after(0, lambda: self._apply_probe(result, reschedule))
+
+    def _probe(self):
+        try:
+            req = urllib.request.Request(f"{URL}/v1/models")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                data = json.loads(r.read())
+            model_path  = data["data"][0]["id"] if data.get("data") else "unknown"
+            model_short = model_path.replace("\\", "/").split("/")[-1]
+            return {"ok": True, "model": model_short}
+        except urllib.error.URLError:
+            return {"ok": False, "error": "server unreachable"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def _apply_probe(self, result, reschedule=False):
+        if result["ok"]:
+            self._lbl_model.config(text=result["model"])
+            self._lbl_dot.config(fg=GREEN)
+            self._lbl_status.config(text="  Running")
+            self._log_put(f"✓  {result['model']}  ·  server alive", "ok")
+        else:
+            self._log_put(f"✗  {result.get('error', 'probe failed')}", "err")
+            if not self._running:
+                self._lbl_dot.config(fg=RED)
+                self._lbl_status.config(text="  Stopped")
+
+        if reschedule and (self._running or self._external):
+            self._schedule_heartbeat()
+
+    # ── Startup probe ────────────────────────────────────────────────────────
+    def _startup_probe(self):
+        def _go():
+            r = self._probe()
+            self.after(0, lambda: self._apply_startup(r))
+        threading.Thread(target=_go, daemon=True).start()
+
+    def _apply_startup(self, result):
+        if result["ok"]:
+            self._external = True
+            self._running  = True
+            self._lbl_model.config(text=result["model"])
+            self._lbl_dot.config(fg=GREEN)
+            self._lbl_status.config(text="  Running (external)")
+            self._btn_stop.config(state="normal")
+            self._log_put(f"Detected running server: {result['model']}", "beat")
+            self._schedule_heartbeat()
+        else:
+            self._log_put("No server detected on startup", "info")
+
+    # ── System stats polling (every 2 s) ────────────────────────────────────
+    def _poll_sysinfo(self):
+        threading.Thread(target=self._sysinfo_thread, daemon=True).start()
+
+    def _sysinfo_thread(self):
+        ram_used, ram_total, ram_pct              = _get_ram()
+        vram_used, vram_total, gpu_load, gpu_w, gpu_t = _get_gpu_stats()
+        cpu_pct                                   = self._cpu_delta()
+        self.after(0, lambda: self._apply_sysinfo(
+            ram_used, ram_total, ram_pct, vram_used, vram_total, gpu_load, cpu_pct,
+            gpu_w, gpu_t))
+        self.after(2000, self._poll_sysinfo)
+
+    def _cpu_delta(self) -> float:
+        """Compute CPU % since the last call using Windows GetSystemTimes."""
+        class _FT(ctypes.Structure):
+            _fields_ = [("lo", ctypes.c_ulong), ("hi", ctypes.c_ulong)]
+        idle, kernel, user = _FT(), _FT(), _FT()
+        ctypes.windll.kernel32.GetSystemTimes(
+            ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user))
+        def ft(s): return s.hi * 0x100000000 + s.lo
+        idle_v   = ft(idle)
+        total_v  = ft(kernel) + ft(user)   # kernel includes idle
+        d_idle   = idle_v  - self._cpu_prev_idle
+        d_total  = total_v - self._cpu_prev_total
+        self._cpu_prev_idle  = idle_v
+        self._cpu_prev_total = total_v
+        if d_total == 0:
+            return 0.0
+        return max(0.0, min(100.0, (d_total - d_idle) / d_total * 100))
+
+    def _apply_sysinfo(self, ram_used, ram_total, ram_pct,
+                       vram_used, vram_total, gpu_load, cpu_pct,
+                       gpu_w, gpu_t):
+        self._lbl_sys_ram.config(
+            text=f"{ram_used:.1f} / {ram_total:.0f} GB  ({ram_pct}%)")
+
+        if vram_used is not None:
+            vram_pct = vram_used * 100 // vram_total
+            self._lbl_sys_vram.config(
+                text=f"{vram_used:,} / {vram_total:,} MiB  ({vram_pct}%)")
+            gpu_text = f"{gpu_load}%"
+            if gpu_t is not None:
+                gpu_text += f"  ·  {gpu_t}°C"
+            self._lbl_sys_gpu.config(text=gpu_text)
+            self._lbl_sys_pwr.config(
+                text=f"{gpu_w:.0f} W" if gpu_w is not None else "—")
+
+        self._lbl_sys_cpu.config(text=f"{cpu_pct:.0f}%")
+
+    # ── Close ────────────────────────────────────────────────────────────────
+    def _on_close(self):
+        if self._running and not self._external:
+            self._stop_server()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    app = ServerManager()
+    app.mainloop()

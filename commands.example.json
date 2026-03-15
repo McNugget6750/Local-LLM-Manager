@@ -1,0 +1,14 @@
+{
+  "_readme": "Copy this to commands.json (gitignored). Add your own model profiles.",
+  "My Model  ·  ?? t/s  ·  Notes": [
+    "path/to/llama-server.exe",
+    "-m", "path/to/model.gguf",
+    "-ngl", "999",
+    "-c", "32768",
+    "-ctk", "q4_1", "-ctv", "q4_1",
+    "--no-mmap", "--jinja",
+    "-b", "4096", "-ub", "4096", "-t", "16",
+    "--parallel", "1",
+    "--port", "1234", "--host", "0.0.0.0"
+  ]
+}

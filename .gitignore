@@ -1,0 +1,23 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Local machine config — contains absolute paths with username
+commands.json
+eli.toml
+config.json
+
+# Eli's runtime state — operational, not config
+MEMORY.md
+.chat_history
+sessions/
+llama.log
+*.log
+
+# Personal user profile
+USER_PROFILE.md
+
+# Artifacts
+render_power_curve.py
