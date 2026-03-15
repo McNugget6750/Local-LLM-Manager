@@ -43,7 +43,8 @@ from rich.rule import Rule
 from rich.text import Text
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-BASE_URL = "http://localhost:1234"
+BASE_URL     = "http://localhost:1234"
+CONTROL_URL  = "http://localhost:1235"   # server_manager.py control API
 MODEL = "auto"
 
 def _load_system_prompt() -> str:
@@ -76,58 +77,70 @@ def _load_commands() -> dict:
     except Exception:
         return {}
 
-async def _find_active_profile() -> tuple[str, list] | None:
-    """Query running server for its model path, match to a commands.json profile."""
+async def _control(method: str, path: str, body: dict | None = None) -> dict | None:
+    """Call the server_manager control API. Returns parsed JSON or None on failure."""
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(f"{BASE_URL}/v1/models", timeout=5)
-        if r.status_code != 200:
-            return None
-        model_id = r.json()["data"][0]["id"]
-        base = Path(__file__).parent
-        for name, cmd in _load_commands().items():
-            try:
-                idx = cmd.index("-m")
-                mp = (base / cmd[idx + 1]).resolve()
-                if mp == Path(model_id).resolve() or Path(cmd[idx + 1]).name == Path(model_id).name:
-                    return name, cmd
-            except (ValueError, IndexError):
-                pass
+        async with httpx.AsyncClient() as c:
+            if method == "GET":
+                r = await c.get(f"{CONTROL_URL}{path}", timeout=5)
+            else:
+                r = await c.post(f"{CONTROL_URL}{path}", json=body or {}, timeout=5)
+            return r.json()
     except Exception:
-        pass
+        return None
+
+async def _find_active_profile() -> str | None:
+    """Ask server_manager which profile is currently running. Returns profile name or None."""
+    data = await _control("GET", "/api/status")
+    if data and data.get("running") and data.get("model"):
+        return data["model"]
     return None
 
-async def _switch_server(cmd: list, label: str, timeout: int = 120) -> bool:
-    """Kill llama-server, start new instance, poll /health until ready."""
-    console.print(f"[dim yellow]  Stopping current server...[/dim yellow]")
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command",
-         "Stop-Process -Name llama-server -Force -ErrorAction SilentlyContinue"],
-        capture_output=True,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
-    await asyncio.sleep(2)
+async def _switch_server(profile: str, timeout: int = 120) -> bool:
+    """Ask server_manager to switch to a named profile and wait until the server is healthy.
 
-    console.print(f"[dim yellow]  Starting {label}...[/dim yellow]")
-    subprocess.Popen(
-        cmd,
-        cwd=str(Path(__file__).parent),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
+    Flow: POST /api/stop → poll until server goes down → POST /api/start →
+          poll /health until the new model is accepting requests.
+    """
+    # 1. Stop
+    console.print(f"[dim yellow]  Requesting stop via Server Manager...[/dim yellow]")
+    result = await _control("POST", "/api/stop")
+    if result is None:
+        console.print("[red]  Server Manager not reachable on port 1235. Is it running?[/red]")
+        return False
 
+    # 2. Wait for server to go down (max 30 s)
+    for i in range(30):
+        await asyncio.sleep(1)
+        try:
+            async with httpx.AsyncClient() as probe:
+                await probe.get(f"{BASE_URL}/health", timeout=1)
+        except Exception:
+            break  # connection refused — server is down
+    else:
+        console.print("[dim yellow]  Server still up after 30 s, continuing anyway...[/dim yellow]")
+    await asyncio.sleep(1)  # brief settle
+
+    # 3. Start the requested profile
+    console.print(f"[dim yellow]  Requesting start: {profile}[/dim yellow]")
+    result = await _control("POST", "/api/start", {"profile": profile})
+    if result is None or "error" in result:
+        err = result.get("error", "unknown error") if result else "no response"
+        console.print(f"[red]  Start failed: {err}[/red]")
+        return False
+
+    # 4. Poll until healthy
     for i in range(timeout):
         await asyncio.sleep(1)
         try:
             async with httpx.AsyncClient() as probe:
                 r = await probe.get(f"{BASE_URL}/health", timeout=2)
                 if r.status_code == 200:
-                    console.print(f"[dim green]  Ready after {i + 1}s[/dim green]")
+                    console.print(f"[dim green]  Server ready after {i + 1}s[/dim green]")
                     return True
         except Exception:
             pass
-    console.print(f"[red]  Server failed to start within {timeout}s[/red]")
+    console.print(f"[red]  Server failed to become healthy within {timeout}s[/red]")
     return False
 
 def _build_initial_messages() -> list[dict]:
@@ -1703,25 +1716,21 @@ class ChatSession:
         max_iter = min(max_iterations, 10)
 
         # ── Model switch ──────────────────────────────────────────────────────
-        restore_cmd: list | None = None
-        restore_label: str = "original model"
+        restore_profile: str | None = None
         if model:
             commands = _load_commands()
             if model not in commands:
                 available = ", ".join(f'"{k}"' for k in commands) or "(none — commands.json missing or empty)"
                 return f"[error: model profile '{model}' not found in commands.json. Available: {available}]"
-            target_cmd = commands[model]
-            # Capture what's running now so we can restore it
-            active = await _find_active_profile()
-            if active:
-                restore_label, restore_cmd = active
+            # Capture what's running now so we can restore it afterward
+            restore_profile = await _find_active_profile()
             console.print(Panel(
                 f"[yellow]Switching server to:[/yellow] {model}\n"
-                f"[dim]Will restore '{restore_label}' after agent finishes.[/dim]",
+                f"[dim]Will restore '{restore_profile or 'original'}' after agent finishes.[/dim]",
                 title="[yellow]Model Switch[/yellow]",
                 border_style="yellow",
             ))
-            ready = await _switch_server(target_cmd, model)
+            ready = await _switch_server(model)
             if not ready:
                 return f"[error: server failed to start model '{model}' — agent aborted]"
 
@@ -1800,6 +1809,7 @@ class ChatSession:
                                     thinking_buf = ""
                                 text_buf += data
                                 assistant_content += data
+                                final_text = assistant_content  # keep current even if interrupted
                                 live.update(Panel(
                                     Markdown(text_buf),
                                     title="[cyan]Agent[/cyan]",
@@ -1933,17 +1943,43 @@ class ChatSession:
                     break
         finally:
             self._in_subagent = False
-            if model and restore_cmd:
-                console.print(Panel(
-                    f"[dim]Restoring server: {restore_label}[/dim]",
-                    title="[yellow]Model Restore[/yellow]",
-                    border_style="yellow",
-                ))
-                await _switch_server(restore_cmd, restore_label)
-            elif model and not restore_cmd:
-                console.print(
-                    "[dim yellow]  Note: could not identify original model — server left on '{model}'[/dim yellow]"
-                )
+            if model:
+                # Graceful wrap-up: if the agent produced no text, ask it to summarise
+                # before we pull the server out from under it.
+                if not final_text and messages and messages[-1]["role"] != "user":
+                    try:
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "You are being stopped due to a model switch. "
+                                "Please immediately summarise your findings so far in a brief response."
+                            ),
+                        })
+                        async with self.client.stream(
+                            "POST",
+                            f"{BASE_URL}/v1/chat/completions",
+                            json={"model": self.model, "messages": messages,
+                                  "stream": True, "temperature": 0.3},
+                            headers={"Accept": "text/event-stream"},
+                        ) as resp:
+                            async for ev_type, ev_data in stream_events(resp):
+                                if ev_type == "text":
+                                    final_text += ev_data
+                    except Exception:
+                        pass  # best-effort only
+
+                if restore_profile:
+                    console.print(Panel(
+                        f"[dim]Restoring server: {restore_profile}[/dim]",
+                        title="[yellow]Model Restore[/yellow]",
+                        border_style="yellow",
+                    ))
+                    await _switch_server(restore_profile)
+                else:
+                    console.print(
+                        f"[dim yellow]  Note: could not identify original model — "
+                        f"server left on '{model}'[/dim yellow]"
+                    )
 
         if self.compact_mode and final_text:
             first_line = final_text.split("\n")[0][:120]

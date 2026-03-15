@@ -7,12 +7,13 @@ Desktop UI for managing ik_llama.cpp server instances.
 import tkinter as tk
 from tkinter import ttk
 import subprocess, threading, queue, json, datetime, shlex, os, re, collections, ctypes
-import urllib.request, urllib.error
+import urllib.request, urllib.error, http.server
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-BINARY      = "llama-server"  # override: add your llama-server path to commands.json
-PORT        = 1234
-URL         = f"http://localhost:{PORT}"
+BINARY        = "llama-server"  # override: add your llama-server path to commands.json
+PORT          = 1234
+CONTROL_PORT  = 1235             # loopback-only control API for chat.py
+URL           = f"http://localhost:{PORT}"
 HB_INTERVAL   = 300    # full heartbeat every 5 min
 MAX_LOG_LINES = 8000   # trim log when it exceeds this many lines
 COMMANDS_FILE = os.path.join(os.path.dirname(__file__), "commands.json")
@@ -179,6 +180,7 @@ class ServerManager(tk.Tk):
         self._poll_log()
         self._startup_probe()
         self._poll_sysinfo()
+        self._start_control_server()
 
     # ── UI ──────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -869,6 +871,73 @@ class ServerManager(tk.Tk):
                 text=f"{gpu_w:.0f} W" if gpu_w is not None else "—")
 
         self._lbl_sys_cpu.config(text=f"{cpu_pct:.0f}%")
+
+    # ── Control API (loopback HTTP on CONTROL_PORT) ──────────────────────────
+    def _start_control_server(self):
+        """Start a tiny HTTP server on localhost:CONTROL_PORT for chat.py integration.
+
+        Endpoints:
+          GET  /api/status   → {running, model, external}
+          GET  /api/profiles → [profile names from commands.json]
+          POST /api/stop     → triggers _stop_server() on the UI thread
+          POST /api/start    → body: {"profile": "..."} — selects model and triggers _start_server()
+
+        All UI mutations are dispatched via self.after(0, ...) to stay on the Tkinter thread.
+        """
+        mgr = self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args):  # silence default stderr logging
+                pass
+
+            def _send(self, code: int, body: bytes):
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path == "/api/status":
+                    data = json.dumps({
+                        "running":  mgr._running,
+                        "model":    mgr._model_var.get() if mgr._running else None,
+                        "external": mgr._external,
+                    }).encode()
+                    self._send(200, data)
+                elif self.path == "/api/profiles":
+                    self._send(200, json.dumps(list(mgr._models.keys())).encode())
+                else:
+                    self._send(404, b'{"error":"not found"}')
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length)) if length else {}
+
+                if self.path == "/api/stop":
+                    mgr.after(0, mgr._stop_server)
+                    self._send(200, b'{"ok":true}')
+
+                elif self.path == "/api/start":
+                    profile = body.get("profile", "")
+                    if profile in mgr._models:
+                        def _do():
+                            mgr._model_var.set(profile)
+                            mgr._combo["values"] = list(mgr._models.keys())
+                            mgr._refresh_cmd_text()
+                            mgr._start_server()
+                        mgr.after(0, _do)
+                        self._send(200, b'{"ok":true}')
+                    else:
+                        available = list(mgr._models.keys())
+                        msg = json.dumps({"error": f"unknown profile: {profile}",
+                                          "available": available}).encode()
+                        self._send(400, msg)
+                else:
+                    self._send(404, b'{"error":"not found"}')
+
+        srv = http.server.HTTPServer(("127.0.0.1", CONTROL_PORT), _Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
 
     # ── Close ────────────────────────────────────────────────────────────────
     def _on_close(self):
