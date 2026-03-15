@@ -786,66 +786,71 @@ async def stream_events(response: httpx.Response) -> AsyncIterator[tuple[str, An
 import re as _re, uuid as _uuid
 
 def _try_parse_text_tool_calls(text: str) -> list[dict] | None:
-    """Fallback for models that emit tool calls as text instead of structured deltas.
+    """Fallback for the 30B model whose jinja template emits tool calls as raw text.
 
-    Handles two formats:
-      1. Qwen/hermes JSON: <tool_call>{"name":..., "arguments":{...}}</tool_call>
-      2. Hermes XML:       <function=name><parameter=p>v</parameter>...</function>
-         and the abbreviated inline variant (no closing tags).
+    The qwen3-30b-a3b-chat-template.jinja instructs the model to output:
 
-    Returns a list of tool call dicts (same shape as OpenAI structured tool calls),
-    or None if no tool call patterns are detected.
+        <tool_call>
+        <function=name>
+        <parameter=param>
+        value
+        </parameter>
+        </function>
+        </tool_call>
+
+    llama-server with --jinja should convert these to structured API tool_call
+    objects, but occasionally passes them through as text. This parser catches
+    that case.
+
+    We REQUIRE the outer <tool_call>...</tool_call> wrapper — this is the
+    strongest injection guard: casual prose descriptions of tool calls are very
+    unlikely to include the full nested XML structure.
+
+    Returns a list of tool call dicts (OpenAI shape), or None if no valid calls found.
     """
     calls = []
 
-    # Format 1 — <tool_call>{...}</tool_call>
-    for m in _re.finditer(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', text, _re.DOTALL):
-        try:
-            obj = json.loads(m.group(1))
-            name = obj.get("name", "")
-            args = obj.get("arguments") or obj.get("parameters") or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    pass
-            if name:
-                calls.append({
-                    "id": f"call_{_uuid.uuid4().hex[:8]}",
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(args) if isinstance(args, dict) else str(args),
-                    },
-                })
-        except Exception:
-            pass
+    # Primary format — <tool_call> wrapping <function=name><parameter=p>v</parameter></function>
+    for tc_m in _re.finditer(r'<tool_call>(.*?)</tool_call>', text, _re.DOTALL):
+        block = tc_m.group(1)
 
-    # Format 2 — <function=name>...(closed)...</function>
-    for m in _re.finditer(r'<function=(\w+)>(.*?)</function>', text, _re.DOTALL):
-        name = m.group(1)
-        params_text = m.group(2)
-        args: dict = {}
-        for pm in _re.finditer(r'<parameter=(\w+)>(.*?)</parameter>', params_text, _re.DOTALL):
-            args[pm.group(1)] = pm.group(2).strip()
-        if not args:
-            # Abbreviated: <parameter=key> value  (no closing tag)
-            for pm in _re.finditer(r'<parameter=(\w+)>\s*([^<\n]+)', params_text):
-                args[pm.group(1)] = pm.group(2).strip().rstrip('"')
-        if name:
-            calls.append({
-                "id": f"call_{_uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {"name": name, "arguments": json.dumps(args)},
-            })
+        # Inner block may be JSON: {"name": ..., "arguments": {...}}
+        json_m = _re.search(r'\{.*\}', block, _re.DOTALL)
+        if json_m:
+            try:
+                obj = json.loads(json_m.group(0))
+                name = obj.get("name", "")
+                args = obj.get("arguments") or obj.get("parameters") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        pass
+                if name:
+                    calls.append({
+                        "id": f"call_{_uuid.uuid4().hex[:8]}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(args) if isinstance(args, dict) else str(args),
+                        },
+                    })
+                    continue
+            except Exception:
+                pass
 
-    # Format 2b — abbreviated with no closing </function> tag
-    if not calls:
-        for m in _re.finditer(r'<function=(\w+)>\s*((?:<parameter=\w+>[^<\n]*\n?)+)', text):
-            name = m.group(1)
+        # Inner block is XML: <function=name><parameter=p>v</parameter>...</function>
+        fn_m = _re.search(r'<function=(\w+)>(.*?)(?:</function>|$)', block, _re.DOTALL)
+        if fn_m:
+            name = fn_m.group(1)
+            params_text = fn_m.group(2)
             args = {}
-            for pm in _re.finditer(r'<parameter=(\w+)>\s*([^<\n]+)', m.group(2)):
-                args[pm.group(1)] = pm.group(2).strip().rstrip('"')
+            for pm in _re.finditer(r'<parameter=(\w+)>\s*(.*?)\s*</parameter>', params_text, _re.DOTALL):
+                args[pm.group(1)] = pm.group(2).strip()
+            if not args:
+                # Abbreviated inline: <parameter=key>\nvalue\n (no closing tag)
+                for pm in _re.finditer(r'<parameter=(\w+)>\s*([^<\n]+)', params_text):
+                    args[pm.group(1)] = pm.group(2).strip().rstrip('"')
             if name:
                 calls.append({
                     "id": f"call_{_uuid.uuid4().hex[:8]}",
@@ -856,30 +861,22 @@ def _try_parse_text_tool_calls(text: str) -> list[dict] | None:
     if not calls:
         return None
 
-    # Gate 1 — tool name validation.
-    # Every parsed name must be a real tool. This is the strongest guard: a false
-    # positive requires prose that uses <function=exact_real_tool_name> syntax, which
-    # is very unlikely compared to generic description of tools.
+    # Gate — tool name validation.
+    # All parsed names must be real tools. Belt-and-suspenders on top of the
+    # structural <tool_call> wrapper requirement.
     known = {t["function"]["name"] for t in TOOLS}
     if not all(c["function"]["name"] in known for c in calls):
         return None
 
-    # Gate 2 — trailing text check.
-    # Strip thinking blocks, find the end of the last matched pattern, and check
-    # what follows. Prose BEFORE the first call is fine (intro sentence). Prose
-    # AFTER the last call means the model is describing, not calling.
+    # Gate — no significant text after the last </tool_call>.
+    # The template says reasoning is allowed BEFORE the call but NOT after.
+    # Text following the last </tool_call> means the model is describing, not calling.
     body = _re.sub(r'<think>.*?</think>', '', text, flags=_re.DOTALL)
-    last_end = 0
-    for pattern in (
-        r'<tool_call>.*?</tool_call>',
-        r'<function=\w+>.*?</function>',
-        r'<function=\w+>(?:\s*<parameter=\w+>[^<\n]*\n?)+',
-    ):
-        for m in _re.finditer(pattern, body, _re.DOTALL):
-            last_end = max(last_end, m.end())
-    after = body[last_end:].strip() if last_end else ""
-    if len(after) > 80:
-        return None
+    last_tc = list(_re.finditer(r'</tool_call>', body))
+    if last_tc:
+        after = body[last_tc[-1].end():].strip()
+        if len(after) > 80:
+            return None
 
     return calls
 
