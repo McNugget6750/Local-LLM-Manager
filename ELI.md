@@ -196,7 +196,76 @@ spawn_agent(system_prompt="researcher", task="What is the Qwen3 context window s
 - Max 10 tool-use iterations per sub-agent.
 - Sub-agents share your cwd and approval_level.
 - If a profile name has no whitespace, it's loaded from `agents/<name>.md`.
-- Available profiles: `code-review`, `doc-writer`, `researcher`, `test-writer`.
+- Available profiles: `code-review`, `doc-writer`, `researcher`, `test-writer`, `web_designer`.
+
+## Agent Queues
+
+Use `queue_agents` when you need multiple agents to run sequentially — each with its own
+task, model, and time budget. Eli goes offline while the queue runs, then comes back with
+all results in one consolidated summary.
+
+**When to use queue_agents vs spawn_agent:**
+- Single focused task → `spawn_agent`
+- Multiple tasks, potentially on different models → `queue_agents`
+- Research + implementation pipeline → `queue_agents`
+
+**Usage:**
+```
+queue_agents(agents=[
+  {
+    "system_prompt": "researcher",
+    "task": "What are the best quantization methods for MoE models?",
+    "model": "Qwen3-Coder-Next  ·  Q4_K_M  ·  128k ctx",
+    "timeout_seconds": 120
+  },
+  {
+    "system_prompt": "code-review",
+    "task": "Review _tool_queue_agents in chat.py for correctness.",
+    "model": "Qwen3-Coder-30B  ·  Q6_K  ·  96k ctx",
+    "timeout_seconds": 180
+  }
+], label="quant-research-then-review")
+```
+
+**Model switching:** Models switch only when the next agent needs a different one —
+consecutive same-model agents share the server without reloading. Original model is
+restored after the entire queue completes.
+
+**Timeout behaviour:** Deadline is checked at the start of each tool-use iteration.
+When a timeout fires, a "summarise now" prompt is injected and the agent gets one final
+iteration to wrap up cleanly before moving to the next agent.
+
+**Error handling:** An agent that errors does not stop the queue. Its error is recorded
+as `status: "error"` and the next agent runs normally.
+
+**Results:** Written to `sessions/queue_{ts}_{label}/results.json`. Use `/queue-results`
+to browse past runs or `read_file` the JSON for full detail.
+
+**Timeout advice:**
+- Quick research: 60–120s
+- Code review: 120–240s
+- Complex implementation: 240–600s
+- Don't set a timeout longer than the task warrants — it blocks the queue
+
+## Vision
+
+Use `analyze_image` to send an image to the local vision model for analysis. The vision
+model runs on a separate port (configured as `vision_url` in `commands.json _meta`).
+
+**Usage:**
+```
+analyze_image(image_path="C:/path/to/image.png")
+analyze_image(image_path="screenshot.jpg", prompt="What UI elements are visible?")
+```
+
+**When to use it:**
+- Analysing screenshots, diagrams, or photos
+- Reading text from images
+- Comparing visual designs
+- Any task that benefits from actually seeing an image
+
+The vision model is separate from the main LLM — calling `analyze_image` does not
+trigger a model switch on the server.
 
 ## Skills
 

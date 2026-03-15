@@ -47,6 +47,10 @@ BASE_URL     = "http://localhost:1234"
 CONTROL_URL  = "http://localhost:1235"   # server_manager.py control API
 MODEL = "auto"
 
+def _vision_url() -> str:
+    """Read vision server URL from commands.json _meta, fallback to localhost:1236."""
+    return _load_commands_meta().get("vision_url", "http://localhost:1236")
+
 def _load_system_prompt() -> str:
     eli_md = Path(__file__).parent / "ELI.md"
     if eli_md.exists():
@@ -76,6 +80,47 @@ def _load_commands() -> dict:
         return {k: v for k, v in data.items() if not k.startswith("_") and isinstance(v, list)}
     except Exception:
         return {}
+
+def _load_commands_meta() -> dict:
+    """Load the _meta block from commands.json (profile descriptions, vision_url, etc.)."""
+    commands_file = Path(__file__).parent / "commands.json"
+    if not commands_file.exists():
+        return {}
+    try:
+        data = json.loads(commands_file.read_text(encoding="utf-8"))
+        return data.get("_meta", {})
+    except Exception:
+        return {}
+
+def _build_model_context() -> str | None:
+    """Format available model profiles + descriptions as a system message for injection at startup."""
+    commands = _load_commands()
+    meta = _load_commands_meta()
+    if not commands:
+        return None
+    profiles_meta = meta.get("profiles", {})
+    vision_url = meta.get("vision_url", "")
+    lines = ["[Available Model Profiles — commands.json]", ""]
+    lines.append("Use these profile names exactly (including spacing and · characters) when")
+    lines.append("calling spawn_agent(model=...) or queue_agents(agents=[{model: ...}]).")
+    lines.append("")
+    for name in commands:
+        m = profiles_meta.get(name, {})
+        lines.append(f"• {name}")
+        if m.get("description"):
+            lines.append(f"  {m['description']}")
+        if m.get("strengths"):
+            lines.append(f"  Strengths: {m['strengths']}")
+        if m.get("weaknesses"):
+            lines.append(f"  Weaknesses: {m['weaknesses']}")
+        if m.get("speed"):
+            lines.append(f"  Speed: {m['speed']}")
+        if m.get("vision"):
+            lines.append(f"  Vision: yes")
+        lines.append("")
+    if vision_url:
+        lines.append(f"Vision API: {vision_url}  (use analyze_image tool for image analysis)")
+    return "\n".join(lines).strip()
 
 async def _control(method: str, path: str, body: dict | None = None) -> dict | None:
     """Call the server_manager control API. Returns parsed JSON or None on failure."""
@@ -148,6 +193,9 @@ def _build_initial_messages() -> list[dict]:
     memory = _load_memory()
     if memory:
         msgs.append({"role": "system", "content": f"[Operational Memory]\n\n{memory}"})
+    model_ctx = _build_model_context()
+    if model_ctx:
+        msgs.append({"role": "system", "content": model_ctx})
     return msgs
 
 def _load_project_config(cwd: Path) -> dict:
@@ -432,15 +480,13 @@ TOOLS = [
         "function": {
             "name": "spawn_agent",
             "description": (
-                "Spawn a specialized sub-agent to perform a task in isolation. "
-                "The agent has its own message history and tool-use loop. "
-                "Results are returned as a string. Use this to delegate specialized "
-                "work (code review, documentation, research, test writing) to a "
-                "focused assistant. Agent profiles: code-review, doc-writer, "
-                "researcher, test-writer, web_designer. "
+                "Spawn a single specialized sub-agent and return its result. "
+                "Use for one-off tasks: code review, documentation, research, test writing. "
+                "Agent profiles: code-review, doc-writer, researcher, test-writer, web_designer. "
                 "Optionally specify a model profile name from commands.json to run "
                 "the agent on a different model — the server switches automatically "
-                "and restores the original model when the agent finishes."
+                "and restores the original model when the agent finishes. "
+                "For multiple agents or pipelines, use queue_agents instead."
             ),
             "parameters": {
                 "type": "object",
@@ -480,6 +526,74 @@ TOOLS = [
                     },
                 },
                 "required": ["system_prompt", "task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_image",
+            "description": (
+                "Send an image to the local vision model and return its analysis. "
+                "The vision model runs separately from the main LLM (different port). "
+                "Use for image description, code screenshot analysis, UI review, or any "
+                "task that requires actually seeing a file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the image file (jpg, png, webp).",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "What to ask about the image. Defaults to a general description.",
+                    },
+                },
+                "required": ["image_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "queue_agents",
+            "description": (
+                "Run a sequence of agents one after another, each with its own task, model, "
+                "and time budget. Results are stored to disk and returned as a summary. "
+                "Use this for research or development pipelines that need multiple agents. "
+                "Agents run sequentially — model switches only when the next agent needs a "
+                "different model (no redundant reloads). The original model is restored after "
+                "the entire queue completes. Each agent gets a per-agent timeout; on timeout "
+                "the agent is asked to summarise before moving on."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agents": {
+                        "type": "array",
+                        "description": "Ordered list of agent specs to run.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "system_prompt":    {"type": "string", "description": "Agent profile name or raw system prompt."},
+                                "task":             {"type": "string", "description": "Task to give this agent."},
+                                "model":            {"type": "string", "description": "Optional profile name from commands.json."},
+                                "timeout_seconds":  {"type": "integer", "description": "Max seconds for this agent (default 300)."},
+                                "tools":            {"type": "array", "items": {"type": "string"}, "description": "Optional tool whitelist."},
+                                "think_level":      {"type": "string", "description": "'off', 'on', or 'deep'."},
+                                "max_iterations":   {"type": "integer", "description": "Max tool-use iterations (default 10, hard max 10)."},
+                            },
+                            "required": ["system_prompt", "task"],
+                        },
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Human-readable label for this queue run (used in filenames and display).",
+                    },
+                },
+                "required": ["agents"],
             },
         },
     },
@@ -1682,6 +1796,20 @@ class ChatSession:
                     min(args.get("max_iterations", 10), 10),
                     args.get("model"),
                 )
+            elif name == "analyze_image":
+                if self._in_subagent:
+                    return "[error: analyze_image not available inside sub-agents]"
+                return await self._tool_analyze_image(
+                    args.get("image_path", ""),
+                    args.get("prompt"),
+                )
+            elif name == "queue_agents":
+                if self._in_subagent:
+                    return "[error: queue_agents not available inside sub-agents]"
+                return await self._tool_queue_agents(
+                    args.get("agents", []),
+                    args.get("label", ""),
+                )
             else:
                 return f"[unknown tool: {name}]"
         except Exception as e:
@@ -1986,6 +2114,283 @@ class ChatSession:
             console.print(f"[dim cyan]  ✓ {first_line}[/dim cyan]")
         return final_text or "[sub-agent returned no text]"
 
+    async def _tool_analyze_image(self, image_path: str, prompt: str | None = None) -> str:
+        """Send an image to the local vision model and return the analysis."""
+        import base64
+        DEFAULT_PROMPT = "Describe this image in detail: content, composition, any text or code visible."
+        prompt = prompt or DEFAULT_PROMPT
+        path = self._resolve_path(image_path)
+        if not path.exists():
+            return f"[error: image not found: {path}]"
+        ext = path.suffix.lower().lstrip(".")
+        mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                "png": "image/png", "webp": "image/webp"}.get(ext, "image/jpeg")
+        try:
+            b64 = base64.b64encode(path.read_bytes()).decode()
+        except Exception as e:
+            return f"[error: could not read image: {e}]"
+
+        vision_url = _vision_url()
+        payload = {
+            "model": "auto",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+            "max_tokens": 1024,
+            "temperature": 0.3,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as c:
+                r = await c.post(f"{vision_url}/v1/chat/completions", json=payload)
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            return f"[error: vision API call failed ({vision_url}): {e}]"
+
+    async def _tool_queue_agents(self, agent_specs: list[dict], label: str = "") -> str:
+        """Run a list of agents sequentially, store results, return consolidated summary."""
+        if not agent_specs:
+            return "[error: queue_agents called with empty agents list]"
+
+        # Validate all models upfront
+        commands = _load_commands()
+        for i, spec in enumerate(agent_specs):
+            m = spec.get("model")
+            if m and m not in commands:
+                available = ", ".join(f'"{k}"' for k in commands)
+                return f"[error: agent {i+1} model '{m}' not found in commands.json. Available: {available}]"
+
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        slug = label.lower().replace(" ", "-")[:32] if label else "run"
+        queue_dir = SESSIONS_DIR / f"queue_{ts}_{slug}"
+        queue_dir.mkdir(parents=True, exist_ok=True)
+
+        restore_profile = await _find_active_profile()
+        current_model = restore_profile
+        total = len(agent_specs)
+        results = []
+
+        console.print(Panel(
+            f"[bold cyan]Queue:[/bold cyan] {total} agent(s)  ·  label: {label or '(none)'}\n"
+            f"[dim]Results → {queue_dir}[/dim]",
+            title="[cyan]Agent Queue Started[/cyan]",
+            border_style="cyan",
+        ))
+
+        loop = asyncio.get_event_loop()
+
+        for idx, spec in enumerate(agent_specs):
+            agent_num = idx + 1
+            target_model = spec.get("model")
+            timeout_s = max(30, int(spec.get("timeout_seconds", 300)))
+            max_iter = min(int(spec.get("max_iterations", 10)), 10)
+            think = spec.get("think_level") or self.think_level
+            tools_wl = spec.get("tools")
+            task = spec.get("task", "")
+            sp = spec.get("system_prompt", "")
+
+            # Resolve profile → system prompt
+            if sp and " " not in sp.strip():
+                profile_path = Path(__file__).parent / "agents" / f"{sp}.md"
+                if profile_path.exists():
+                    sp = profile_path.read_text(encoding="utf-8")
+
+            # Switch model only when needed
+            if target_model and target_model != current_model:
+                console.print(f"[dim yellow]  Switching to: {target_model}[/dim yellow]")
+                switched = await _switch_server(target_model)
+                if not switched:
+                    results.append({
+                        "index": idx, "system_prompt": spec.get("system_prompt", ""),
+                        "task": task, "model": target_model,
+                        "timeout_seconds": timeout_s, "status": "error",
+                        "result": f"[error: failed to switch to model '{target_model}']",
+                        "duration_seconds": 0.0,
+                    })
+                    console.print(f"[red]  Agent {agent_num}/{total} skipped — model switch failed[/red]")
+                    continue
+                current_model = target_model
+
+            # Build tool list
+            sub_tools = [t for t in TOOLS if t["function"]["name"] not in ("spawn_agent", "queue_agents", "analyze_image")]
+            if tools_wl:
+                sub_tools = [t for t in sub_tools if t["function"]["name"] in tools_wl]
+
+            messages: list[dict] = [
+                {"role": "system", "content": sp},
+                {"role": "user",   "content": task},
+            ]
+
+            console.print(Panel(
+                f"[bold]Task:[/bold] {task[:200]}{'...' if len(task) > 200 else ''}\n"
+                f"[dim]Model: {target_model or current_model or 'current'}  ·  "
+                f"Timeout: {timeout_s}s  ·  Max iter: {max_iter}[/dim]",
+                title=f"[cyan]Queue Agent {agent_num}/{total}[/cyan]",
+                border_style="cyan",
+            ))
+
+            start_t = loop.time()
+            agent_status = "completed"
+            final_text = ""
+            self._in_subagent = True
+            try:
+                deadline = loop.time() + timeout_s
+                for _iter in range(max_iter):
+                    # Check deadline before starting new iteration
+                    if loop.time() >= deadline:
+                        agent_status = "timeout"
+                        if messages and messages[-1]["role"] != "user":
+                            messages.append({
+                                "role": "user",
+                                "content": "Time limit reached. Summarise your findings concisely now.",
+                            })
+                            try:
+                                async with self.client.stream(
+                                    "POST", f"{BASE_URL}/v1/chat/completions",
+                                    json={"model": self.model, "messages": messages,
+                                          "stream": True, "temperature": 0.3},
+                                    headers={"Accept": "text/event-stream"},
+                                ) as resp:
+                                    async for ev_type, ev_data in stream_events(resp):
+                                        if ev_type == "text":
+                                            final_text += ev_data
+                            except Exception:
+                                pass
+                        break
+
+                    think_kwargs: dict = {}
+                    if think == "off":
+                        think_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+                    else:
+                        think_kwargs["chat_template_kwargs"] = {"enable_thinking": True}
+
+                    payload = {
+                        "model": self.model, "messages": messages,
+                        "tools": sub_tools, "tool_choice": "auto",
+                        "stream": True, "stream_options": {"include_usage": True},
+                        "temperature": 0.3 if think == "deep" else 0.6,
+                        **think_kwargs,
+                    }
+
+                    text_buf = ""
+                    assistant_content = ""
+                    tool_calls_received = []
+
+                    async with self.client.stream(
+                        "POST", f"{BASE_URL}/v1/chat/completions",
+                        json=payload, headers={"Accept": "text/event-stream"},
+                    ) as response:
+                        response.raise_for_status()
+                        _live = _NullLive() if self.compact_mode else Live(console=console, refresh_per_second=8)
+                        with _live as live:
+                            async for ev_type, ev_data in stream_events(response):
+                                if ev_type == "text":
+                                    text_buf += ev_data
+                                    assistant_content += ev_data
+                                    final_text = assistant_content
+                                    live.update(Panel(
+                                        Markdown(text_buf),
+                                        title=f"[cyan]Agent {agent_num}[/cyan]",
+                                        border_style="cyan",
+                                    ))
+                                elif ev_type == "tool_calls":
+                                    tool_calls_received = ev_data
+                                    live.update(Text(""))
+                                elif ev_type == "stop":
+                                    if not text_buf:
+                                        live.update(Text(""))
+
+                    if tool_calls_received:
+                        messages.append({
+                            "role": "assistant",
+                            "content": assistant_content or None,
+                            "tool_calls": tool_calls_received,
+                        })
+                        async def _run_q_tool(tc):
+                            tc_name = tc["function"]["name"]
+                            try:
+                                tc_args = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"].strip() else {}
+                            except json.JSONDecodeError:
+                                tc_args = {}
+                            if self.compact_mode:
+                                console.print(f"[dim]    ◌ {tc_name}{markup_escape(self._compact_args(tc_name, tc_args))}[/dim]")
+                            tc_result = await self._dispatch_tool(tc_name, tc_args)
+                            if self.compact_mode:
+                                console.print(f"[dim]      → {markup_escape(self._compact_result(tc_result))}[/dim]")
+                            return tc["id"], tc_result
+                        tool_results = await asyncio.gather(*[_run_q_tool(tc) for tc in tool_calls_received])
+                        for tc_id, tc_result_val in tool_results:
+                            messages.append({"role": "tool", "tool_call_id": tc_id, "content": tc_result_val})
+                    else:
+                        if assistant_content:
+                            messages.append({"role": "assistant", "content": assistant_content})
+                        break
+
+            except Exception as e:
+                agent_status = "error"
+                final_text = final_text or f"[error during agent execution: {e}]"
+            finally:
+                self._in_subagent = False
+
+            duration = round(loop.time() - start_t, 1)
+            status_icon = {"completed": "✓", "timeout": "⏱", "error": "✗"}.get(agent_status, "?")
+            console.print(Panel(
+                Markdown(final_text[:500] + ("..." if len(final_text) > 500 else "")) if final_text else "[dim](no output)[/dim]",
+                title=f"[cyan]Agent {agent_num}/{total}  {status_icon} {agent_status}  ({duration}s)[/cyan]",
+                border_style="cyan" if agent_status == "completed" else "yellow" if agent_status == "timeout" else "red",
+            ))
+
+            results.append({
+                "index": idx,
+                "system_prompt": spec.get("system_prompt", ""),
+                "task": task,
+                "model": target_model or current_model or "",
+                "timeout_seconds": timeout_s,
+                "status": agent_status,
+                "result": final_text or "[no output]",
+                "duration_seconds": duration,
+            })
+
+        # Restore original model if we moved away from it
+        if current_model != restore_profile and restore_profile:
+            console.print(Panel(
+                f"[dim]Restoring: {restore_profile}[/dim]",
+                title="[yellow]Model Restore[/yellow]",
+                border_style="yellow",
+            ))
+            await _switch_server(restore_profile)
+
+        # Write results to disk
+        output = {
+            "label": label,
+            "started": ts,
+            "completed_at": datetime.now().isoformat(),
+            "agent_count": total,
+            "results": results,
+        }
+        results_path = queue_dir / "results.json"
+        results_path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        # Build return summary
+        counts = {"completed": 0, "timeout": 0, "error": 0}
+        for r in results:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        summary_lines = [
+            f"Queue complete: {total} agent(s) — "
+            f"{counts['completed']} completed, {counts['timeout']} timeout, {counts['error']} error(s)",
+            f"Results saved: {results_path}",
+            "",
+        ]
+        for r in results:
+            icon = {"completed": "✓", "timeout": "⏱", "error": "✗"}.get(r["status"], "?")
+            snippet = r["result"][:200].replace("\n", " ")
+            summary_lines.append(f"{icon} Agent {r['index']+1}: {snippet}{'...' if len(r['result']) > 200 else ''}")
+        return "\n".join(summary_lines)
+
     async def _call_tool(self, name: str, arguments_str: str, call_id: str) -> str:
         try:
             args = json.loads(arguments_str) if arguments_str.strip() else {}
@@ -2130,6 +2535,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                     "[bold]/config[/bold]                Show loaded eli.toml project config",
                     "[bold]/skills[/bold]                List available skills",
                     "[bold]/skill <name> \\[args\\][/bold]   Invoke a skill explicitly",
+                    "[bold]/queue-results \\[label\\][/bold]  List recent agent queue runs, or show one by label",
                     "[bold]/help[/bold]                  Show this message",
                     "",
                     "[bold]Shift+Tab[/bold]              Cycle mode: normal → plan → normal",
@@ -2329,6 +2735,86 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                 title="[cyan]Project Config (eli.toml)[/cyan]",
                 border_style="cyan",
             ))
+        return True
+
+    elif name == "/queue-results":
+        if not SESSIONS_DIR.exists():
+            console.print("[dim]No queue runs found.[/dim]")
+            return True
+        queue_dirs = sorted(
+            [d for d in SESSIONS_DIR.iterdir() if d.is_dir() and d.name.startswith("queue_")],
+            reverse=True,
+        )
+        if not queue_dirs:
+            console.print("[dim]No queue runs found.[/dim]")
+            return True
+        label_filter = " ".join(parts[1:]).lower() if len(parts) > 1 else ""
+        if label_filter:
+            # Show full details for matching run
+            matches = [d for d in queue_dirs if label_filter in d.name.lower()]
+            if not matches:
+                console.print(f"[yellow]No queue run matching '{label_filter}'[/yellow]")
+                return True
+            qdir = matches[0]
+            results_file = qdir / "results.json"
+            if not results_file.exists():
+                console.print(f"[yellow]results.json missing in {qdir.name}[/yellow]")
+                return True
+            try:
+                data = json.loads(results_file.read_text(encoding="utf-8"))
+                results = data.get("results", [])
+                label = data.get("label", "")
+                total_dur = data.get("total_duration_seconds", 0)
+                lines = []
+                if label:
+                    lines.append(f"[bold]Label:[/bold] {label}")
+                lines.append(f"[bold]Agents:[/bold] {len(results)}   [bold]Total:[/bold] {total_dur:.0f}s")
+                lines.append("")
+                for r in results:
+                    status_col = {"completed": "green", "timeout": "yellow", "error": "red"}.get(r.get("status", ""), "white")
+                    lines.append(
+                        f"[{status_col}]{r.get('status','?').upper()}[/{status_col}]  "
+                        f"[bold]{r.get('index',0)+1}. {r.get('label', r.get('system_prompt',''))}[/bold]  "
+                        f"[dim]{r.get('model','')[:40]}  {r.get('duration_seconds',0):.0f}s[/dim]"
+                    )
+                    result_text = (r.get("result") or "").strip()
+                    if result_text:
+                        # show first 400 chars
+                        preview = result_text[:400] + ("…" if len(result_text) > 400 else "")
+                        lines.append(f"  [dim]{preview}[/dim]")
+                    lines.append("")
+                console.print(Panel("\n".join(lines), title=f"[cyan]Queue: {qdir.name}[/cyan]", border_style="cyan"))
+            except Exception as e:
+                console.print(f"[red]Failed to read {results_file}: {e}[/red]")
+        else:
+            # List last 5 queue runs
+            lines = []
+            for qdir in queue_dirs[:5]:
+                results_file = qdir / "results.json"
+                try:
+                    data = json.loads(results_file.read_text(encoding="utf-8"))
+                    results = data.get("results", [])
+                    label = data.get("label", "")
+                    total_dur = data.get("total_duration_seconds", 0)
+                    statuses = [r.get("status", "?") for r in results]
+                    err_count = statuses.count("error")
+                    timeout_count = statuses.count("timeout")
+                    status_str = (
+                        f"[red]{err_count} error{'s' if err_count!=1 else ''}[/red]  " if err_count else ""
+                    ) + (
+                        f"[yellow]{timeout_count} timeout{'s' if timeout_count!=1 else ''}[/yellow]  " if timeout_count else ""
+                    ) + (
+                        f"[green]{statuses.count('completed')} completed[/green]" if statuses.count("completed") else ""
+                    )
+                    label_str = f"  [dim]{label}[/dim]" if label else ""
+                    lines.append(
+                        f"[bold cyan]{qdir.name}[/bold cyan]{label_str}\n"
+                        f"  {len(results)} agents  {total_dur:.0f}s  {status_str}"
+                    )
+                except Exception:
+                    lines.append(f"[bold cyan]{qdir.name}[/bold cyan]  [dim](unreadable)[/dim]")
+            lines.append("\n[dim]Usage: /queue-results <label>  — show full results for a run[/dim]")
+            console.print(Panel("\n".join(lines), title="Recent Queue Runs", border_style="cyan"))
         return True
 
     # Unknown /command — try skill lookup before giving up

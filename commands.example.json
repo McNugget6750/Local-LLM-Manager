@@ -1,5 +1,16 @@
 {
-  "_readme": "Copy this to commands.json (gitignored). Add your own model profiles.",
+  "_meta": {
+    "vision_url": "http://localhost:1236",
+    "profiles": {
+      "My Model  ·  ?? t/s  ·  Notes": {
+        "description": "One-line description of this model and quantization.",
+        "strengths": "What it excels at",
+        "weaknesses": "What to avoid using it for",
+        "speed": "~?? t/s",
+        "vision": false
+      }
+    }
+  },
   "My Model  ·  ?? t/s  ·  Notes": [
     "path/to/llama-server.exe",
     "-m", "path/to/model.gguf",
