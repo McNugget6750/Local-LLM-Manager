@@ -782,6 +782,79 @@ async def stream_events(response: httpx.Response) -> AsyncIterator[tuple[str, An
                 holdback = ""
             yield ("stop", "stop")
 
+# ── Text tool-call fallback parser ────────────────────────────────────────────
+import re as _re, uuid as _uuid
+
+def _try_parse_text_tool_calls(text: str) -> list[dict] | None:
+    """Fallback for models that emit tool calls as text instead of structured deltas.
+
+    Handles two formats:
+      1. Qwen/hermes JSON: <tool_call>{"name":..., "arguments":{...}}</tool_call>
+      2. Hermes XML:       <function=name><parameter=p>v</parameter>...</function>
+         and the abbreviated inline variant (no closing tags).
+
+    Returns a list of tool call dicts (same shape as OpenAI structured tool calls),
+    or None if no tool call patterns are detected.
+    """
+    calls = []
+
+    # Format 1 — <tool_call>{...}</tool_call>
+    for m in _re.finditer(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', text, _re.DOTALL):
+        try:
+            obj = json.loads(m.group(1))
+            name = obj.get("name", "")
+            args = obj.get("arguments") or obj.get("parameters") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    pass
+            if name:
+                calls.append({
+                    "id": f"call_{_uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args) if isinstance(args, dict) else str(args),
+                    },
+                })
+        except Exception:
+            pass
+
+    # Format 2 — <function=name>...(closed)...</function>
+    for m in _re.finditer(r'<function=(\w+)>(.*?)</function>', text, _re.DOTALL):
+        name = m.group(1)
+        params_text = m.group(2)
+        args: dict = {}
+        for pm in _re.finditer(r'<parameter=(\w+)>(.*?)</parameter>', params_text, _re.DOTALL):
+            args[pm.group(1)] = pm.group(2).strip()
+        if not args:
+            # Abbreviated: <parameter=key> value  (no closing tag)
+            for pm in _re.finditer(r'<parameter=(\w+)>\s*([^<\n]+)', params_text):
+                args[pm.group(1)] = pm.group(2).strip().rstrip('"')
+        if name:
+            calls.append({
+                "id": f"call_{_uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args)},
+            })
+
+    # Format 2b — abbreviated with no closing </function> tag
+    if not calls:
+        for m in _re.finditer(r'<function=(\w+)>\s*((?:<parameter=\w+>[^<\n]*\n?)+)', text):
+            name = m.group(1)
+            args = {}
+            for pm in _re.finditer(r'<parameter=(\w+)>\s*([^<\n]+)', m.group(2)):
+                args[pm.group(1)] = pm.group(2).strip().rstrip('"')
+            if name:
+                calls.append({
+                    "id": f"call_{_uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args)},
+                })
+
+    return calls if calls else None
+
 # ── Tool executors ────────────────────────────────────────────────────────────
 def _is_dangerous(command: str) -> bool:
     cmd_lower = command.lower()
@@ -1658,6 +1731,13 @@ class ChatSession:
             if not self._compacting and self.tokens_used >= int(self.ctx_window * CTX_COMPACT_THRESH):
                 await self._compact_history()
 
+            # Fallback: model emitted tool calls as text (e.g. 30B with custom template)
+            if not tool_calls_received and assistant_content:
+                _parsed = _try_parse_text_tool_calls(assistant_content)
+                if _parsed:
+                    tool_calls_received = _parsed
+                    assistant_content = ""  # don't echo raw text back into message history
+
             # Append assistant message
             if tool_calls_received:
                 self.messages.append({
@@ -1883,6 +1963,7 @@ class ChatSession:
 
         self._in_subagent = True
         final_text = ""
+        _hit_max_iter = True  # cleared when agent breaks naturally
         try:
             for _iter in range(max_iter):
                 temperature = 0.3 if think == "deep" else 0.6
@@ -1961,6 +2042,13 @@ class ChatSession:
                                     live.update(Text(""))
 
                 final_text = assistant_content
+
+                # Fallback: model emitted tool calls as text
+                if not tool_calls_received and assistant_content:
+                    _parsed = _try_parse_text_tool_calls(assistant_content)
+                    if _parsed:
+                        tool_calls_received = _parsed
+                        assistant_content = ""
 
                 if tool_calls_received:
                     messages.append({
@@ -2070,36 +2158,49 @@ class ChatSession:
                             "content": tc_result_val,
                         })
                 else:
+                    _hit_max_iter = False
                     if assistant_content:
                         messages.append({"role": "assistant", "content": assistant_content})
                     break
         finally:
             self._in_subagent = False
-            if model:
-                # Graceful wrap-up: if the agent produced no text, ask it to summarise
-                # before we pull the server out from under it.
-                if not final_text and messages and messages[-1]["role"] != "user":
-                    try:
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                "You are being stopped due to a model switch. "
-                                "Please immediately summarise your findings so far in a brief response."
-                            ),
-                        })
-                        async with self.client.stream(
-                            "POST",
-                            f"{BASE_URL}/v1/chat/completions",
-                            json={"model": self.model, "messages": messages,
-                                  "stream": True, "temperature": 0.3},
-                            headers={"Accept": "text/event-stream"},
-                        ) as resp:
-                            async for ev_type, ev_data in stream_events(resp):
-                                if ev_type == "text":
-                                    final_text += ev_data
-                    except Exception:
-                        pass  # best-effort only
 
+            # Graceful summarise — always attempt when:
+            #   (a) agent produced no text output at all, or
+            #   (b) hit max iterations while still in a tool-call loop
+            # This covers both model-switch and same-model agents.
+            _last_role = messages[-1]["role"] if messages else "user"
+            _needs_summary = (not final_text) or (_hit_max_iter and _last_role == "tool")
+            if _needs_summary and len(messages) > 2:
+                _stop_reason = (
+                    "You have reached the maximum number of tool-use iterations."
+                    if _hit_max_iter
+                    else "You are being stopped due to a model switch."
+                )
+                try:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"{_stop_reason} "
+                            "Please provide a concise summary of: what you did, what you found "
+                            "or created, and any file paths or key results the caller should know about."
+                        ),
+                    })
+                    console.print("[dim cyan]  Agent reached iteration limit — requesting summary...[/dim cyan]")
+                    async with self.client.stream(
+                        "POST",
+                        f"{BASE_URL}/v1/chat/completions",
+                        json={"model": self.model, "messages": messages,
+                              "stream": True, "temperature": 0.3},
+                        headers={"Accept": "text/event-stream"},
+                    ) as resp:
+                        async for ev_type, ev_data in stream_events(resp):
+                            if ev_type == "text":
+                                final_text += ev_data
+                except Exception:
+                    pass  # best-effort only
+
+            if model:
                 if restore_profile:
                     console.print(Panel(
                         f"[dim]Restoring server: {restore_profile}[/dim]",
@@ -2360,6 +2461,13 @@ class ChatSession:
                                 elif ev_type == "stop":
                                     if not text_buf:
                                         live.update(Text(""))
+
+                    # Fallback: model emitted tool calls as text
+                    if not tool_calls_received and assistant_content:
+                        _parsed = _try_parse_text_tool_calls(assistant_content)
+                        if _parsed:
+                            tool_calls_received = _parsed
+                            assistant_content = ""
 
                     if tool_calls_received:
                         messages.append({
