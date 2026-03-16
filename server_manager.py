@@ -153,13 +153,14 @@ class ServerManager(tk.Tk):
         self.geometry("760x940")
         self.minsize(660, 740)
 
-        self._models   = _load_models()
-        self._proc     = None
-        self._log_q    = queue.Queue()
-        self._running  = False
-        self._external = False
-        self._hb_after = None
-        self._cd_after = None
+        self._models      = _load_models()
+        self._proc        = None
+        self._voice_proc  = None
+        self._log_q       = queue.Queue()
+        self._running     = False
+        self._external    = False
+        self._hb_after    = None
+        self._cd_after    = None
         self._hb_secs  = 0
         self._tps_gen  = 0.0
         self._tps_pre  = 0.0
@@ -273,6 +274,7 @@ class ServerManager(tk.Tk):
         self._lbl_speed  = self._make_label_row(left, "Speed",    2, GREEN)
         self._lbl_last   = self._make_label_row(left, "Last req", 3, PURPLE)
         self._lbl_cd     = self._make_label_row(left, "Next chk", 4, FG_DIM)
+        self._lbl_voice, self._cmb_voice = self._make_voice_row(left, 5)
 
         # Right column — system resources
         tk.Label(right, text="System", bg=PANEL, fg=FG_DIM,
@@ -365,6 +367,18 @@ class ServerManager(tk.Tk):
         val = tk.Label(f, text="—", bg=PANEL, fg=fg, font=("Segoe UI", 9))
         val.pack(side="left")
         return val
+
+    def _make_voice_row(self, parent, row):
+        f = tk.Frame(parent, bg=PANEL)
+        f.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
+        tk.Label(f, text="Voice", bg=PANEL, fg=FG_DIM,
+                 font=("Segoe UI", 8), width=10, anchor="w").pack(side="left")
+        status = tk.Label(f, text="—", bg=PANEL, fg=FG_DIM, font=("Segoe UI", 9))
+        status.pack(side="left")
+        cmb = ttk.Combobox(f, state="disabled", width=28, font=("Segoe UI", 9))
+        cmb.pack(side="left", padx=(6, 0))
+        cmb.bind("<<ComboboxSelected>>", self._on_voice_selected)
+        return status, cmb
 
     def _make_sys_row(self, parent, label, row):
         tk.Label(parent, text=label, bg=PANEL, fg=FG_DIM,
@@ -644,6 +658,7 @@ class ServerManager(tk.Tk):
                  "Stop-Process -Name llama-server -Force -ErrorAction SilentlyContinue"],
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
+        self._stop_voice_server()
         self._reset_ui()
         self._log_put("Server stopped", "err")
 
@@ -665,6 +680,98 @@ class ServerManager(tk.Tk):
         self._lbl_dot.config(fg=GREEN)
         self._lbl_status.config(text="  Running")
         self._btn_chat.config(state="normal")
+        self._start_voice_server()
+
+    # ── Voice server lifecycle ───────────────────────────────────────────────
+    _VOICE_PYTHON = r"C:\Users\timob\claude-projects\qwen3-manager\.venv\Scripts\python.exe"
+    _VOICE_CWD    = r"C:\Users\timob\claude-projects\qwen3-manager"
+
+    def _start_voice_server(self) -> None:
+        if self._voice_proc and self._voice_proc.poll() is None:
+            return  # already running
+        try:
+            cmd = [self._VOICE_PYTHON, "-m", "uvicorn", "eli_voice_server:app",
+                   "--host", "127.0.0.1", "--port", "1236"]
+            self._voice_proc = subprocess.Popen(
+                cmd, cwd=self._VOICE_CWD,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            threading.Thread(target=self._read_voice_proc, daemon=True).start()
+            self._lbl_voice.config(text="starting…")
+        except Exception as e:
+            self._log_put(f"[voice] Failed to start: {e}", "err")
+            self._lbl_voice.config(text="error")
+
+    def _stop_voice_server(self) -> None:
+        if self._voice_proc and self._voice_proc.poll() is None:
+            self._voice_proc.terminate()
+            try:
+                self._voice_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._voice_proc.kill()
+        self._voice_proc = None
+        self._on_voice_server_stopped()
+
+    def _read_voice_proc(self) -> None:
+        for line in self._voice_proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            ll = line.lower()
+            if "application startup complete" in ll or "uvicorn running" in ll:
+                self._log_q.put(("[voice] Ready", "ok"))
+                self.after(0, lambda: self._lbl_voice.config(text="running"))
+                self.after(500, self._fetch_voices)   # small delay for server readiness
+            elif "error" in ll:
+                self._log_q.put((f"[voice] {line}", "err"))
+            else:
+                self._log_q.put((f"[voice] {line}", "info"))
+        self._log_q.put(("[voice] Process exited", "warn"))
+        self.after(0, self._on_voice_server_stopped)
+
+    def _on_voice_server_stopped(self) -> None:
+        self._lbl_voice.config(text="stopped")
+        self._cmb_voice.config(state="disabled")
+        self._cmb_voice.set("")
+
+    def _fetch_voices(self) -> None:
+        """Fetch voice list from TTS server and populate the combobox (runs on UI thread)."""
+        import urllib.request, json as _json
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:1236/voices", timeout=3) as r:
+                data = _json.loads(r.read())
+            voices  = data.get("voices", [])
+            current = data.get("current", "")
+            if voices:
+                self._cmb_voice["values"] = voices
+                self._cmb_voice.config(state="readonly")
+                self._cmb_voice.set(current if current in voices else voices[0])
+        except Exception as e:
+            self._log_put(f"[voice] Could not fetch voice list: {e}", "warn")
+
+    def _on_voice_selected(self, _event=None) -> None:
+        """Called when user picks a voice from the combobox."""
+        raw = self._cmb_voice.get()
+        if not raw:
+            return
+        self._lbl_voice.config(text="switching…")
+        threading.Thread(target=self._set_voice_bg, args=(raw,), daemon=True).start()
+
+    def _set_voice_bg(self, voice_id: str) -> None:
+        """POST /voice to the TTS server (background thread)."""
+        import urllib.request, urllib.parse, json as _json
+        try:
+            url = f"http://127.0.0.1:1236/voice?voice_id={urllib.parse.quote(voice_id)}"
+            req = urllib.request.Request(url, data=b"", method="POST")
+            with urllib.request.urlopen(req, timeout=30) as r:
+                _json.loads(r.read())
+            self._log_q.put((f"[voice] Switched to {voice_id}", "ok"))
+            self.after(0, lambda: self._lbl_voice.config(text="running"))
+        except Exception as e:
+            self._log_q.put((f"[voice] Switch failed: {e}", "err"))
+            self.after(0, lambda: self._lbl_voice.config(text="error"))
 
     def _read_proc(self):
         for line in self._proc.stdout:
@@ -963,6 +1070,8 @@ class ServerManager(tk.Tk):
     def _on_close(self):
         if self._running and not self._external:
             self._stop_server()
+        else:
+            self._stop_voice_server()
         self.destroy()
 
 

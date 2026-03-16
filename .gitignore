@@ -21,3 +21,10 @@ USER_PROFILE.md
 
 # Artifacts
 render_power_curve.py
+audio.raw
+audio.wav
+audio_full.wav
+audio_stream.wav
+
+# Kokoro model files — large binaries, download separately
+kokoro_models/

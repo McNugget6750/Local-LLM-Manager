@@ -1,2 +1,3 @@
 @echo off
-.venv\Scripts\python.exe chat.py %*
+cd /d "%~dp0"
+"%~dp0.venv\Scripts\python.exe" "%~dp0chat.py" %*

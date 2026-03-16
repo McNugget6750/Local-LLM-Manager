@@ -45,7 +45,31 @@ from rich.text import Text
 # ── Constants ─────────────────────────────────────────────────────────────────
 BASE_URL     = "http://localhost:1234"
 CONTROL_URL  = "http://localhost:1235"   # server_manager.py control API
+TTS_URL      = "http://127.0.0.1:1236"  # eli_server TTS + transcribe
 MODEL = "auto"
+
+# ── Voice mode config ──────────────────────────────────────────────────────────
+PTT_KEY          = "scroll_lock"   # pynput Key name or single char
+VOICE_DEFAULT_MODE = "ptt"         # "ptt" or "auto"
+VOICE_SAMPLE_RATE     = 16000  # Hz — must match what /transcribe expects
+VOICE_SILENCE_TIMEOUT = 2.5    # seconds of silence before auto-send (auto mode)
+VOICE_MIN_SPEECH_MS   = 500    # ms of speech required before transcribing (auto mode)
+VOICE_RMS_THRESHOLD      = 650  # int16 RMS below this is ignored even if VAD says speech
+VOICE_ONSET_FRAMES       = 2    # consecutive speech frames required before recording starts
+VOICE_POST_TTS_DELAY  = 0.6    # seconds to wait after TTS finishes before listening again
+
+VOICE_SYSTEM_PROMPT = """You are a sharp, engaged conversational partner.
+You're a colleague and friend — not an assistant, not a tool.
+
+Rules:
+- Respond in 2–4 sentences. You're in a voice conversation — keep it tight.
+- Challenge ideas. Push back when something seems off. Ask the one question
+  that cuts to the core of the matter.
+- No preamble. No affirmations. Just engage directly with what was said.
+- Think out loud with the person. Build on their idea or dismantle it.
+- When you need to go deeper, do — but never ramble.
+- No lists, no bullet points. Spoken prose only.
+"""
 
 def _vision_url() -> str:
     """Read vision server URL from commands.json _meta, fallback to localhost:1236."""
@@ -301,12 +325,18 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "bash",
-            "description": "Run a shell command and return combined stdout+stderr.",
+            "description": (
+                "Run a shell command and return combined stdout+stderr. "
+                "The working directory defaults to the session cwd. "
+                "Use the 'cwd' parameter to run in a different directory — "
+                "prefer this over 'cd X && command' to avoid venv path confusion."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Shell command to execute"},
+                    "command": {"type": "string",  "description": "Shell command to execute"},
                     "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)"},
+                    "cwd":     {"type": "string",  "description": "Working directory for this command (absolute path)"},
                 },
                 "required": ["command"],
             },
@@ -316,11 +346,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read and return the contents of a file.",
+            "description": (
+                "Read and return the contents of a file with line numbers. "
+                "Use offset and limit to read a specific range of lines (1-based). "
+                "Line numbers are shown as '  N | content' — do NOT include them in old_string when editing."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path to read"},
+                    "path":   {"type": "string",  "description": "File path to read"},
+                    "offset": {"type": "integer", "description": "First line to read, 1-based (default: 1)"},
+                    "limit":  {"type": "integer", "description": "Maximum number of lines to return (default: 200)"},
                 },
                 "required": ["path"],
             },
@@ -514,7 +550,7 @@ TOOLS = [
                     },
                     "max_iterations": {
                         "type": "integer",
-                        "description": "Max tool-use iterations (default 10, hard max 10).",
+                        "description": "Max tool-use iterations (default 10, hard max 30). Increase for large codebases — code-review of a big project may need 20–30.",
                     },
                     "model": {
                         "type": "string",
@@ -589,7 +625,7 @@ TOOLS = [
                                 "timeout_seconds":  {"type": "integer", "description": "Max seconds for this agent (default 300)."},
                                 "tools":            {"type": "array", "items": {"type": "string"}, "description": "Optional tool whitelist."},
                                 "think_level":      {"type": "string", "description": "'off', 'on', or 'deep'."},
-                                "max_iterations":   {"type": "integer", "description": "Max tool-use iterations (default 10, hard max 10)."},
+                                "max_iterations":   {"type": "integer", "description": "Max tool-use iterations (default 10, hard max 30). Increase for large codebases — code-review may need 20–30."},
                             },
                             "required": ["system_prompt", "task"],
                         },
@@ -600,6 +636,26 @@ TOOLS = [
                     },
                 },
                 "required": ["agents"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "speak",
+            "description": (
+                "Speak a brief message aloud via the local TTS server. "
+                "Use for: task-done notifications, questions that need the user at the keyboard, "
+                "unexpected blockers. "
+                "Keep to 1–2 short sentences — conversational length. "
+                "Do NOT narrate ongoing work, repeat what is already on screen, or read out long results."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Text to speak (1–2 sentences max)"},
+                },
+                "required": ["text"],
             },
         },
     },
@@ -614,6 +670,13 @@ DANGEROUS_PATTERNS = [
     "dd if=",
     ":(){:|:&};:",
     "del /f /s /q",
+    # Process termination
+    "taskkill",
+    "kill -9",
+    "kill -sigkill",
+    "pkill",
+    "killall",
+    "stop-process",
     # Git — irreversible or history-rewriting operations
     "git push --force",
     "git push -f ",
@@ -859,11 +922,33 @@ def _try_parse_text_tool_calls(text: str) -> list[dict] | None:
                 })
 
     if not calls:
-        return None
+        # Secondary fallback — naked <function=name> without <tool_call> wrapper.
+        # Only fires when the body (after thinking) is almost entirely markup,
+        # i.e. the model forgot the wrapper but clearly intends a tool call.
+        body = _re.sub(r'<think>.*?</think>', '', text, flags=_re.DOTALL).strip()
+        known = {t["function"]["name"] for t in TOOLS}
+        fn_m = _re.match(r'^<function=(\w+)>(.*?)(?:</function>|$)', body, _re.DOTALL)
+        if fn_m and fn_m.group(1) in known:
+            name = fn_m.group(1)
+            params_text = fn_m.group(2)
+            args = {}
+            for pm in _re.finditer(r'<parameter=(\w+)>\s*(.*?)\s*</parameter>', params_text, _re.DOTALL):
+                args[pm.group(1)] = pm.group(2).strip()
+            if not args:
+                for pm in _re.finditer(r'<parameter=(\w+)>\s*([^<]+)', params_text, _re.DOTALL):
+                    args[pm.group(1)] = pm.group(2).strip()
+            # Require at least one parameter to avoid false positives
+            if args:
+                calls.append({
+                    "id": f"call_{_uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args)},
+                })
+
+        if not calls:
+            return None
 
     # Gate — tool name validation.
-    # All parsed names must be real tools. Belt-and-suspenders on top of the
-    # structural <tool_call> wrapper requirement.
     known = {t["function"]["name"] for t in TOOLS}
     if not all(c["function"]["name"] in known for c in calls):
         return None
@@ -885,19 +970,16 @@ def _is_dangerous(command: str) -> bool:
     cmd_lower = command.lower()
     return any(pat in cmd_lower for pat in DANGEROUS_PATTERNS)
 
+# Sentinel returned by gates when the user rejects a tool call.
+# The dispatch loop watches for this prefix and stops the current batch immediately.
+_GATE_REJECTED_PREFIX = "[GATE_REJECTED]"
+
 INSTALL_PATTERNS = [
     "pip install", "pip3 install", "python -m pip",
     "npm install", "npm i ", "yarn add", "yarn install",
     "conda install", "mamba install",
     "winget install", "choco install", "scoop install",
     "apt install", "apt-get install", "brew install",
-]
-
-# Bare Python/pip invocations that bypass the project venv.
-# Matched against the first token(s) of the command.
-BARE_PYTHON_PATTERNS = [
-    "pip ", "pip\n", "pip3 ", "pip3\n",
-    "python ", "python\n", "python3 ", "python3\n",
 ]
 
 def _is_install(command: str) -> bool:
@@ -909,9 +991,45 @@ def _is_install(command: str) -> bool:
     return bool(re.search(r'pip(?:3)?\.exe\s+install', cmd_lower))
 
 def _is_bare_python(command: str) -> bool:
-    """Detect bare python/pip calls that would hit system Python instead of the venv."""
-    stripped = command.strip().lower()
-    return any(stripped.startswith(pat) for pat in BARE_PYTHON_PATTERNS)
+    """Detect bare python/pip calls that would hit system Python instead of a venv.
+
+    Splits multi-command pipelines on &&, ||, ;, | and checks each segment.
+    Returns True if ANY segment is a bare python/pip invocation.
+
+    Allowed (returns False):
+      - Explicit venv path: .venv/Scripts/python.exe, venv/bin/python, etc.
+      - Venv creation: python -m venv, py -m venv
+      - Non-python commands chained with python-looking segments won't flag
+    """
+    # Executables that go to system Python when unqualified.
+    _BARE_EXES = _re.compile(
+        r'^(?:python3?(?:\.exe)?|pip3?(?:\.exe)?|py)\s',
+        _re.IGNORECASE,
+    )
+    # A path component that identifies an explicit venv.
+    _VENV_PATH = _re.compile(
+        r'[/\\](?:\.venv|venv|env|\.env)[/\\]',
+        _re.IGNORECASE,
+    )
+    # Venv creation — always allowed regardless of other checks.
+    _VENV_CREATE = _re.compile(
+        r'^(?:python3?(?:\.exe)?|py)\s+.*-m\s+venv\b',
+        _re.IGNORECASE,
+    )
+    # Split on shell sequence operators and pipes (crude but sufficient).
+    segments = _re.split(r'&&|\|\||[;|]', command)
+    for raw in segments:
+        seg = raw.strip()
+        if not seg:
+            continue
+        if not _BARE_EXES.match(seg):
+            continue                       # not a python/pip invocation
+        if _VENV_PATH.search(seg):
+            continue                       # qualified with a venv path
+        if _VENV_CREATE.match(seg):
+            continue                       # creating a venv — always allowed
+        return True                        # bare invocation found
+    return False
 
 # Prefixes that are definitely read-only / safe — don't flag as script execution.
 _EXEC_SAFE_PREFIXES = (
@@ -921,40 +1039,166 @@ _EXEC_SAFE_PREFIXES = (
 )
 
 def _is_exec(command: str) -> bool:
-    """Detect script/binary execution (.py/.js/.sh/.bat/.ps1/.exe)."""
-    import re
+    """Detect script/binary execution (.py/.js/.sh/.bat/.ps1/.exe).
+
+    Python/pip interpreters are stripped before the check so that
+    `path/to/.venv/Scripts/python.exe -c "..."` doesn't falsely trigger.
+    """
     stripped = command.strip()
     lower = stripped.lower()
     if any(lower.startswith(ex) for ex in _EXEC_SAFE_PREFIXES):
         return False
-    return bool(re.search(r'\b\S+\.(py|js|sh|bat|ps1|exe)\b', stripped, re.IGNORECASE))
+    # Strip a leading python/pip interpreter token (quoted or bare) before checking.
+    # This prevents the interpreter path itself (.exe) from triggering the gate.
+    candidate = _re.sub(
+        r'^"?[^\s"]*(?:python\d*(?:\.\d+)?|pip\d*)(?:\.exe)?"?\s+',
+        "", stripped, flags=_re.IGNORECASE,
+    )
+    return bool(_re.search(r'\b\S+\.(py|js|sh|bat|ps1|exe)\b', candidate, _re.IGNORECASE))
+
+
+def _menu_select(options: list[str]) -> int:
+    """Interactive menu: arrow keys or number keys to select. Returns 0-based index."""
+    import sys, os
+
+    n = len(options)
+    selected = 0
+
+    def _render(sel: int, first: bool) -> None:
+        if not first:
+            sys.stdout.write(f"\033[{n}A")   # move cursor up n lines
+        for i, opt in enumerate(options):
+            if i == sel:
+                sys.stdout.write(f"\r\033[2K  \033[1;36m❯ {i + 1}. {opt}\033[0m\n")
+            else:
+                sys.stdout.write(f"\r\033[2K    {i + 1}. {opt}\n")
+        sys.stdout.flush()
+
+    _render(selected, first=True)
+
+    if os.name == "nt":
+        import msvcrt
+        while True:
+            ch = msvcrt.getwch()
+            if ch in ("\r", "\n"):
+                break
+            if ch in ("1", "2", "3"):
+                idx = int(ch) - 1
+                if 0 <= idx < n:
+                    selected = idx
+                    _render(selected, first=False)
+            if ch in ("\xe0", "\x00"):          # escape prefix for arrow keys
+                arrow = msvcrt.getwch()
+                if arrow == "H":                # up arrow
+                    selected = (selected - 1) % n
+                elif arrow == "P":              # down arrow
+                    selected = (selected + 1) % n
+                _render(selected, first=False)
+    else:
+        import tty, termios
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while True:
+                ch = sys.stdin.read(1)
+                if ch in ("\r", "\n"):
+                    break
+                if ch == "\x03":                # Ctrl+C
+                    raise KeyboardInterrupt
+                if ch in ("1", "2", "3"):
+                    idx = int(ch) - 1
+                    if 0 <= idx < n:
+                        selected = idx
+                        _render(selected, first=False)
+                if ch == "\x1b":
+                    seq = sys.stdin.read(2)
+                    if seq == "[A":             # up arrow
+                        selected = (selected - 1) % n
+                    elif seq == "[B":           # down arrow
+                        selected = (selected + 1) % n
+                    _render(selected, first=False)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    return selected
+
+
+def _new_project_path(name: str, args: dict, cwd: Path) -> Path | None:
+    """Return the first new directory that would be created, or None.
+
+    Fires on:
+      - bash commands containing 'mkdir' targeting a path that doesn't exist yet
+      - write_file calls whose parent directory doesn't exist yet
+
+    Used to gate new-project scaffolding behind a plan-approval prompt.
+    """
+    if name == "bash":
+        cmd = args.get("command", "")
+        if "mkdir" not in cmd.lower():
+            return None
+        # Extract the first path argument after mkdir (with optional -p / -m flags)
+        m = _re.search(
+            r'\bmkdir\b(?:\s+(?:-[a-zA-Z0-9]+\s+)*)"?([^\s"&|;><]+)"?',
+            cmd,
+        )
+        if not m:
+            return None
+        target = Path(m.group(1).strip('"\''))
+        if not target.is_absolute():
+            target = cwd / target
+        if not target.exists():
+            return target
+    elif name == "write_file":
+        raw = args.get("path", "")
+        if not raw:
+            return None
+        target = Path(raw)
+        if not target.is_absolute():
+            target = cwd / target
+        if not target.parent.exists():
+            return target.parent
+    return None
 
 
 async def tool_bash(command: str, timeout: int = 30, cwd: Path | None = None) -> str:
     try:
+        effective_cwd = Path(cwd) if cwd else None
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            cwd=str(cwd) if cwd else None,
+            cwd=str(effective_cwd) if effective_cwd else None,
         )
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
             proc.kill()
             return f"[timeout after {timeout}s]"
-        output = stdout.decode(errors="replace")
-        return output if output else "(no output)"
+        output = stdout.decode(errors="replace").rstrip()
+        rc = proc.returncode
+        cwd_line = f"[cwd: {effective_cwd}]\n" if effective_cwd else ""
+        if output:
+            return f"{cwd_line}[exit {rc}]\n{output}" if rc != 0 else f"{cwd_line}{output}"
+        else:
+            return f"{cwd_line}(exit {rc})"
     except Exception as e:
         return f"[error: {e}]"
 
 
-async def tool_read_file(path: str) -> str:
+async def tool_read_file(path: str, offset: int = 1, limit: int = 200) -> str:
     try:
-        text = Path(path).read_text(encoding="utf-8", errors="replace")
-        if len(text) > 8000:
-            text = text[:8000] + f"\n... [truncated, {len(text)} chars total]"
-        return text
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        total = len(lines)
+        start = max(0, offset - 1)          # convert 1-based to 0-based
+        end   = min(total, start + limit)
+        slice_ = lines[start:end]
+        width  = len(str(start + len(slice_)))
+        numbered = "\n".join(f"{start + i + 1:>{width}} | {l}" for i, l in enumerate(slice_))
+        footer = ""
+        if end < total:
+            footer = f"\n... [{total - end} more lines — use offset={end + 1} to continue]"
+        return numbered + footer
     except Exception as e:
         return f"[error: {e}]"
 
@@ -1135,7 +1379,20 @@ async def tool_edit(path: str, old_string: str, new_string: str) -> str:
         text = p.read_text(encoding="utf-8", errors="replace")
         count = text.count(old_string)
         if count == 0:
-            return "[error: old_string not found in file]"
+            # Give the model a fuzzy hint: find the line in the file most similar to
+            # the first line of old_string so it can correct its old_string.
+            import difflib as _difflib
+            target_first = old_string.splitlines()[0].strip() if old_string.strip() else ""
+            file_lines = text.splitlines()
+            if target_first:
+                matches = _difflib.get_close_matches(target_first, file_lines, n=3, cutoff=0.4)
+                if matches:
+                    hint = "\n".join(f"  {m!r}" for m in matches)
+                    return (
+                        "[error: old_string not found in file]\n"
+                        f"Closest lines in file (use read_file to get exact content):\n{hint}"
+                    )
+            return "[error: old_string not found — use read_file to get the exact content before editing]"
         if count > 1:
             return f"[error: old_string found {count} times — make it more specific]"
         new_text = text.replace(old_string, new_string, 1)
@@ -1153,6 +1410,15 @@ async def tool_edit(path: str, old_string: str, new_string: str) -> str:
         return f"Edited {p.name}: applied (whitespace-only change)"
     except Exception as e:
         return f"[error: {e}]"
+
+
+async def tool_speak(text: str) -> str:
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.post("http://127.0.0.1:1236/play", json={"text": text}, timeout=10)
+        return "spoken" if r.is_success else f"[voice error: {r.status_code}]"
+    except Exception as e:
+        return f"[voice unavailable: {e}]"
 
 
 async def tool_web_fetch(url: str) -> str:
@@ -1397,6 +1663,7 @@ class ChatSession:
         self._in_subagent: bool     = False
         self.compact_mode: bool     = False
         self._project_config: dict  = {}
+        self._approval_notes: str   = ""  # injected into tool result after dispatch
 
     async def __aenter__(self):
         await self._health_check()
@@ -1471,9 +1738,16 @@ class ChatSession:
                 return
 
     def _inject_cwd_context(self) -> None:
-        """Inject current working directory as a system message so Eli always knows where it is."""
+        """Inject current working directory and date as a system message."""
+        import datetime
         self._remove_cwd_context()
-        content = f"[Session Context]\nCurrent working directory: {self.cwd}\nAll relative file paths resolve against this directory."
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        content = (
+            f"[Session Context]\n"
+            f"Today's date: {today}\n"
+            f"Current working directory: {self.cwd}\n"
+            f"All relative file paths resolve against this directory."
+        )
         self.messages.insert(self._n_fixed, {"role": "system", "content": content})
         self._n_fixed += 1
 
@@ -1770,20 +2044,43 @@ class ChatSession:
                     "content": assistant_content or None,
                     "tool_calls": tool_calls_received,
                 })
-                # Execute tool calls in parallel
+                # Execute tool calls: read-only ops in parallel, write/exec sequentially.
+                # Write ops (bash, write_file, edit) must be sequential so interactive
+                # gates (approval prompts, plan gates) fire in order and can't be raced.
+                _READ_ONLY_TOOLS = {"read_file", "list_dir", "glob", "grep", "ripgrep",
+                                    "web_search", "web_fetch", "speak"}
+
                 async def _run_one(tc):
-                    return await self._call_tool(
+                    return tc["id"], await self._call_tool(
                         tc["function"]["name"],
                         tc["function"]["arguments"],
                         tc["id"],
                     )
-                results = await asyncio.gather(*[_run_one(tc) for tc in tool_calls_received])
-                for tc, result in zip(tool_calls_received, results):
-                    self.messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": result,
-                    })
+
+                # Split into runs: flush a parallel batch whenever a write op appears.
+                # Stop the entire batch immediately if any gate rejects a call.
+                _batch: list = []
+                _gate_rejected = False
+                for tc in tool_calls_received:
+                    if _gate_rejected:
+                        break
+                    if tc["function"]["name"] in _READ_ONLY_TOOLS:
+                        _batch.append(tc)
+                    else:
+                        # Flush pending reads in parallel first
+                        if _batch:
+                            for _tc_id, _result in await asyncio.gather(*[_run_one(t) for t in _batch]):
+                                self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
+                            _batch = []
+                        # Then run the write op sequentially
+                        _tc_id, _result = await _run_one(tc)
+                        self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
+                        if _result.startswith(_GATE_REJECTED_PREFIX):
+                            _gate_rejected = True
+                # Flush any remaining reads (only if not rejected)
+                if _batch and not _gate_rejected:
+                    for _tc_id, _result in await asyncio.gather(*[_run_one(t) for t in _batch]):
+                        self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
                 # Loop: send tool results back to model
                 continue
             else:
@@ -1850,13 +2147,51 @@ class ChatSession:
             resolved = self.cwd / resolved
         return str(resolved)
 
+    async def _approval_prompt(self, title: str, message: str, style: str = "yellow") -> tuple[bool, str]:
+        """Three-option approval prompt: y / b (yes, but...) / n (no, with reason).
+
+        Returns (approved: bool, notes: str).
+        Notes are non-empty when user chose 'b' or 'n' and typed something.
+        Caller injects notes into the tool result (approved) or rejection message (denied).
+        """
+        console.print(Panel(message, title=f"[{style}]{title}[/{style}]", border_style=style))
+        loop = asyncio.get_event_loop()
+        try:
+            selected = await loop.run_in_executor(
+                None, lambda: _menu_select(["Yes", "Yes, but... (add notes)", "No"])
+            )
+        except (EOFError, KeyboardInterrupt):
+            return False, ""
+
+        if selected == 0:
+            return True, ""
+        elif selected == 1:
+            console.print("[dim]Notes (sent to Eli as context):[/dim]")
+            try:
+                notes = await loop.run_in_executor(None, lambda: input("   > ").strip())
+            except (EOFError, KeyboardInterrupt):
+                notes = ""
+            return True, notes
+        else:
+            console.print("[dim]Reason (optional, sent to Eli):[/dim]")
+            try:
+                reason = await loop.run_in_executor(None, lambda: input("   > ").strip())
+            except (EOFError, KeyboardInterrupt):
+                reason = ""
+            return False, reason
+
     async def _dispatch_tool(self, name: str, args: dict) -> str:
         """Pure tool dispatch — no display, no approval check."""
         try:
             if name == "bash":
-                return await tool_bash(args.get("command", ""), args.get("timeout", 30), cwd=self.cwd)
+                _bash_cwd = Path(args["cwd"]) if args.get("cwd") else self.cwd
+                return await tool_bash(args.get("command", ""), args.get("timeout", 30), cwd=_bash_cwd)
             elif name == "read_file":
-                return await tool_read_file(self._resolve_path(args.get("path", "")))
+                return await tool_read_file(
+                    self._resolve_path(args.get("path", "")),
+                    offset=int(args.get("offset", 1)),
+                    limit=int(args.get("limit", 200)),
+                )
             elif name == "write_file":
                 return await tool_write_file(self._resolve_path(args.get("path", "")), args.get("content", ""))
             elif name == "list_dir":
@@ -1904,7 +2239,7 @@ class ChatSession:
                     args.get("task", ""),
                     args.get("tools"),
                     args.get("think_level"),
-                    min(args.get("max_iterations", 10), 10),
+                    min(args.get("max_iterations", 10), 30),
                     args.get("model"),
                 )
             elif name == "analyze_image":
@@ -1919,6 +2254,8 @@ class ChatSession:
                     args.get("agents", []),
                     args.get("label", ""),
                 )
+            elif name == "speak":
+                return await tool_speak(args.get("text", ""))
             else:
                 return f"[unknown tool: {name}]"
         except Exception as e:
@@ -1937,11 +2274,16 @@ class ChatSession:
         if self._in_subagent:
             return "[error: nested sub-agent spawning is not allowed]"
 
-        # Resolve profile name → system prompt
+        # Resolve profile name → system prompt, and auto-extract recommended model
         if system_prompt and " " not in system_prompt.strip():
             profile_path = Path(__file__).parent / "agents" / f"{system_prompt}.md"
             if profile_path.exists():
                 system_prompt = profile_path.read_text(encoding="utf-8")
+                # Use the profile's recommended model if caller didn't specify one
+                if not model:
+                    _m = _re.search(r'\*\*Recommended model:\*\*\s*`([^`]+)`', system_prompt)
+                    if _m:
+                        model = _m.group(1).strip()
             # If not found, use the string as-is (may be a short raw prompt)
 
         # Build tool list — always exclude spawn_agent from sub-agents
@@ -1950,7 +2292,7 @@ class ChatSession:
             sub_tools = [t for t in sub_tools if t["function"]["name"] in tools]
 
         think = think_level or self.think_level
-        max_iter = min(max_iterations, 10)
+        max_iter = min(max_iterations, 30)
 
         # ── Model switch ──────────────────────────────────────────────────────
         restore_profile: str | None = None
@@ -1961,15 +2303,20 @@ class ChatSession:
                 return f"[error: model profile '{model}' not found in commands.json. Available: {available}]"
             # Capture what's running now so we can restore it afterward
             restore_profile = await _find_active_profile()
-            console.print(Panel(
-                f"[yellow]Switching server to:[/yellow] {model}\n"
-                f"[dim]Will restore '{restore_profile or 'original'}' after agent finishes.[/dim]",
-                title="[yellow]Model Switch[/yellow]",
-                border_style="yellow",
-            ))
-            ready = await _switch_server(model)
-            if not ready:
-                return f"[error: server failed to start model '{model}' — agent aborted]"
+            if restore_profile == model:
+                # Already on the right model — no switch needed, no restore needed
+                restore_profile = None
+                console.print(f"[dim]  Model already loaded: {model}[/dim]")
+            else:
+                console.print(Panel(
+                    f"[yellow]Switching server to:[/yellow] {model}\n"
+                    f"[dim]Will restore '{restore_profile or 'original'}' after agent finishes.[/dim]",
+                    title="[yellow]Model Switch[/yellow]",
+                    border_style="yellow",
+                ))
+                ready = await _switch_server(model)
+                if not ready:
+                    return f"[error: server failed to start model '{model}' — agent aborted]"
 
         messages: list[dict] = [
             {"role": "system", "content": system_prompt},
@@ -2108,7 +2455,11 @@ class ChatSession:
                                     title="[red]Venv Rule Violation[/red]",
                                     border_style="red",
                                 ))
-                                tc_result = "[blocked: bare python/pip — must use .venv\\Scripts\\pip.exe or .venv\\Scripts\\python.exe]"
+                                tc_result = (
+                                    "[blocked: bare python/pip — all Python must run inside the project venv. "
+                                    "If no venv exists yet, create one first: python -m venv .venv "
+                                    "Then use: .venv\\Scripts\\python.exe  or  .venv\\Scripts\\pip.exe install <pkg>]"
+                                )
                                 console.print(Panel(tc_result, title="[dim cyan]Agent Tool Result[/dim cyan]", border_style="red"))
                                 return tc["id"], tc_result
 
@@ -2144,26 +2495,22 @@ class ChatSession:
                                 ask_needed = True
                                 ask_msg = "[yellow]Sub-agent bash command — approve?[/yellow]"
                             if ask_needed:
-                                console.print(Panel(
-                                    ask_msg,
-                                    title=f"[{ask_style}]{ask_title}[/{ask_style}]",
-                                    border_style=ask_style,
-                                ))
-                                try:
-                                    confirm = await asyncio.get_event_loop().run_in_executor(
-                                        None, lambda: input("Run it? [y/N] ")
-                                    )
-                                except (EOFError, KeyboardInterrupt):
-                                    confirm = "n"
-                                if confirm.strip().lower() != "y":
-                                    tc_result = "[cancelled by user]"
+                                _sa_approved, _sa_notes = await self._approval_prompt(ask_title, ask_msg, ask_style)
+                                if not _sa_approved:
+                                    _reason = f" User says: {_sa_notes}." if _sa_notes else ""
+                                    tc_result = f"[cancelled by user]{_reason}"
                                     console.print(Panel(
                                         tc_result,
                                         title="[dim cyan]Agent Tool Result[/dim cyan]",
                                         border_style="cyan",
                                     ))
                                     return tc["id"], tc_result
+                                if _sa_notes:
+                                    self._approval_notes = _sa_notes
                         tc_result = await self._dispatch_tool(tc_name, tc_args)
+                        if self._approval_notes:
+                            tc_result += f"\n[Note from user: {self._approval_notes}]"
+                            self._approval_notes = ""
                         if self.compact_mode:
                             console.print(f"[dim]      → {markup_escape(self._compact_result(tc_result))}[/dim]")
                         else:
@@ -2175,8 +2522,8 @@ class ChatSession:
                             ))
                         return tc["id"], tc_result
 
-                    results = await asyncio.gather(*[_run_agent_tool(tc) for tc in tool_calls_received])
-                    for tc_id, tc_result_val in results:
+                    for tc in tool_calls_received:
+                        tc_id, tc_result_val = await _run_agent_tool(tc)
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc_id,
@@ -2225,19 +2572,13 @@ class ChatSession:
                 except Exception:
                     pass  # best-effort only
 
-            if model:
-                if restore_profile:
-                    console.print(Panel(
-                        f"[dim]Restoring server: {restore_profile}[/dim]",
-                        title="[yellow]Model Restore[/yellow]",
-                        border_style="yellow",
-                    ))
-                    await _switch_server(restore_profile)
-                else:
-                    console.print(
-                        f"[dim yellow]  Note: could not identify original model — "
-                        f"server left on '{model}'[/dim yellow]"
-                    )
+            if model and restore_profile:
+                console.print(Panel(
+                    f"[dim]Restoring server: {restore_profile}[/dim]",
+                    title="[yellow]Model Restore[/yellow]",
+                    border_style="yellow",
+                ))
+                await _switch_server(restore_profile)
 
         if self.compact_mode and final_text:
             first_line = final_text.split("\n")[0][:120]
@@ -2370,17 +2711,21 @@ class ChatSession:
             agent_num = idx + 1
             target_model = spec.get("model")
             timeout_s = max(30, int(spec.get("timeout_seconds", 300)))
-            max_iter = min(int(spec.get("max_iterations", 10)), 10)
+            max_iter = min(int(spec.get("max_iterations", 10)), 30)
             think = spec.get("think_level") or self.think_level
             tools_wl = spec.get("tools")
             task = spec.get("task", "")
             sp = spec.get("system_prompt", "")
 
-            # Resolve profile → system prompt
+            # Resolve profile → system prompt, auto-extract recommended model
             if sp and " " not in sp.strip():
                 profile_path = Path(__file__).parent / "agents" / f"{sp}.md"
                 if profile_path.exists():
                     sp = profile_path.read_text(encoding="utf-8")
+                    if not target_model:
+                        _m = _re.search(r'\*\*Recommended model:\*\*\s*`([^`]+)`', sp)
+                        if _m:
+                            target_model = _m.group(1).strip()
 
             # Switch model only when needed
             if target_model and target_model != current_model:
@@ -2512,8 +2857,8 @@ class ChatSession:
                             if self.compact_mode:
                                 console.print(f"[dim]      → {markup_escape(self._compact_result(tc_result))}[/dim]")
                             return tc["id"], tc_result
-                        tool_results = await asyncio.gather(*[_run_q_tool(tc) for tc in tool_calls_received])
-                        for tc_id, tc_result_val in tool_results:
+                        for tc in tool_calls_received:
+                            tc_id, tc_result_val = await _run_q_tool(tc)
                             messages.append({"role": "tool", "tool_call_id": tc_id, "content": tc_result_val})
                     else:
                         if assistant_content:
@@ -2605,13 +2950,67 @@ class ChatSession:
             cmd = args.get("command", "")
             if _is_bare_python(cmd):
                 console.print(Panel(
-                    f"[red]Bare python/pip call blocked.[/red] Use the project venv instead:\n"
+                    f"[red]Bare python/pip call blocked.[/red]\n"
                     f"[dim]{cmd}[/dim]\n\n"
-                    "[yellow]Example:[/yellow] [bold].venv\\Scripts\\pip.exe install package[/bold]",
+                    "All Python must run inside the project venv.\n"
+                    "[yellow]New project?[/yellow] Create venv first: [bold]python -m venv .venv[/bold]\n"
+                    "[yellow]Then use:[/yellow] [bold].venv\\Scripts\\python.exe script.py[/bold]  or  [bold].venv\\Scripts\\pip.exe install <pkg>[/bold]",
                     title="[red]Venv Rule Violation[/red]",
                     border_style="red",
                 ))
-                return "[blocked: bare python/pip call — must use project venv (.venv\\Scripts\\pip.exe or .venv\\Scripts\\python.exe)]"
+                return (
+                    "[blocked: bare python/pip — all Python must run inside the project venv. "
+                    "New project? Create the venv first: python -m venv .venv "
+                    "Then: .venv\\Scripts\\python.exe script.py  or  .venv\\Scripts\\pip.exe install <pkg>]"
+                )
+
+        # New-project gate — fires before the general approval guard, in all modes except yolo.
+        # Blocks scaffolding until the user confirms a plan has been approved.
+        if self.approval_level != "yolo":
+            _np = _new_project_path(name, args, self.cwd)
+            if _np is not None:
+                # Detect whether Eli asked any questions before trying to build.
+                _asked_questions = any(
+                    m["role"] == "assistant" and m.get("content") and not m.get("tool_calls")
+                    for m in self.messages
+                )
+                _skipped_step1 = not _asked_questions
+                _gate_msg = (
+                    f"[magenta bold]New project structure detected.[/magenta bold]\n"
+                    f"[dim]Path: {_np}[/dim]\n\n"
+                )
+                if _skipped_step1:
+                    _gate_msg += (
+                        "[red]You went straight to creating files without asking a single question.[/red]\n"
+                        "Step 1 of the workflow is mandatory: ask all clarifying questions first,\n"
+                        "then wait for answers before doing anything else."
+                    )
+                else:
+                    _gate_msg += (
+                        "Have you: asked clarifying questions, received answers, run research,\n"
+                        "written a proposal, had it reviewed, and received explicit approval?"
+                    )
+                _np_approved, _np_notes = await self._approval_prompt(
+                    "Plan Approval Required", _gate_msg, style="magenta",
+                )
+                if not _np_approved:
+                    _reason = f" User says: {_np_notes}." if _np_notes else ""
+                    _step1_reminder = (
+                        " You skipped Step 1 entirely. Your NEXT action must be a message"
+                        " asking the user clarifying questions — not a tool call."
+                        if _skipped_step1 else ""
+                    )
+                    return (
+                        _GATE_REJECTED_PREFIX +
+                        f" No plan approved.{_reason}{_step1_reminder} STOP all file/directory creation. "
+                        "Follow the new project workflow: "
+                        "(1) Ask clarifying questions in one message and wait for answers. "
+                        "(2) spawn_agent researcher. "
+                        "(3) Write proposal, spawn expert_coder to review it. "
+                        "(4) Present plan, ask 'Shall I proceed?', wait for yes."
+                    )
+                if _np_notes:
+                    self._approval_notes = _np_notes
 
         # Approval guard
         if self.approval_level != "yolo":
@@ -2647,22 +3046,20 @@ class ChatSession:
                     ask_needed = True
                     ask_msg = "[yellow]Write operation — approve?[/yellow]"
             if ask_needed:
-                console.print(Panel(
-                    ask_msg,
-                    title=f"[{ask_style}]{ask_title}[/{ask_style}]",
-                    border_style=ask_style,
-                ))
-                try:
-                    confirm = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: input("Run it? [y/N] ")
-                    )
-                except (EOFError, KeyboardInterrupt):
-                    confirm = "n"
-                if confirm.strip().lower() != "y":
-                    return "[cancelled by user]"
+                _approved, _notes = await self._approval_prompt(ask_title, ask_msg, ask_style)
+                if not _approved:
+                    _reason = f" User says: {_notes}." if _notes else ""
+                    return f"[cancelled by user]{_reason}"
+                if _notes:
+                    self._approval_notes = _notes
 
         # Dispatch
         result = await self._dispatch_tool(name, args)
+
+        # Inject any approval notes (from "yes, but...") into the tool result
+        if self._approval_notes:
+            result += f"\n[Note from user: {self._approval_notes}]"
+            self._approval_notes = ""
 
         # Post-edit hook — run build/test after file edits
         if name in ("edit", "write_file") and not result.startswith("[error"):
@@ -2700,6 +3097,300 @@ class ChatSession:
             )
         return result
 
+# ── Voice conversation loop ────────────────────────────────────────────────────
+
+async def _voice_model_call(history: list, client: httpx.AsyncClient) -> str:
+    """Send voice history to the model and return the full reply text."""
+    payload = {
+        "model": "auto",
+        "messages": history,
+        "stream": True,
+        "temperature": 0.85,
+        "max_tokens": 180,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    reply_parts: list[str] = []
+    console.print()
+    async with client.stream(
+        "POST",
+        f"{BASE_URL}/v1/chat/completions",
+        json=payload,
+        headers={"Accept": "text/event-stream"},
+    ) as response:
+        response.raise_for_status()
+        async for event_type, data in stream_events(response):
+            if event_type == "text":
+                reply_parts.append(data)
+                console.print(data, end="", markup=False)
+    console.print()
+    return "".join(reply_parts).strip()
+
+
+async def _voice_record_ptt(ptt_event_start: asyncio.Event, ptt_event_stop: asyncio.Event) -> bytes:
+    """Record audio while PTT is held. Returns raw int16 PCM bytes."""
+    import numpy as np
+    import sounddevice as sd
+
+    await ptt_event_start.wait()
+    ptt_event_start.clear()
+    console.print("[bold red]● REC[/bold red]", end="\r")
+
+    chunks: list[bytes] = []
+    loop = asyncio.get_event_loop()
+    chunk_done = asyncio.Event()
+    current_chunk: list = [None]
+
+    def callback(indata, frames, time_info, status):
+        current_chunk[0] = indata.copy()
+        loop.call_soon_threadsafe(chunk_done.set)
+
+    block_size = int(VOICE_SAMPLE_RATE * 0.05)  # 50ms chunks
+    with sd.InputStream(
+        samplerate=VOICE_SAMPLE_RATE,
+        channels=1,
+        dtype="int16",
+        blocksize=block_size,
+        callback=callback,
+    ):
+        while not ptt_event_stop.is_set():
+            chunk_done.clear()
+            await asyncio.wait_for(chunk_done.wait(), timeout=0.2)
+            if current_chunk[0] is not None:
+                chunks.append(current_chunk[0].tobytes())
+
+    return b"".join(chunks)
+
+
+async def _voice_record_auto(quit_event: asyncio.Event) -> bytes | None:
+    """Record audio using WebRTC VAD + RMS gate. Returns PCM bytes or None if quit."""
+    import numpy as np
+    import sounddevice as sd
+    import webrtcvad
+
+    vad = webrtcvad.Vad(2)
+    frame_ms = 20
+    frame_samples = int(VOICE_SAMPLE_RATE * frame_ms / 1000)
+    silence_frames_needed = int(VOICE_SILENCE_TIMEOUT * 1000 / frame_ms)
+    min_speech_frames = int(VOICE_MIN_SPEECH_MS / frame_ms)
+
+    speech_chunks: list[bytes] = []
+    silence_count = 0
+    in_speech = False
+    onset_count = 0   # consecutive loud+speech frames; must reach VOICE_ONSET_FRAMES
+
+    loop = asyncio.get_event_loop()
+    q: asyncio.Queue = asyncio.Queue()
+
+    def callback(indata, frames, time_info, status):
+        loop.call_soon_threadsafe(q.put_nowait, indata.copy().tobytes())
+
+    with sd.InputStream(
+        samplerate=VOICE_SAMPLE_RATE,
+        channels=1,
+        dtype="int16",
+        blocksize=frame_samples,
+        callback=callback,
+    ):
+        while not quit_event.is_set():
+            try:
+                frame = await asyncio.wait_for(q.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+
+            # RMS gate — ignore frames below volume threshold regardless of VAD
+            audio_np = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+            rms = float(np.sqrt(np.mean(audio_np ** 2)))
+            is_speech = rms >= VOICE_RMS_THRESHOLD and vad.is_speech(frame, VOICE_SAMPLE_RATE)
+
+            if is_speech:
+                onset_count += 1
+                if not in_speech:
+                    if onset_count >= VOICE_ONSET_FRAMES:
+                        # Confirmed speech onset
+                        in_speech = True
+                        console.print("[bold red]● REC[/bold red]", end="\r")
+                else:
+                    speech_chunks.append(frame)
+                    silence_count = 0
+            else:
+                onset_count = 0
+                if in_speech:
+                    speech_chunks.append(frame)
+                    silence_count += 1
+                    if silence_count >= silence_frames_needed:
+                        if len(speech_chunks) >= min_speech_frames:
+                            return b"".join(speech_chunks)
+                        else:
+                            speech_chunks.clear()
+                            in_speech = False
+                            silence_count = 0
+                            console.print("[dim]  (too short, discarded)[/dim]")
+    return None
+
+
+async def _voice_transcribe(audio_bytes: bytes) -> str:
+    """POST raw PCM to /transcribe and return transcript."""
+    import requests as _requests
+    console.print("[dim]⏳ transcribing...[/dim]", end="\r")
+    resp = _requests.post(
+        f"{TTS_URL}/transcribe",
+        data=audio_bytes,
+        params={"sample_rate": VOICE_SAMPLE_RATE},
+        headers={"Content-Type": "application/octet-stream"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json().get("text", "").strip()
+
+
+async def _voice_speak(text: str) -> None:
+    """Send text to TTS server for playback (blocking)."""
+    import requests as _requests
+    _requests.post(
+        f"{TTS_URL}/play",
+        json={"text": text},
+        timeout=60,
+    )
+
+
+async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt") -> None:
+    """Blocking voice conversation loop. Exit: q+Enter or Ctrl+C."""
+    try:
+        import sounddevice  # noqa: F401 — check it's available
+    except ImportError:
+        console.print("[red]sounddevice not installed. Run: .venv\\Scripts\\pip install sounddevice[/red]")
+        return
+
+    # Load persona from agents/voice.md; fall back to inline constant
+    voice_agent_file = Path(__file__).parent / "agents" / "voice.md"
+    voice_prompt = (
+        voice_agent_file.read_text(encoding="utf-8")
+        if voice_agent_file.exists()
+        else VOICE_SYSTEM_PROMPT
+    )
+    history = [{"role": "system", "content": voice_prompt}]
+
+    from pynput import keyboard as _kb
+
+    quit_event = asyncio.Event()
+    loop = asyncio.get_event_loop()
+
+    if mode == "ptt":
+        # Resolve the PTT key
+        try:
+            ptt_key = getattr(_kb.Key, PTT_KEY)
+        except AttributeError:
+            ptt_key = _kb.KeyCode.from_char(PTT_KEY)
+
+        ptt_start = asyncio.Event()
+        ptt_stop  = asyncio.Event()
+
+        def on_press(key):
+            if key == ptt_key:
+                loop.call_soon_threadsafe(ptt_start.set)
+                loop.call_soon_threadsafe(ptt_stop.clear)
+            elif key == _kb.Key.esc:
+                loop.call_soon_threadsafe(quit_event.set)
+
+        def on_release(key):
+            if key == ptt_key:
+                loop.call_soon_threadsafe(ptt_stop.set)
+
+        listener = _kb.Listener(on_press=on_press, on_release=on_release)
+        listener.start()
+
+        console.print(Panel(
+            f"Voice mode [bold]PTT[/bold] — hold [bold cyan]{PTT_KEY}[/bold cyan] to speak, release to send.\n"
+            "[dim]Press Escape to exit.[/dim]",
+            border_style="magenta",
+        ))
+
+        try:
+            while not quit_event.is_set():
+                console.print("[dim]waiting for PTT...[/dim]", end="\r")
+
+                while not ptt_start.is_set() and not quit_event.is_set():
+                    await asyncio.sleep(0.05)
+
+                if quit_event.is_set():
+                    break
+
+                audio = await _voice_record_ptt(ptt_start, ptt_stop)
+                if not audio:
+                    continue
+
+                transcript = await _voice_transcribe(audio)
+                if not transcript:
+                    console.print("[dim]  (nothing heard)[/dim]")
+                    continue
+
+                console.print(f"[bold green]You:[/bold green] {transcript}")
+                history.append({"role": "user", "content": transcript})
+
+                reply = await _voice_model_call(history, session.client)
+                if not reply:
+                    continue
+                history.append({"role": "assistant", "content": reply})
+
+                await _voice_speak(reply)
+                await asyncio.sleep(VOICE_POST_TTS_DELAY)
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            listener.stop()
+
+    else:  # auto VAD mode
+        try:
+            import webrtcvad  # noqa: F401
+        except ImportError:
+            console.print("[red]webrtcvad not installed. Run: .venv\\Scripts\\pip install webrtcvad[/red]")
+            return
+
+        def on_press_auto(key):
+            if key == _kb.Key.esc:
+                loop.call_soon_threadsafe(quit_event.set)
+
+        listener = _kb.Listener(on_press=on_press_auto)
+        listener.start()
+
+        console.print(Panel(
+            "Voice mode [bold]AUTO[/bold] — speak naturally, pause to send.\n"
+            "[dim]Press Escape to exit.[/dim]",
+            border_style="magenta",
+        ))
+
+        try:
+            while not quit_event.is_set():
+                console.print("[dim]listening...[/dim]", end="\r")
+                audio = await _voice_record_auto(quit_event)
+                if not audio or quit_event.is_set():
+                    break
+
+                transcript = await _voice_transcribe(audio)
+                if not transcript:
+                    console.print("[dim]  (nothing heard)[/dim]")
+                    continue
+
+                console.print(f"[bold green]You:[/bold green] {transcript}")
+                history.append({"role": "user", "content": transcript})
+
+                reply = await _voice_model_call(history, session.client)
+                if not reply:
+                    continue
+                history.append({"role": "assistant", "content": reply})
+
+                await _voice_speak(reply)
+                await asyncio.sleep(VOICE_POST_TTS_DELAY)
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            listener.stop()
+
+    console.print(Rule("[dim]Voice mode ended[/dim]", style="dim"))
+
+
 # ── Slash command handler ─────────────────────────────────────────────────────
 async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
     """Returns True if command was handled (skip sending to model)."""
@@ -2727,6 +3418,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                     "[bold]/skills[/bold]                List available skills",
                     "[bold]/skill <name> \\[args\\][/bold]   Invoke a skill explicitly",
                     "[bold]/queue-results \\[label\\][/bold]  List recent agent queue runs, or show one by label",
+                    "[bold]/voice \\[ptt|auto\\][/bold]      Start voice sparring mode (PTT or auto-VAD)",
                     "[bold]/help[/bold]                  Show this message",
                     "",
                     "[bold]Shift+Tab[/bold]              Cycle mode: normal → plan → normal",
@@ -3060,6 +3752,14 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                     lines.append(f"[bold cyan]{qdir.name}[/bold cyan]  [dim](unreadable)[/dim]")
             lines.append("\n[dim]Usage: /queue-results <label>  — show full results for a run[/dim]")
             console.print(Panel("\n".join(lines), title="Recent Queue Runs", border_style="cyan"))
+        return True
+
+    elif name == "/voice":
+        voice_mode = parts[1].lower() if len(parts) > 1 else VOICE_DEFAULT_MODE
+        if voice_mode not in ("ptt", "auto"):
+            console.print(f"[yellow]Unknown voice mode '{voice_mode}'. Use: ptt | auto[/yellow]")
+            return True
+        await _voice_conversation_loop(session, mode=voice_mode)
         return True
 
     # Unknown /command — try skill lookup before giving up

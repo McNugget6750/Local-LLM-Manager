@@ -4,3 +4,15 @@ httpx[http2]>=0.27
 rich>=13.7
 prompt_toolkit>=3.0
 duckduckgo-search>=6.0
+
+# Voice server (eli_voice_server.py)
+kokoro-onnx>=0.5.0
+faster-whisper>=1.2.0
+sounddevice>=0.5.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
+
+# Voice input (chat.py /voice command)
+pynput>=1.7.0
+webrtcvad>=2.0.10
+numpy>=2.0.0
