@@ -48,6 +48,29 @@ CONTROL_URL  = "http://localhost:1235"   # server_manager.py control API
 TTS_URL      = "http://127.0.0.1:1236"  # eli_server TTS + transcribe
 MODEL = "auto"
 
+# ── Tool announce fallback (shown when model emits no text before first tool call) ──
+_TOOL_STATUS = {
+    "spawn_agent":  "Looking into this…",
+    "queue_agents": "Spinning up agents…",
+    "web_search":   "Searching the web…",
+    "web_fetch":    "Fetching that…",
+    "read_file":    "Reading the file…",
+    "list_dir":     "Listing directory…",
+    "glob":         "Searching files…",
+    "grep":         "Searching code…",
+    "ripgrep":      "Searching code…",
+    "bash":         "Running a command…",
+    "edit":         "Editing…",
+    "write_file":   "Writing the file…",
+    "speak":        "Speaking…",
+}
+
+def _tool_announce(tool_calls: list) -> str:
+    names = [tc["function"]["name"] for tc in tool_calls]
+    if len(names) == 1:
+        return _TOOL_STATUS.get(names[0], f"{names[0]}…")
+    return "  /  ".join(_TOOL_STATUS.get(n, f"{n}…") for n in names)
+
 # ── Voice mode config ──────────────────────────────────────────────────────────
 PTT_KEY          = "scroll_lock"   # pynput Key name or single char
 VOICE_DEFAULT_MODE = "ptt"         # "ptt" or "auto"
@@ -283,18 +306,19 @@ def _save_session(messages: list[dict], n_fixed: int, session_path: Path | None 
         "messages": conversation,
     }
     session_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    all_sessions = sorted(SESSIONS_DIR.glob("*.json"))
+    all_sessions = sorted(p for p in SESSIONS_DIR.glob("*.json") if p.name != "state.json")
     for old in all_sessions[:-MAX_SESSIONS]:
         try:
             old.unlink()
         except Exception:
             pass
+    _save_state(last_session=session_path.stem)
     return session_path
 
 def _load_session(name: str | None = None) -> tuple[list[dict], Path] | tuple[None, None]:
     if not SESSIONS_DIR.exists():
         return None, None
-    all_sessions = sorted(SESSIONS_DIR.glob("*.json"))
+    all_sessions = sorted(p for p in SESSIONS_DIR.glob("*.json") if p.name != "state.json")
     if not all_sessions:
         return None, None
     if name:
@@ -310,6 +334,28 @@ def _load_session(name: str | None = None) -> tuple[list[dict], Path] | tuple[No
     except Exception:
         return None, None
 
+def _load_state() -> dict:
+    """Load persisted session settings (think level, role, etc.)."""
+    try:
+        if STATE_FILE.exists():
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_state(**kwargs) -> None:
+    """Merge kwargs into the persistent state file (creates it if absent)."""
+    SESSIONS_DIR.mkdir(exist_ok=True)
+    try:
+        current = _load_state()
+        current.update(kwargs)
+        STATE_FILE.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
 # ── Compaction constants ──────────────────────────────────────────────────────
 CTX_WINDOW           = 32_768   # fallback if /slots doesn't respond
 CTX_COMPACT_THRESH   = 0.80     # trigger history compaction at this fraction
@@ -318,6 +364,7 @@ INPUT_COMPRESS_CHARS = 8_000    # auto-compress user input above this char count
 CHARS_PER_TOKEN      = 4        # fallback estimator when server usage unavailable
 
 SESSIONS_DIR = Path(__file__).parent / "sessions"
+STATE_FILE   = SESSIONS_DIR / "state.json"
 MAX_SESSIONS = 10
 
 TOOLS = [
@@ -519,9 +566,9 @@ TOOLS = [
                 "Spawn a single specialized sub-agent and return its result. "
                 "Use for one-off tasks: code review, documentation, research, test writing. "
                 "Agent profiles: code-review, doc-writer, researcher, test-writer, web_designer. "
-                "Optionally specify a model profile name from commands.json to run "
-                "the agent on a different model — the server switches automatically "
-                "and restores the original model when the agent finishes. "
+                "Do NOT specify a model unless the user explicitly requested a different one — "
+                "only use profile names listed in the system context (commands.json). "
+                "The server switches automatically and restores the original model when done. "
                 "For multiple agents or pipelines, use queue_agents instead."
             ),
             "parameters": {
@@ -621,7 +668,7 @@ TOOLS = [
                             "properties": {
                                 "system_prompt":    {"type": "string", "description": "Agent profile name or raw system prompt."},
                                 "task":             {"type": "string", "description": "Task to give this agent."},
-                                "model":            {"type": "string", "description": "Optional profile name from commands.json."},
+                                "model":            {"type": "string", "description": "Optional profile name from commands.json. Only set if the user explicitly requested a different model — do not guess or invent model names."},
                                 "timeout_seconds":  {"type": "integer", "description": "Max seconds for this agent (default 300)."},
                                 "tools":            {"type": "array", "items": {"type": "string"}, "description": "Optional tool whitelist."},
                                 "think_level":      {"type": "string", "description": "'off', 'on', or 'deep'."},
@@ -1662,6 +1709,7 @@ class ChatSession:
         self._session_path: Path | None = None
         self._in_subagent: bool     = False
         self.compact_mode: bool     = False
+        self.role: str              = "eli"  # active role name
         self._project_config: dict  = {}
         self._approval_notes: str   = ""  # injected into tool result after dispatch
 
@@ -1830,27 +1878,58 @@ class ChatSession:
                 "model": self.model,
                 "messages": [
                     {"role": "system", "content": (
-                        "You are a conversation summarizer. Produce a dense, complete "
-                        "summary as a bullet list. Preserve: technical decisions, file "
-                        "names, code identifiers, error messages, numeric values, "
-                        "commands run, and conclusions reached."
+                        "You are a conversation summarizer for an AI assistant session. "
+                        "Produce a dense, structured summary. Use sections:\n"
+                        "## Work Done — what was built, changed, or decided\n"
+                        "## Key Facts — file names, identifiers, commands, error messages, "
+                        "numeric values, URLs, paths\n"
+                        "## Active State — current mode settings, active tools or roles, "
+                        "anything the assistant should remember about how to behave\n"
+                        "## Open Items — unresolved questions, things in progress, next steps\n"
+                        "Be complete. Missing a detail here means it is permanently lost."
                     )},
                     {"role": "user", "content": f"Summarize this conversation:\n\n{serialised}"},
                 ],
                 "stream": False,
                 "temperature": 0.3,
-                "max_tokens": 1024,
+                "max_tokens": 2048,
             })
             r.raise_for_status()
             summary = r.json()["choices"][0]["message"]["content"].strip()
             if not summary:
                 raise ValueError("empty summary")
 
-            self.messages = [
-                *self.messages[:self._n_fixed],
-                {"role": "system", "content": f"[Conversation summary — earlier messages compacted]\n\n{summary}"},
-                *self.messages[-CTX_KEEP_RECENT:],
-            ]
+            # Re-read all behavior files fresh from disk so compaction also refreshes
+            # any instructions that may have changed since session start (e.g. ELI.md,
+            # MEMORY.md). This mirrors how Claude Code re-reads CLAUDE.md after its own
+            # context compaction.
+            fresh_initial = _build_initial_messages()
+            new_messages = list(fresh_initial)
+            self._n_fixed = len(fresh_initial)
+
+            # Re-inject active role right after the refreshed system messages.
+            # The original role injection lived in conversation history and was
+            # just summarised away; re-reading the file also picks up any edits.
+            if self.role != "eli":
+                _agents_dir = Path(__file__).parent / "agents"
+                _agent_file = _agents_dir / f"{self.role}.md"
+                if _agent_file.exists():
+                    _profile = _agent_file.read_text(encoding="utf-8")
+                    new_messages.append({
+                        "role": "system",
+                        "content": (
+                            f"[Role Override — {self.role}] (restored after context compaction)\n\n"
+                            f"Continue embodying this persona fully. Your tools and capabilities "
+                            f"remain unchanged.\n\n{_profile}"
+                        ),
+                    })
+
+            new_messages.append(
+                {"role": "system", "content": f"[Conversation summary — earlier messages compacted]\n\n{summary}"}
+            )
+            new_messages.extend(self.messages[-CTX_KEEP_RECENT:])
+
+            self.messages = new_messages
             self.tokens_used = 0
             console.print(Rule(
                 f"[yellow]Context compacted[/yellow] [dim]({orig_count} → {len(self.messages)} messages)[/dim]",
@@ -2036,6 +2115,10 @@ class ChatSession:
                 if _parsed:
                     tool_calls_received = _parsed
                     assistant_content = ""  # don't echo raw text back into message history
+
+            # Auto-announce if model produced no text before first tool call
+            if tool_calls_received and not text_buf.strip():
+                console.print(f"[dim]{_tool_announce(tool_calls_received)}[/dim]")
 
             # Append assistant message
             if tool_calls_received:
@@ -2299,8 +2382,9 @@ class ChatSession:
         if model:
             commands = _load_commands()
             if model not in commands:
-                available = ", ".join(f'"{k}"' for k in commands) or "(none — commands.json missing or empty)"
-                return f"[error: model profile '{model}' not found in commands.json. Available: {available}]"
+                available = "  ·  ".join(commands) or "(none)"
+                console.print(f"[dim yellow]⚠ unknown model '{model}' — using current model. Available: {available}[/dim yellow]")
+                model = None
             # Capture what's running now so we can restore it afterward
             restore_profile = await _find_active_profile()
             if restore_profile == model:
@@ -2421,6 +2505,10 @@ class ChatSession:
                     if _parsed:
                         tool_calls_received = _parsed
                         assistant_content = ""
+
+                # Auto-announce if model produced no text before first tool call
+                if tool_calls_received and not text_buf.strip():
+                    console.print(f"[dim]  {_tool_announce(tool_calls_received)}[/dim]")
 
                 if tool_calls_received:
                     messages.append({
@@ -2680,13 +2768,14 @@ class ChatSession:
         if not agent_specs:
             return "[error: queue_agents called with empty agents list]"
 
-        # Validate all models upfront
+        # Validate models upfront — strip unknown ones rather than aborting
         commands = _load_commands()
-        for i, spec in enumerate(agent_specs):
+        for spec in agent_specs:
             m = spec.get("model")
             if m and m not in commands:
-                available = ", ".join(f'"{k}"' for k in commands)
-                return f"[error: agent {i+1} model '{m}' not found in commands.json. Available: {available}]"
+                available = "  ·  ".join(commands) or "(none)"
+                console.print(f"[dim yellow]  ⚠ unknown model '{m}' — using current model. Available: {available}[/dim yellow]")
+                spec["model"] = None
 
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         slug = label.lower().replace(" ", "-")[:32] if label else "run"
@@ -3099,8 +3188,119 @@ class ChatSession:
 
 # ── Voice conversation loop ────────────────────────────────────────────────────
 
-async def _voice_model_call(history: list, client: httpx.AsyncClient) -> str:
-    """Send voice history to the model and return the full reply text."""
+async def _voice_model_call(
+    history: list,
+    client: httpx.AsyncClient,
+    session: "ChatSession | None" = None,
+    use_tools: bool = False,
+) -> str:
+    """Send voice history to the model and return the full reply text. Returns '' on failure.
+
+    When use_tools=True and session is provided, the model may call tools.  The
+    tool loop runs silently (results shown in terminal but not spoken).  The final
+    text reply is streamed to the terminal and returned for TTS.
+    """
+
+    # ── Tool loop (non-streaming so we can inspect tool_calls) ─────────────────
+    if use_tools and session is not None:
+        working_history = list(history)
+        tools_used = False
+        for _round in range(6):   # cap tool-calling rounds to prevent infinite loops
+            payload_nt = {
+                "model": "auto",
+                "messages": working_history,
+                "stream": False,
+                "temperature": 0.85,
+                "max_tokens": 600,
+                "tools": TOOLS,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+            try:
+                r = await client.post(f"{BASE_URL}/v1/chat/completions", json=payload_nt)
+                r.raise_for_status()
+            except httpx.ConnectError:
+                console.print("[red]LLM server went away.[/red]")
+                return ""
+            except httpx.HTTPError as e:
+                console.print(f"[red]Server error: {e}[/red]")
+                return ""
+
+            choice = r.json()["choices"][0]
+            msg    = choice["message"]
+            finish = choice.get("finish_reason", "")
+
+            if finish == "tool_calls" or msg.get("tool_calls"):
+                # Execute every tool call and append results to working history
+                tools_used = True
+                working_history.append({"role": "assistant", **{k: v for k, v in msg.items() if k != "role"}})
+                for tc in msg.get("tool_calls", []):
+                    tc_id   = tc["id"]
+                    tc_name = tc["function"]["name"]
+                    try:
+                        tc_args = json.loads(tc["function"]["arguments"])
+                    except Exception:
+                        tc_args = {}
+                    console.print(f"[dim]  ◌ {tc_name}({tc_args})[/dim]")
+                    tc_result = await session._dispatch_tool(tc_name, tc_args)
+                    console.print(f"[dim]    → {tc_result[:200]}[/dim]")
+                    working_history.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": tc_result,
+                    })
+                continue   # go around for the model to process results
+
+            # Model returned text directly (no tool calls this round).
+            text_reply = (msg.get("content") or "").strip()
+
+            if not tools_used:
+                # No tools were called at all — return the direct reply as-is.
+                # A summary call here would produce a past-tense recap of a live reply.
+                if text_reply:
+                    console.print()
+                    console.print(text_reply, markup=False)
+                    console.print()
+                    return text_reply
+                return ""
+
+            # Tools were used — the 600-token reply may be long or structured.
+            # Make one tight follow-up call: no tools, 180 tokens, spoken-summary prompt.
+            if text_reply:
+                working_history.append({"role": "assistant", "content": text_reply})
+
+            working_history.append({
+                "role": "user",
+                "content": (
+                    "[Internal instruction — not from the human] "
+                    "Summarise what you just found or did in one to three short spoken sentences. "
+                    "No lists, no markdown. Speak directly to the person."
+                ),
+            })
+            try:
+                r2 = await client.post(f"{BASE_URL}/v1/chat/completions", json={
+                    "model": "auto",
+                    "messages": working_history,
+                    "stream": False,
+                    "temperature": 0.85,
+                    "max_tokens": 180,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                })
+                r2.raise_for_status()
+                text_content = (r2.json()["choices"][0]["message"].get("content") or "").strip()
+            except Exception:
+                text_content = text_reply
+
+            if text_content:
+                console.print()
+                console.print(text_content, markup=False)
+                console.print()
+                return text_content
+
+            return ""
+
+        return ""   # ran out of tool rounds without a text reply
+
+    # ── Simple streaming (no tools) ────────────────────────────────────────────
     payload = {
         "model": "auto",
         "messages": history,
@@ -3111,17 +3311,27 @@ async def _voice_model_call(history: list, client: httpx.AsyncClient) -> str:
     }
     reply_parts: list[str] = []
     console.print()
-    async with client.stream(
-        "POST",
-        f"{BASE_URL}/v1/chat/completions",
-        json=payload,
-        headers={"Accept": "text/event-stream"},
-    ) as response:
-        response.raise_for_status()
-        async for event_type, data in stream_events(response):
-            if event_type == "text":
-                reply_parts.append(data)
-                console.print(data, end="", markup=False)
+    try:
+        async with client.stream(
+            "POST",
+            f"{BASE_URL}/v1/chat/completions",
+            json=payload,
+            headers={"Accept": "text/event-stream"},
+        ) as response:
+            response.raise_for_status()
+            async for event_type, data in stream_events(response):
+                if event_type == "text":
+                    reply_parts.append(data)
+                    console.print(data, end="", markup=False)
+    except httpx.ConnectError:
+        console.print("\n[red]LLM server went away — is llama-server still running?[/red]")
+        return ""
+    except httpx.RemoteProtocolError:
+        console.print("\n[red]LLM server closed the connection mid-stream.[/red]")
+        return ""
+    except httpx.HTTPError as e:
+        console.print(f"\n[red]Server error: {e}[/red]")
+        return ""
     console.print()
     return "".join(reply_parts).strip()
 
@@ -3253,7 +3463,7 @@ async def _voice_speak(text: str) -> None:
     )
 
 
-async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt") -> None:
+async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_tools: bool = False) -> None:
     """Blocking voice conversation loop. Exit: q+Enter or Ctrl+C."""
     try:
         import sounddevice  # noqa: F401 — check it's available
@@ -3299,9 +3509,10 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt") -> N
         listener = _kb.Listener(on_press=on_press, on_release=on_release)
         listener.start()
 
+        tools_note = "  [yellow]tools: on[/yellow]" if use_tools else "  [dim]tools: off[/dim]"
         console.print(Panel(
             f"Voice mode [bold]PTT[/bold] — hold [bold cyan]{PTT_KEY}[/bold cyan] to speak, release to send.\n"
-            "[dim]Press Escape to exit.[/dim]",
+            f"[dim]Press Escape to exit.[/dim]{tools_note}",
             border_style="magenta",
         ))
 
@@ -3327,7 +3538,7 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt") -> N
                 console.print(f"[bold green]You:[/bold green] {transcript}")
                 history.append({"role": "user", "content": transcript})
 
-                reply = await _voice_model_call(history, session.client)
+                reply = await _voice_model_call(history, session.client, session=session, use_tools=use_tools)
                 if not reply:
                     continue
                 history.append({"role": "assistant", "content": reply})
@@ -3354,9 +3565,10 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt") -> N
         listener = _kb.Listener(on_press=on_press_auto)
         listener.start()
 
+        tools_note = "  [yellow]tools: on[/yellow]" if use_tools else "  [dim]tools: off[/dim]"
         console.print(Panel(
             "Voice mode [bold]AUTO[/bold] — speak naturally, pause to send.\n"
-            "[dim]Press Escape to exit.[/dim]",
+            f"[dim]Press Escape to exit.[/dim]{tools_note}",
             border_style="magenta",
         ))
 
@@ -3375,7 +3587,7 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt") -> N
                 console.print(f"[bold green]You:[/bold green] {transcript}")
                 history.append({"role": "user", "content": transcript})
 
-                reply = await _voice_model_call(history, session.client)
+                reply = await _voice_model_call(history, session.client, session=session, use_tools=use_tools)
                 if not reply:
                     continue
                 history.append({"role": "assistant", "content": reply})
@@ -3418,7 +3630,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                     "[bold]/skills[/bold]                List available skills",
                     "[bold]/skill <name> \\[args\\][/bold]   Invoke a skill explicitly",
                     "[bold]/queue-results \\[label\\][/bold]  List recent agent queue runs, or show one by label",
-                    "[bold]/voice \\[ptt|auto\\][/bold]      Start voice sparring mode (PTT or auto-VAD)",
+                    "[bold]/voice \\[ptt|auto\\] \\[tools\\][/bold]  Start voice sparring mode (tools flag enables tool use)",
                     "[bold]/help[/bold]                  Show this message",
                     "",
                     "[bold]Shift+Tab[/bold]              Cycle mode: normal → plan → normal",
@@ -3464,6 +3676,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                   "on":  "[cyan]on — normal thinking[/cyan]",
                   "deep": "[yellow]deep — thorough reasoning, temp 0.3[/yellow]"}
         console.print(f"Think level: {labels[session.think_level]}")
+        _save_state(think_level=session.think_level)
         return True
 
     elif name == "/compact":
@@ -3499,10 +3712,11 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         return True
 
     elif name == "/sessions":
-        if not SESSIONS_DIR.exists() or not list(SESSIONS_DIR.glob("*.json")):
+        _all = [p for p in SESSIONS_DIR.glob("*.json") if p.name != "state.json"] if SESSIONS_DIR.exists() else []
+        if not _all:
             console.print("[dim]No saved sessions.[/dim]")
             return True
-        all_sessions = sorted(SESSIONS_DIR.glob("*.json"), reverse=True)
+        all_sessions = sorted(_all, reverse=True)
         lines = []
         for i, s in enumerate(all_sessions):
             try:
@@ -3543,6 +3757,8 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         console.print(f"Approval: {labels[session.approval_level]}")
         if len(parts) <= 1:
             console.print(f"  Usage: /approval [{' | '.join(VALID)}]")
+        else:
+            _save_state(approval_level=session.approval_level)
         return True
 
     elif name == "/cd":
@@ -3592,6 +3808,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
     elif name == "/model":
         if len(parts) > 1:
             session.model = parts[1]
+            _save_state(model=session.model)
             console.print(f"[green]Model: {session.model}[/green]")
             return True
         try:
@@ -3632,6 +3849,8 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                     "your original system instructions. Conversation context is preserved."
                 ),
             })
+            session.role = "eli"
+            _save_state(role="eli")
             console.print(Panel(
                 "Reverted to [bold cyan]Eli[/bold cyan].\n"
                 "[dim]Conversation context preserved.[/dim]",
@@ -3655,6 +3874,8 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                 f"unchanged. Continue the current conversation context.\n\n{profile}"
             ),
         })
+        session.role = role_name
+        _save_state(role=role_name)
         console.print(Panel(
             f"Persona loaded: [bold magenta]{role_name}[/bold magenta]\n"
             f"[dim]Profile injected as system message. Conversation context preserved.[/dim]",
@@ -3755,11 +3976,11 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         return True
 
     elif name == "/voice":
-        voice_mode = parts[1].lower() if len(parts) > 1 else VOICE_DEFAULT_MODE
-        if voice_mode not in ("ptt", "auto"):
-            console.print(f"[yellow]Unknown voice mode '{voice_mode}'. Use: ptt | auto[/yellow]")
-            return True
-        await _voice_conversation_loop(session, mode=voice_mode)
+        # Accept: /voice [ptt|auto] [tools]  (order of ptt/auto and tools is flexible)
+        flags = [p.lower() for p in parts[1:]]
+        voice_mode  = next((f for f in flags if f in ("ptt", "auto")), VOICE_DEFAULT_MODE)
+        use_tools   = "tools" in flags
+        await _voice_conversation_loop(session, mode=voice_mode, use_tools=use_tools)
         return True
 
     # Unknown /command — try skill lookup before giving up
@@ -3771,7 +3992,6 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
     console.print(f"[yellow]Unknown command: {name} (try /help or /skills)[/yellow]")
     return True
 
-# ── Modes ─────────────────────────────────────────────────────────────────────
 MODES = ["normal", "plan"]
 
 PROMPT_STYLE = Style.from_dict({
@@ -3789,9 +4009,12 @@ async def main():
     parser = _argparse.ArgumentParser(description="Chat with Eli (Qwen3 local agent)", add_help=True)
     parser.add_argument("--resume", nargs="?", const="", metavar="NAME",
                         help="Resume last session, or named session (partial name match)")
+    parser.add_argument("--continue", dest="continue_last", action="store_true",
+                        help="Continue the last session with all previous settings restored")
     args = parser.parse_args()
     resume_name: str | None = args.resume if args.resume is not None else None
-    do_resume = args.resume is not None
+    do_resume    = args.resume is not None
+    do_continue  = args.continue_last
 
     current_task: list[asyncio.Task | None] = [None]
     mode = ["normal"]   # mutable so closures can update it
@@ -3863,6 +4086,7 @@ async def main():
     def _toggle_compact(event):
         if chat_ref[0]:
             chat_ref[0].compact_mode = not chat_ref[0].compact_mode
+            _save_state(compact_mode=chat_ref[0].compact_mode)
         event.app.invalidate()
 
     @bindings.add("enter")
@@ -3886,7 +4110,31 @@ async def main():
 
     async with ChatSession() as chat:
         chat_ref[0] = chat
-        if do_resume:
+
+        # ── --continue: restore all settings + resume last session ────────────
+        if do_continue:
+            state = _load_state()
+            chat.think_level   = state.get("think_level",   "on")
+            chat.compact_mode  = state.get("compact_mode",  False)
+            chat.approval_level = state.get("approval_level", "auto")
+            chat.model         = state.get("model",         MODEL)
+            chat.role          = state.get("role",          "eli")
+            last_name          = state.get("last_session")  # stem, e.g. "2025-01-01_12-00-00"
+            saved_msgs, sess_path = _load_session(last_name)
+            if saved_msgs:
+                chat.messages.extend(saved_msgs)
+                chat._session_path = sess_path
+                role_note = f"  role: {chat.role}" if chat.role != "eli" else ""
+                think_note = f"  think: {chat.think_level}"
+                console.print(Rule(
+                    f"[cyan]↩ Continuing: {sess_path.name}{role_note}{think_note}[/cyan]",
+                    style="cyan",
+                ))
+            else:
+                console.print("[dim]No previous session found — starting fresh.[/dim]")
+
+        # ── --resume: load named (or latest) session only ─────────────────────
+        elif do_resume:
             saved_msgs, sess_path = _load_session(resume_name)
             if saved_msgs:
                 chat.messages.extend(saved_msgs)
@@ -3895,6 +4143,7 @@ async def main():
             else:
                 hint = resume_name or "latest"
                 console.print(f"[yellow]No session found matching '{hint}'[/yellow]")
+
         while True:
             try:
                 user_input = await prompt_session.prompt_async(get_prompt)
@@ -3910,7 +4159,18 @@ async def main():
                 continue
 
             if user_input.startswith("/"):
-                await handle_slash_command(user_input, chat)
+                try:
+                    await handle_slash_command(user_input, chat)
+                except asyncio.CancelledError:
+                    console.print("[dim](interrupted)[/dim]")
+                except httpx.ConnectError:
+                    console.print("[red]LLM server not reachable. Is llama-server running?[/red]")
+                except httpx.RemoteProtocolError:
+                    console.print("[red]LLM server closed the connection unexpectedly.[/red]")
+                except httpx.HTTPError as e:
+                    console.print(f"[red]Server error: {e}[/red]")
+                except Exception as e:
+                    console.print(f"[red]Error: {e}[/red]")
                 continue  # handle_slash_command always handles the command (returns True)
 
             # Rule below the user's input, above the response

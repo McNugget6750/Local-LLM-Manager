@@ -8,7 +8,7 @@ conventional format: `type(scope): summary`.
 
 ## Hard rule — Python & venv
 
-Never use bare `python`, `python3`, `pip`, or `pip3`. Always use the project venv explicitly (e.g. `.venv\Scripts\python.exe`, `.venv\Scripts\pip.exe`). System Python is off-limits. No exceptions.
+Never use bare `python`, `python3`, `python.exe`, `py`, `pip`, `pip3` — including inside multi-command pipelines. Always use the project venv explicitly (`.venv\Scripts\python.exe`, `.venv\Scripts\pip.exe`). System Python is off-limits. No exceptions. If no venv exists yet, create one first with `python -m venv .venv`, then use it for everything.
 
 ## How to work
 

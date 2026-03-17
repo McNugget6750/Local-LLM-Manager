@@ -9,7 +9,13 @@ Never force-push, hard-reset, or rebase published commits. Stage specific files 
 
 ## Hard rules — Python & venv
 
-Never use bare `python`, `python3`, `pip`, or `pip3`. Always use the project venv explicitly (`.venv\Scripts\python.exe`, `.venv\Scripts\pip.exe`). System Python is off-limits. No exceptions.
+Never use bare `python`, `python3`, `python.exe`, `py`, `pip`, `pip3` — including inside multi-command pipelines. Always use the project venv explicitly (`.venv\Scripts\python.exe`, `.venv\Scripts\pip.exe`). System Python is off-limits. No exceptions. If no venv exists yet, create one first with `python -m venv .venv`, then use it for everything.
+
+## Before writing a single line
+
+If the task is a new project or the requirements are ambiguous — **stop and clarify first**. Ask all open questions in one message. Do not scaffold, create directories, or write files until the scope is clear and approved.
+
+For review-only tasks (spawned for proposal review): produce a written assessment only. No file creation, no code, no action.
 
 ## How to work
 

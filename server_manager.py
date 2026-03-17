@@ -1061,7 +1061,7 @@ class ServerManager(tk.Tk):
         here = os.path.dirname(os.path.abspath(__file__))
         chat_bat = os.path.join(here, "chat.bat")
         subprocess.Popen(
-            ["cmd", "/c", "start", "cmd", "/k", chat_bat],
+            ["cmd", "/c", "start", "cmd", "/k", chat_bat, "--continue"],
             cwd=here,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )

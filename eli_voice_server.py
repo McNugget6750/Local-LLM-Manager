@@ -29,7 +29,7 @@ MODEL_PATH   = str(_HERE / "kokoro_models" / "kokoro-v1.0.onnx")
 VOICES_PATH  = str(_HERE / "kokoro_models" / "voices-v1.0.bin")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DEFAULT_VOICE = "am_michael"
+DEFAULT_VOICE = "am_eric"
 TTS_SPEED     = 1.0   # 1.0 = natural pace. Lower = faster, higher = slower.
 SAMPLE_RATE   = 24000  # Kokoro outputs 24 kHz
 
