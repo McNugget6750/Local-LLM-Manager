@@ -2,7 +2,7 @@
 
 A local LLM chat CLI + server manager GUI for [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (a high-performance fork of llama.cpp).
 
-Includes **Eli** — a coding assistant persona with tool use, sub-agents, agent queues, vision analysis, plan mode, slash commands, and persistent memory.
+Includes **Eli** — a coding assistant persona with tool use, sub-agents, agent queues, vision analysis, voice I/O, plan mode, slash commands, and persistent session state.
 
 ---
 
@@ -66,10 +66,13 @@ The server manager also exposes a loopback control API on port 1235. Eli uses th
 ### Eli chat CLI
 
 ```bat
-chat.bat
+chat.bat           # new session
+chat.bat --continue  # resume last session with all settings restored
 ```
 
-Connects to `http://localhost:1234` by default. Type naturally or use slash commands.
+Connects to `http://localhost:1234` by default. **Open Chat** in the server manager passes `--continue` automatically. Type naturally or use slash commands.
+
+**Session persistence** — think level, compact mode, approval level, model, and active role are written to `sessions/state.json` whenever they change and restored on `--continue`.
 
 **Slash commands:**
 
@@ -81,9 +84,12 @@ Connects to `http://localhost:1234` by default. Type naturally or use slash comm
 | `/research <topic>` | Spawn researcher sub-agent |
 | `/queue-results [label]` | List recent agent queue runs or show one by label |
 | `/model` | List available model profiles |
+| `/role <name>` | Adopt an agent persona (`/role eli` to revert) |
+| `/voice [ptt\|auto] [tools]` | Start voice conversation mode |
 | `/config` | Show loaded eli.toml config |
 | `/cd <path>` | Change working directory |
 | `/think [off\|on\|deep]` | Set thinking level |
+| `/approval [auto\|always\|never]` | Set tool approval level |
 | `/compact` | Summarise older messages to free context |
 | `/status` | Show token usage and context window info |
 
@@ -93,6 +99,21 @@ Connects to `http://localhost:1234` by default. Type naturally or use slash comm
 - `Ctrl+D` — exit
 - `Shift+Tab` — toggle plan mode (Eli plans but doesn't execute)
 - `Ctrl+O` — toggle compact mode (collapse thinking/tool output)
+
+---
+
+## Voice mode
+
+```
+/voice              # PTT mode (default)
+/voice auto         # VAD — speak naturally, pause to send
+/voice ptt tools    # PTT with tool access enabled
+/voice auto tools   # auto VAD with tool access
+```
+
+Voice requires the **eli_voice_server** running on port 1236 (Kokoro ONNX TTS + faster-whisper STT). In PTT mode, hold the configured key (default: Scroll Lock) to record; release to transcribe and send. In auto mode, silence detection triggers the send automatically. Press Escape to exit voice mode.
+
+The `voice_input.py` standalone tool (`claudes_tools/`) provides system-wide push-to-type voice input — it transcribes speech and types the result into whatever window is focused.
 
 ---
 
