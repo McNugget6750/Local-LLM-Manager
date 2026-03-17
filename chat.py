@@ -148,8 +148,7 @@ def _build_model_context() -> str | None:
     profiles_meta = meta.get("profiles", {})
     vision_url = meta.get("vision_url", "")
     lines = ["[Available Model Profiles — commands.json]", ""]
-    lines.append("Use these profile names exactly (including spacing and · characters) when")
-    lines.append("calling spawn_agent(model=...) or queue_agents(agents=[{model: ...}]).")
+    lines.append("Use these profile names exactly when calling spawn_agent(model=...) or queue_agents(agents=[{model: ...}]).")
     lines.append("")
     for name in commands:
         m = profiles_meta.get(name, {})
@@ -3806,23 +3805,50 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         return True
 
     elif name == "/model":
+        # Fetch available profiles and currently loaded model from Server Manager
+        profiles_data = await _control("GET", "/api/profiles")
+        status_data   = await _control("GET", "/api/status")
+        profiles: list[str] = profiles_data if isinstance(profiles_data, list) else list(_load_commands().keys())
+        loaded: str | None  = status_data.get("model") if isinstance(status_data, dict) else None
+
         if len(parts) > 1:
-            session.model = parts[1]
-            _save_state(model=session.model)
-            console.print(f"[green]Model: {session.model}[/green]")
+            target = " ".join(parts[1:])
+            # Accept unambiguous prefix matches
+            matches = [p for p in profiles if p.lower().startswith(target.lower())]
+            if not matches:
+                matches = [p for p in profiles if target.lower() in p.lower()]
+            if len(matches) == 1:
+                target = matches[0]
+            elif len(matches) > 1:
+                console.print(f"[yellow]Ambiguous — did you mean:[/yellow]")
+                for m in matches:
+                    console.print(f"  {m}")
+                return True
+            elif target not in profiles:
+                console.print(f"[yellow]Unknown profile: {target}[/yellow]")
+                console.print(f"[dim]Available: {', '.join(profiles)}[/dim]")
+                return True
+
+            if target == loaded:
+                console.print(f"[dim]{target} is already loaded.[/dim]")
+                return True
+
+            console.print(f"[cyan]Switching to {target}…[/cyan]")
+            ok = await _switch_server(target)
+            if ok:
+                session.model = "auto"
+                _save_state(model=session.model)
             return True
-        try:
-            r = await session.client.get(f"{BASE_URL}/v1/models", timeout=5)
-            models = r.json().get("data", [])
-            lines = [
-                f"[bold cyan]{m['id']}[/bold cyan]"
-                + ("  ← current" if m['id'] == session.model else "")
-                for m in models
-            ]
-            lines.append(f"\n[dim]Usage: /model <id>[/dim]")
-            console.print(Panel("\n".join(lines), title="Models", border_style="cyan"))
-        except Exception as e:
-            console.print(f"[dim]Current: {session.model}  ({e})[/dim]")
+
+        # No argument — list all profiles
+        lines = []
+        for p in profiles:
+            marker = "  [green]● loaded[/green]" if p == loaded else ""
+            lines.append(f"[bold cyan]{p}[/bold cyan]{marker}")
+        if not loaded:
+            lines.append("\n[dim]Server Manager not reachable — profile list from commands.json[/dim]")
+        lines.append(f"\n[dim]Usage: /model <name>   (prefix match supported)[/dim]")
+        console.print(Panel("\n".join(lines), title="Models", border_style="cyan"))
         return True
 
     elif name == "/role":

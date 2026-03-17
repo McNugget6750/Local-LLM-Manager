@@ -3,7 +3,7 @@
     "vision_url": "http://192.168.x.x:1234",
     "vision_external": false,
     "profiles": {
-      "My Model  ·  ?? t/s  ·  Notes": {
+      "My Model \u00b7 Quantization": {
         "description": "One-line description of this model and quantization.",
         "strengths": "What it excels at",
         "weaknesses": "What to avoid using it for",
@@ -12,7 +12,7 @@
       }
     }
   },
-  "My Model  ·  ?? t/s  ·  Notes": [
+  "My Model \u00b7 Quantization": [
     "path/to/llama-server.exe",
     "-m", "path/to/model.gguf",
     "-ngl", "999",

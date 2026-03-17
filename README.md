@@ -176,7 +176,7 @@ Model profiles for the server manager, plus optional metadata. Copy from `comman
     "vision_url": "http://192.168.x.x:1234",
     "vision_external": false,
     "profiles": {
-      "My Model  ·  ?? t/s  ·  Notes": {
+      "My Model · Quantization": {
         "description": "One-line description.",
         "strengths": "What it excels at",
         "weaknesses": "What to avoid",
@@ -185,7 +185,7 @@ Model profiles for the server manager, plus optional metadata. Copy from `comman
       }
     }
   },
-  "My Model  ·  ?? t/s  ·  Notes": [
+  "My Model · Quantization": [
     "path/to/llama-server.exe",
     "-m", "path/to/model.gguf",
     "-ngl", "999", "-c", "32768",
