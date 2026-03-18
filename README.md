@@ -78,10 +78,12 @@ Connects to `http://localhost:1234` by default. **Open Chat** in the server mana
 
 | Command | Description |
 |---------|-------------|
-| `/skills` | List available skills |
+| `/skills` | List available skills with triggers |
 | `/commit` | Generate a conventional commit message |
-| `/review <file>` | Spawn code-review sub-agent on a file |
-| `/research <topic>` | Spawn researcher sub-agent |
+| `/review <file>` | Deep code review sub-agent (reads code + callers + tests) |
+| `/research <topic>` | Skeptical research sub-agent (3-pass protocol) |
+| `/plan <feature>` | Implementation planning sub-agent |
+| `/code <task>` | Production code writing sub-agent |
 | `/queue-results [label]` | List recent agent queue runs or show one by label |
 | `/model` | List available model profiles |
 | `/role <name>` | Adopt an agent persona (`/role eli` to revert) |
@@ -111,9 +113,9 @@ Connects to `http://localhost:1234` by default. **Open Chat** in the server mana
 /voice auto tools   # auto VAD with tool access
 ```
 
-Voice requires the **eli_voice_server** running on port 1236 (Kokoro ONNX TTS + faster-whisper STT). In PTT mode, hold the configured key (default: Scroll Lock) to record; release to transcribe and send. In auto mode, silence detection triggers the send automatically. Press Escape to exit voice mode.
+Voice requires the **eli_voice_server** running on port 1236 (Kokoro ONNX TTS + faster-whisper STT). Start it standalone with `voice_server.bat` — no model loaded in the server manager needed for TTS/STT alone. In PTT mode, hold the configured key to record; release to transcribe and send. In auto mode, silence detection triggers the send automatically. Press Escape to exit voice mode.
 
-The `voice_input.py` standalone tool (`claudes_tools/`) provides system-wide push-to-type voice input — it transcribes speech and types the result into whatever window is focused.
+The `voice_input.py` standalone tool provides system-wide push-to-type voice input (Insert key PTT by default). It types transcriptions into any target window you pick, with optional auto-submit.
 
 ---
 
@@ -240,15 +242,33 @@ Sub-agents are spawned by Eli for specialized tasks. Profiles live in `agents/`:
 
 ## Skills
 
-Prompt workflows stored in `skills/`. Invoked with `/skillname`:
+Prompt workflows stored in `skills/`. Invoked with `/skillname` or triggered automatically when your message matches a skill's trigger list. Use `/skills` to list all available skills with their triggers.
 
-| Skill | Description |
-|-------|-------------|
-| `/commit` | Conventional commit message template |
-| `/review` | Spawns code-review sub-agent |
-| `/research` | Spawns researcher sub-agent |
-| `/pr` | Pull request description template |
-| `/git-status` | Git status summary |
+| Skill | Spawns agent | Description |
+|-------|:------------:|-------------|
+| `/research` | yes | 3-pass skeptical research protocol — initial sweep, cross-examination, synthesis |
+| `/plan` | yes | Implementation planning — reads codebase, evaluates approaches, produces ordered task checklist |
+| `/code` | yes | Production code writing — reads first, designs, implements, writes tests, self-reviews |
+| `/review` | yes | Deep code review — reads code, callers, and tests; reports issues by severity with fixes |
+| `/commit` | no | Conventional commit message template |
+| `/pr` | no | Pull request description template |
+| `/git-status` | no | Git status summary |
+
+Skills that spawn agents support a `max_iterations` frontmatter field to control how long they run. The hard ceiling is 50 iterations.
+
+Skill files use YAML frontmatter:
+
+```yaml
+---
+name: my-skill
+description: One-line description shown in /skills
+spawn_agent: true
+think_level: deep
+max_iterations: 20
+triggers: [keyword, another keyword]
+context_files: [path/to/extra.md]
+---
+```
 
 ---
 
