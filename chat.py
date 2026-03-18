@@ -234,14 +234,42 @@ async def _switch_server(profile: str, timeout: int = 120) -> bool:
     console.print(f"[red]  Server failed to become healthy within {timeout}s[/red]")
     return False
 
+def _load_mission_objective() -> str | None:
+    """Load MISSION_OBJECTIVE.md from cwd or any parent (up to 5 levels)."""
+    path = Path.cwd()
+    for _ in range(5):
+        candidate = path / "MISSION_OBJECTIVE.md"
+        if candidate.exists():
+            try:
+                return candidate.read_text(encoding="utf-8")
+            except Exception:
+                return None
+        parent = path.parent
+        if parent == path:
+            break
+        path = parent
+    return None
+
+
 def _build_initial_messages() -> list[dict]:
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    msgs = [{"role": "system", "content": _load_system_prompt()}]
+    loaded: list[str] = ["ELI.md"]
+
     memory = _load_memory()
     if memory:
         msgs.append({"role": "system", "content": f"[Operational Memory]\n\n{memory}"})
+        loaded.append("MEMORY.md")
+
+    mission = _load_mission_objective()
+    if mission:
+        msgs.append({"role": "system", "content": f"[Mission Objective — auto-loaded from MISSION_OBJECTIVE.md]\n\n{mission}"})
+        loaded.append("MISSION_OBJECTIVE.md")
+
     model_ctx = _build_model_context()
     if model_ctx:
         msgs.append({"role": "system", "content": model_ctx})
+
+    console.print(f"[dim]Context loaded: {', '.join(loaded)}[/dim]")
     return msgs
 
 def _load_project_config(cwd: Path) -> dict:
@@ -596,7 +624,7 @@ TOOLS = [
                     },
                     "max_iterations": {
                         "type": "integer",
-                        "description": "Max tool-use iterations (default 10, hard max 30). Increase for large codebases — code-review of a big project may need 20–30.",
+                        "description": "Max tool-use iterations (default 10, hard max 50). Increase for large codebases or deep research — code-review may need 20–30, research 40–50.",
                     },
                     "model": {
                         "type": "string",
@@ -671,7 +699,7 @@ TOOLS = [
                                 "timeout_seconds":  {"type": "integer", "description": "Max seconds for this agent (default 300)."},
                                 "tools":            {"type": "array", "items": {"type": "string"}, "description": "Optional tool whitelist."},
                                 "think_level":      {"type": "string", "description": "'off', 'on', or 'deep'."},
-                                "max_iterations":   {"type": "integer", "description": "Max tool-use iterations (default 10, hard max 30). Increase for large codebases — code-review may need 20–30."},
+                                "max_iterations":   {"type": "integer", "description": "Max tool-use iterations (default 10, hard max 50). Increase for large codebases or deep research — code-review may need 20–30, research 40–50."},
                             },
                             "required": ["system_prompt", "task"],
                         },
@@ -1653,6 +1681,13 @@ def _load_skills() -> dict:
                 else:
                     meta[key] = val.strip("\"'")
             if "name" in meta:
+                # context_files: [file1.md, file2.md] — append additional files into body
+                for cf in (meta.get("context_files") or []):
+                    cf_path = path.parent / cf
+                    try:
+                        body += "\n\n---\n\n" + cf_path.read_text(encoding="utf-8")
+                    except Exception:
+                        pass
                 meta["_body"] = body
                 result[meta["name"]] = meta
         except Exception:
@@ -1670,14 +1705,15 @@ async def _invoke_skill(skill_name: str, skill_args: str, session: "ChatSession"
     expanded = body.replace("$ARGS", skill_args).strip()
     spawn = skill.get("spawn_agent", False)
     if spawn:
-        tools = skill.get("agent_tools") or None
-        think = skill.get("think_level") or None
+        tools      = skill.get("agent_tools") or None
+        think      = skill.get("think_level") or None
+        max_iter   = int(skill.get("max_iterations", 10))
         console.print(Panel(
             f"[dim]Invoking agent skill '[bold]{skill_name}[/bold]'...[/dim]",
             title="[cyan]Skill[/cyan]",
             border_style="cyan",
         ))
-        result = await session._tool_spawn_agent(expanded, skill_args, tools, think)
+        result = await session._tool_spawn_agent(expanded, skill_args, tools, think, max_iter)
         session.messages.append({"role": "assistant", "content": result})
         console.print(Panel(
             Markdown(result),
@@ -2374,7 +2410,7 @@ class ChatSession:
             sub_tools = [t for t in sub_tools if t["function"]["name"] in tools]
 
         think = think_level or self.think_level
-        max_iter = min(max_iterations, 30)
+        max_iter = min(max_iterations, 50)
 
         # ── Model switch ──────────────────────────────────────────────────────
         restore_profile: str | None = None
@@ -2799,7 +2835,7 @@ class ChatSession:
             agent_num = idx + 1
             target_model = spec.get("model")
             timeout_s = max(30, int(spec.get("timeout_seconds", 300)))
-            max_iter = min(int(spec.get("max_iterations", 10)), 30)
+            max_iter = min(int(spec.get("max_iterations", 10)), 50)
             think = spec.get("think_level") or self.think_level
             tools_wl = spec.get("tools")
             task = spec.get("task", "")
@@ -3789,7 +3825,11 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         for sname, skill in sorted(skills.items()):
             tag = " [cyan][agent][/cyan]" if skill.get("spawn_agent") else ""
             desc = skill.get("description", "(no description)")
-            lines.append(f"[bold cyan]/{sname}[/bold cyan]{tag}  —  {desc}")
+            raw_triggers = skill.get("triggers", [])
+            if isinstance(raw_triggers, str):
+                raw_triggers = [t.strip() for t in raw_triggers.split(",") if t.strip()]
+            trigger_str = f"  [dim]· triggers: {', '.join(raw_triggers)}[/dim]" if raw_triggers else ""
+            lines.append(f"[bold cyan]/{sname}[/bold cyan]{tag}  —  {desc}{trigger_str}")
         console.print(Panel("\n".join(lines), title="Skills", border_style="cyan"))
         return True
 
