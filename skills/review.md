@@ -3,7 +3,7 @@ name: review
 description: Deep code review — reads the target code, its callers, and its tests, then reports issues ordered by severity with concrete fixes. Covers correctness, safety, performance, and testability.
 spawn_agent: true
 think_level: deep
-max_iterations: 20
+max_iterations: 35
 triggers: [review, audit code, check this code, look at this code, find bugs, is this correct]
 ---
 
@@ -14,6 +14,34 @@ real problems — not hypothetical ones. Every issue you report must be backed b
 evidence you found in the code.
 
 **Code to review:** $ARGS
+
+---
+
+## Step 0 — Orient to the Project
+
+**Before running any tool, read and internalize these exclusions:**
+
+IGNORE COMPLETELY — skip these directories and files entirely, do not read them,
+do not report on them, do not let their contents influence your review:
+- `.venv/`, `venv/`, `env/` — Python virtual environments (third-party packages, NOT project code)
+- `node_modules/` — JavaScript packages
+- `.tox/`, `.cache/`, `__pycache__/`, `*.pyc` — build/cache artifacts
+- `build/`, `dist/`, `target/` — compiled output
+- `.git/` — version control internals
+- `.idea/`, `.vscode/` — IDE config
+
+If `list_dir` or `glob` returns paths inside any of the above directories, discard
+them and move on. Do NOT comment on them. Do NOT ask the user about them.
+
+Now orient to the actual project:
+
+1. Use `list_dir` on the project root. Mentally filter out the excluded directories above.
+2. Read `README.md` if it exists — this tells you what the project does.
+3. Use `glob` with a pattern like `*.py` or `*.cpp` to list the real source files.
+4. Read `requirements.txt` or `pyproject.toml` to note key dependencies (skim only — one pass).
+5. Form a clear one-sentence model: "This is a [type] project that does [X]."
+   Every finding in Steps 1–5 must be interpreted through that lens.
+6. Proceed immediately to Step 1 — do not ask the user questions at this stage.
 
 ---
 
@@ -112,6 +140,8 @@ For every issue found, assign a severity:
 
 ## Hard Rules
 
+- NEVER review a virtual environment, build directory, or `.git/` — they are not project code.
+- NEVER ask the user clarifying questions mid-review — complete the review and report findings.
 - NEVER report an issue without the file and line number.
 - NEVER speculate — if you're not sure something is a bug, say "Possible issue:
   verify that..." instead of stating it as fact.
@@ -123,6 +153,7 @@ For every issue found, assign a severity:
 ---
 
 ## Output Format
+_No more than 2000 words total output_
 
 ---
 

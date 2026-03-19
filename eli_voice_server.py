@@ -11,8 +11,10 @@ Endpoints:
   GET  /              Health / info
 """
 
+import queue
 import re
 import struct
+import threading
 import numpy as np
 import sounddevice as sd
 from pathlib import Path
@@ -54,6 +56,26 @@ def _play(audio_bytes: bytes) -> None:
     sd.wait()
 
 
+# ── Playback queue ─────────────────────────────────────────────────────────────
+# /play enqueues PCM here and returns immediately. The worker thread drains the
+# queue sequentially so messages never overlap, and the HTTP response is instant.
+_play_queue: queue.Queue = queue.Queue()
+
+
+def _playback_worker() -> None:
+    while True:
+        pcm = _play_queue.get()
+        try:
+            _play(pcm)
+        except Exception as e:
+            print(f"[voice] playback error: {e}")
+        finally:
+            _play_queue.task_done()
+
+
+threading.Thread(target=_playback_worker, daemon=True, name="playback-worker").start()
+
+
 # ── Whisper STT (lazy) ────────────────────────────────────────────────────────
 _whisper_model = None
 
@@ -93,14 +115,15 @@ async def root():
 
 @app.post("/play")
 async def play_text(request: TTSRequest):
-    """Synthesize and play immediately (blocks until audio finishes)."""
+    """Synthesize and enqueue for playback. Returns immediately; audio plays in background."""
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="Text must not be empty")
     try:
-        _play(_synthesize(request.text))
-        return {"status": "ok", "voice": current_voice}
+        pcm = _synthesize(request.text)
+        _play_queue.put(pcm)
+        return {"status": "ok", "voice": current_voice, "queued": _play_queue.qsize()}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Playback failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Synthesis failed: {e}")
 
 
 @app.post("/tts")

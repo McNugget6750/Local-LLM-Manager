@@ -5,6 +5,7 @@ spawn_agent: true
 think_level: deep
 max_iterations: 40
 triggers: [research, investigate, find out, what is the latest, deep dive, look into, explain in depth, what do we know about]
+return_prompt: "The research agent has completed the report above. Acknowledge receipt in one sentence only — do NOT summarize or paraphrase. The full report is in your context and you can answer questions from it directly."
 ---
 
 # Deep Research Protocol
