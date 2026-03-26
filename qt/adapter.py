@@ -18,7 +18,7 @@ from chat import ChatSession
 
 
 class QtChatAdapter(QThread):
-    # ── Signals (emitted on the Qt main thread via signal/slot mechanism) ──
+    # ── Signals ──────────────────────────────────────────────────────────────
     think_token     = Signal(str)
     text_token      = Signal(str)
     tool_start      = Signal(str, str, str)        # id, name, args_json
@@ -29,22 +29,24 @@ class QtChatAdapter(QThread):
     system_msg      = Signal(str)
     error_msg       = Signal(str)
     done            = Signal()
+    stream_started  = Signal()                     # fires at start of each turn
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._work_queue: asyncio.Queue | None = None
         self._pending_future: asyncio.Future | None = None
-        self._ready = threading.Event()   # set when loop is running
+        self._ready = threading.Event()
+        self._stream_task: asyncio.Task | None = None
+        self._cancel_requested: bool = False
 
-    # ── Worker thread entry point ────────────────────────────────────────────
+    # ── Worker thread ────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        """Runs in the worker thread. Keeps one event loop alive for the session."""
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         self._work_queue = asyncio.Queue()
-        self._ready.set()                         # unblock any waiting submit() calls
+        self._ready.set()
         self._loop.run_until_complete(self._main())
 
     async def _main(self) -> None:
@@ -54,7 +56,7 @@ class QtChatAdapter(QThread):
                     session.tui_queue = asyncio.Queue()
                 while True:
                     item = await self._work_queue.get()
-                    if item is None:              # shutdown sentinel
+                    if item is None:
                         break
                     kind = item[0]
                     if kind == "__slash__":
@@ -63,26 +65,31 @@ class QtChatAdapter(QThread):
                         text, plan_mode = item
                         await self._run_turn(session, text, plan_mode)
         except Exception as exc:
-            # ChatSession.__aenter__ failed (e.g. server offline at startup)
             self.error_msg.emit(f"Backend init failed: {exc}")
             self.done.emit()
 
     # ── Per-turn logic ───────────────────────────────────────────────────────
 
     async def _run_turn(self, session: ChatSession, text: str, plan_mode: bool) -> None:
-        """Send one message and drain tui_queue until done/error."""
-        # Reset queue in case previous turn left stale events
         while not session.tui_queue.empty():
             session.tui_queue.get_nowait()
 
         try:
-            stream_task = asyncio.create_task(
+            self._stream_task = asyncio.create_task(
                 session.send_and_stream(text, plan_mode=plan_mode)
             )
-            await self._drain_queue(session, stream_task)
+            self.stream_started.emit()
+            await self._drain_queue(session, self._stream_task)
+            # Autosave after every successful turn
+            try:
+                session._autosave()
+            except Exception:
+                pass
         except Exception as exc:
             self.error_msg.emit(str(exc))
             self.done.emit()
+        finally:
+            self._stream_task = None
 
     async def _run_slash(self, session: ChatSession, cmd: str) -> None:
         """Run a slash command; drain any system events it emits, then signal done.
@@ -111,10 +118,13 @@ class QtChatAdapter(QThread):
                     session.tui_queue.get(), timeout=0.05
                 )
             except asyncio.TimeoutError:
-                # No event yet — check if stream_task finished with an exception
                 if stream_task.done():
                     if stream_task.cancelled():
-                        self.error_msg.emit("Stream cancelled unexpectedly.")
+                        if self._cancel_requested:
+                            self._cancel_requested = False
+                            self.system_msg.emit("(interrupted)")
+                        else:
+                            self.error_msg.emit("Stream cancelled unexpectedly.")
                         self.done.emit()
                         return
                     if stream_task.exception():
@@ -166,7 +176,7 @@ class QtChatAdapter(QThread):
                 self.done.emit()
                 return
 
-    # ── Thread-safe public API (called from main thread) ────────────────────
+    # ── Thread-safe public API ───────────────────────────────────────────────
 
     def submit(self, text: str, plan_mode: bool) -> None:
         """Submit a user message. Blocks briefly until the loop is ready."""
@@ -181,6 +191,13 @@ class QtChatAdapter(QThread):
         self._loop.call_soon_threadsafe(
             self._work_queue.put_nowait, ("__slash__", cmd)
         )
+
+    def cancel(self) -> None:
+        """Cancel the in-flight stream. Safe to call when nothing is running."""
+        task = self._stream_task
+        if task and self._loop:
+            self._cancel_requested = True
+            self._loop.call_soon_threadsafe(task.cancel)
 
     def resolve_approval(self, approved: bool, notes: str = "") -> None:
         """Resolve the pending approval Future. Called from the main thread."""

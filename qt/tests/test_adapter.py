@@ -172,3 +172,119 @@ def test_window_imports_without_llm_worker(qapp):
             module = getattr(node, "module", "") or ""
             assert "llm_client" not in names and "llm_client" not in module, \
                 "window.py still imports llm_client"
+
+
+# ── cancel / stream_started / autosave ───────────────────────────────────────
+
+def test_stream_started_signal_emitted(qapp, qtbot):
+    """stream_started fires at the beginning of each turn."""
+    q = asyncio.Queue()
+    with patch("qt.adapter.ChatSession") as MockSession:
+        ms = _mock_session(q)
+
+        async def fake_stream(text, plan_mode):
+            await q.put({"type": "text_done", "text": "hi"})
+            await q.put({"type": "done"})
+
+        ms.send_and_stream = fake_stream
+        MockSession.return_value = ms
+
+        adapter = QtChatAdapter()
+        adapter.start()
+
+        started = []
+        adapter.stream_started.connect(lambda: started.append(1))
+
+        with qtbot.waitSignal(adapter.done, timeout=5000):
+            adapter.submit("hi", False)
+
+        adapter.shutdown()
+        adapter.wait(3000)
+
+    assert started == [1]
+
+
+def test_cancel_stops_stream(qapp, qtbot):
+    """cancel() causes the stream to stop and done signal fires."""
+    q = asyncio.Queue()
+    with patch("qt.adapter.ChatSession") as MockSession:
+        ms = _mock_session(q)
+
+        async def slow_stream(text, plan_mode):
+            # Never puts "done" — simulates a long-running stream
+            await asyncio.sleep(10)
+            await q.put({"type": "done"})
+
+        ms.send_and_stream = slow_stream
+        MockSession.return_value = ms
+
+        adapter = QtChatAdapter()
+        adapter.start()
+
+        with qtbot.waitSignal(adapter.stream_started, timeout=3000):
+            adapter.submit("hi", False)
+
+        # Cancel immediately after stream starts
+        with qtbot.waitSignal(adapter.done, timeout=3000):
+            adapter.cancel()
+
+        adapter.shutdown()
+        adapter.wait(3000)
+
+
+def test_cancel_emits_system_msg_not_error(qapp, qtbot):
+    """User-initiated cancel emits system_msg '(interrupted)', not error_msg."""
+    q = asyncio.Queue()
+    with patch("qt.adapter.ChatSession") as MockSession:
+        ms = _mock_session(q)
+
+        async def slow_stream(text, plan_mode):
+            await asyncio.sleep(10)
+
+        ms.send_and_stream = slow_stream
+        MockSession.return_value = ms
+
+        adapter = QtChatAdapter()
+        errors = []
+        system_msgs = []
+        adapter.error_msg.connect(errors.append)
+        adapter.system_msg.connect(system_msgs.append)
+        adapter.start()
+
+        with qtbot.waitSignal(adapter.stream_started, timeout=3000):
+            adapter.submit("hi", False)
+
+        with qtbot.waitSignal(adapter.done, timeout=3000):
+            adapter.cancel()
+
+        adapter.shutdown()
+        adapter.wait(3000)
+
+    assert errors == [], f"Expected no errors, got {errors}"
+    assert any("interrupted" in m for m in system_msgs)
+
+
+def test_autosave_called_after_turn(qapp, qtbot):
+    """session._autosave() is called after each completed turn."""
+    q = asyncio.Queue()
+    with patch("qt.adapter.ChatSession") as MockSession:
+        ms = _mock_session(q)
+        ms._autosave = MagicMock()
+
+        async def fake_stream(text, plan_mode):
+            await q.put({"type": "text_done", "text": "reply"})
+            await q.put({"type": "done"})
+
+        ms.send_and_stream = fake_stream
+        MockSession.return_value = ms
+
+        adapter = QtChatAdapter()
+        adapter.start()
+
+        with qtbot.waitSignal(adapter.done, timeout=5000):
+            adapter.submit("hi", False)
+
+        adapter.shutdown()
+        adapter.wait(3000)
+
+    ms._autosave.assert_called_once()
