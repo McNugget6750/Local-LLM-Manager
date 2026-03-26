@@ -90,6 +90,7 @@ class QtChatAdapter(QThread):
             self.done.emit()
         finally:
             self._stream_task = None
+            self._cancel_requested = False
 
     async def _run_slash(self, session: ChatSession, cmd: str) -> None:
         """Run a slash command; drain any system events it emits, then signal done.
