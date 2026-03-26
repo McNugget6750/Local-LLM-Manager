@@ -72,8 +72,7 @@ class SlashCompleter(QListWidget):
         self.clear()
         for cmd, desc in commands:
             item = QListWidgetItem(f"{cmd}  —  {desc}")
-            item.setData(Qt.ItemDataRole.UserRole, cmd)  # role 256 in PySide6 6.x
-            item.setData(32, cmd)                        # legacy role value used in tests
+            item.setData(Qt.ItemDataRole.UserRole, cmd)
             self.addItem(item)
 
     def _on_item_clicked(self, item: QListWidgetItem) -> None:

@@ -1,5 +1,6 @@
 """Tests for SlashCompleter popup widget."""
 import pytest
+from PySide6.QtCore import Qt
 from qt.slash_completer import SlashCompleter, SLASH_COMMANDS
 
 
@@ -15,7 +16,7 @@ def test_update_filter_narrows_results(qapp):
     has_matches = c.update_filter("/co")
     assert has_matches
     for i in range(c.count()):
-        item_cmd = c.item(i).data(32)  # Qt.ItemDataRole.UserRole == 32
+        item_cmd = c.item(i).data(Qt.ItemDataRole.UserRole)  # Qt.ItemDataRole.UserRole == 32
         assert item_cmd.startswith("/co"), f"{item_cmd} doesn't start with /co"
 
 
@@ -32,7 +33,7 @@ def test_update_filter_exact_match(qapp):
     c = SlashCompleter()
     c.update_filter("/clear")
     assert c.count() == 1
-    assert c.item(0).data(32) == "/clear"
+    assert c.item(0).data(Qt.ItemDataRole.UserRole) == "/clear"
 
 
 def test_command_chosen_signal_on_select_current(qapp, qtbot):
