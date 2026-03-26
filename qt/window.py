@@ -4,16 +4,22 @@ Panels: Explorer | Chat+Input | Editor | Server Stats
 """
 
 import os
+import sys
 from pathlib import Path
+
+# Ensure qt/ siblings are importable regardless of working directory
+sys.path.insert(0, str(Path(__file__).parent))
 
 from PySide6.QtWidgets import (
     QMainWindow, QSplitter, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QToolBar, QStatusBar, QComboBox, QLineEdit,
     QTreeView, QTabWidget, QTextBrowser, QPlainTextEdit,
     QPushButton, QProgressBar, QMessageBox, QFileSystemModel,
+    QScrollArea, QGroupBox, QSlider, QSpinBox, QDialog,
+    QDialogButtonBox, QListWidget, QListWidgetItem,
 )
 from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QAction, QColor, QTextCharFormat, QTextCursor, QKeySequence, QShortcut
 
 import httpx
 
@@ -21,6 +27,13 @@ from colors import USER_COLOR, ASST_COLOR, BG_CODE, BORDER_CODE, ACCENT, TEXT_DI
 from highlighter import SyntaxHighlighter, detect_language
 from file_watcher import DirWatcher
 from adapter import QtChatAdapter
+
+try:
+    from session_state import load_state, save_state, list_sessions, load_session, get_agent_name
+    from slash_completer import SlashCompleter
+except ImportError:
+    from qt.session_state import load_state, save_state, list_sessions, load_session, get_agent_name
+    from qt.slash_completer import SlashCompleter
 
 HOME_DIR = str(Path.home() / "claude-projects")
 
@@ -78,6 +91,14 @@ class MainWindow(QMainWindow):
         self._adapter = QtChatAdapter(self)
         self._adapter.start()
 
+        # Load persisted state
+        _state = load_state()
+        self._agent_name: str = get_agent_name(_state)
+        self._saved_think: str = _state.get("think_level", "on")
+        self._saved_approval: str = _state.get("approval_level", "auto")
+        self._saved_compact: bool = bool(_state.get("compact_mode", False))
+        self._compact_mode: bool = self._saved_compact
+
         self._build_menu()
         self._build_toolbar()
         self._build_panels()
@@ -96,7 +117,18 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self):
         mb = self.menuBar()
-        for name in ("File", "Sessions", "Model", "Tools", "Skills", "Voice", "Help"):
+
+        file_menu = mb.addMenu("File")
+        file_menu.addAction("Save Session As…", self._on_save_session)
+
+        sessions_menu = mb.addMenu("Sessions")
+        sessions_menu.addAction("New Session", self._on_new_session)
+        sessions_menu.addAction("Resume Last", self._on_resume_last)
+        sessions_menu.addAction("Browse Sessions…", self._on_browse_sessions)
+        sessions_menu.addSeparator()
+        sessions_menu.addAction("Browse Queue Results…", self._on_browse_queue_results)
+
+        for name in ("Model", "Tools", "Skills", "Voice", "Help"):
             mb.addMenu(name)
 
     # ── Toolbar ──────────────────────────────────────────────────────────────
@@ -125,7 +157,7 @@ class MainWindow(QMainWindow):
         tb.addWidget(QLabel("Think:"))
         self._think_combo = QComboBox()
         self._think_combo.addItems(["off", "on", "deep"])
-        self._think_combo.setCurrentText("on")
+        self._think_combo.setCurrentText(self._saved_think)
         self._think_combo.setFixedWidth(70)
         self._think_combo.currentTextChanged.connect(self._on_think_changed)
         tb.addWidget(self._think_combo)
@@ -134,9 +166,35 @@ class MainWindow(QMainWindow):
         tb.addWidget(QLabel("Approval:"))
         self._approval_combo = QComboBox()
         self._approval_combo.addItems(["auto", "ask-writes", "ask-all", "yolo"])
+        self._approval_combo.setCurrentText(self._saved_approval)
         self._approval_combo.setFixedWidth(90)
         self._approval_combo.currentTextChanged.connect(self._on_approval_changed)
         tb.addWidget(self._approval_combo)
+        tb.addSeparator()
+
+        # Plan mode toggle
+        self._plan_btn = QPushButton("Plan")
+        self._plan_btn.setCheckable(True)
+        self._plan_btn.setFixedWidth(50)
+        self._plan_btn.setToolTip("Plan mode — model describes actions without running tools")
+        tb.addWidget(self._plan_btn)
+
+        # Compact view toggle
+        self._compact_btn = QPushButton("Compact")
+        self._compact_btn.setCheckable(True)
+        self._compact_btn.setChecked(self._saved_compact)
+        self._compact_btn.setFixedWidth(70)
+        self._compact_btn.setToolTip("Compact mode — hides thinking tokens in Full View")
+        self._compact_btn.toggled.connect(self._on_compact_toggled)
+        tb.addWidget(self._compact_btn)
+
+        # Stop / interrupt button
+        self._stop_btn = QPushButton("■ Stop")
+        self._stop_btn.setFixedWidth(65)
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.setToolTip("Cancel the in-flight response (ESC)")
+        self._stop_btn.clicked.connect(self._adapter.cancel)
+        tb.addWidget(self._stop_btn)
         tb.addSeparator()
 
         self._cwd_label = QLabel(f"CWD: {self._cwd}")
@@ -198,13 +256,38 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._full_view, "Full Output")
         layout.addWidget(self._tabs, stretch=1)
 
+        # Token context bar (temporary SP3 placement; migrated to right panel in SP4)
+        ctx_row = QWidget()
+        ctx_layout = QHBoxLayout(ctx_row)
+        ctx_layout.setContentsMargins(6, 2, 6, 2)
+        ctx_layout.setSpacing(6)
+
+        self._ctx_bar = QProgressBar()
+        self._ctx_bar.setRange(0, 100)
+        self._ctx_bar.setValue(0)
+        self._ctx_bar.setTextVisible(False)
+        self._ctx_bar.setFixedHeight(6)
+        ctx_layout.addWidget(self._ctx_bar, stretch=1)
+
+        self._ctx_label = QLabel("Context: —")
+        self._ctx_label.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px;")
+        ctx_layout.addWidget(self._ctx_label)
+
+        self._ctx_warn = QLabel("⚠ compact soon")
+        self._ctx_warn.setStyleSheet("color: #fbbf24; font-size: 10px;")
+        self._ctx_warn.setVisible(False)
+        ctx_layout.addWidget(self._ctx_warn)
+
+        layout.addWidget(ctx_row)
+
+        # Input area
         input_container = QWidget()
         input_layout = QHBoxLayout(input_container)
         input_layout.setContentsMargins(6, 6, 6, 6)
         input_layout.setSpacing(6)
 
         self._input = QPlainTextEdit()
-        self._input.setPlaceholderText("Type a message… (Enter to send, Shift+Enter for new line)")
+        self._input.setPlaceholderText("Type a message… (Enter to send, Shift+Enter for newline, / for commands)")
         self._input.setFixedHeight(90)
         self._input.installEventFilter(self)
         input_layout.addWidget(self._input, stretch=1)
@@ -215,6 +298,12 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self._send_btn, alignment=Qt.AlignmentFlag.AlignBottom)
 
         layout.addWidget(input_container)
+
+        # Slash completer (positioned dynamically above input)
+        self._completer = SlashCompleter(self)
+        self._completer.hide()
+        self._completer.command_chosen.connect(self._on_command_chosen)
+
         return w
 
     # ── File Editor ──────────────────────────────────────────────────────────
@@ -318,16 +407,46 @@ class MainWindow(QMainWindow):
         self._adapter.error_msg.connect(self._on_error_msg)
         self._adapter.done.connect(self._on_turn_done)
 
-    # ── Event filter (Enter in input) ────────────────────────────────────────
+        # SP3 additions
+        self._adapter.stream_started.connect(self._on_stream_started)
+        self._esc_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._esc_shortcut.activated.connect(self._on_esc)
+        self._plan_btn.toggled.connect(lambda checked: setattr(self, '_plan_mode', checked))
+        self._input.textChanged.connect(self._on_input_changed)
+
+    # ── Event filter ─────────────────────────────────────────────────────────
 
     def eventFilter(self, obj, event):
         from PySide6.QtCore import QEvent
         if obj is self._input and event.type() == QEvent.Type.KeyPress:
             key = event.key()
             mods = event.modifiers()
-            if key == Qt.Key.Key_Return and not (mods & Qt.KeyboardModifier.ShiftModifier):
-                self._send_message()
+
+            # Shift+Enter → newline
+            if key == Qt.Key.Key_Return and (mods & Qt.KeyboardModifier.ShiftModifier):
+                self._input.insertPlainText("\n")
                 return True
+
+            # Enter (no shift) → send
+            if key == Qt.Key.Key_Return and not (mods & Qt.KeyboardModifier.ShiftModifier):
+                if self._completer.isVisible():
+                    self._completer.select_current()
+                else:
+                    self._send_message()
+                return True
+
+            # Arrow keys navigate completer
+            if self._completer.isVisible():
+                if key == Qt.Key.Key_Up:
+                    self._completer.move_selection(-1)
+                    return True
+                if key == Qt.Key.Key_Down:
+                    self._completer.move_selection(1)
+                    return True
+                if key == Qt.Key.Key_Escape:
+                    self._completer.hide()
+                    return True
+
         return super().eventFilter(obj, event)
 
     # ── Slots ────────────────────────────────────────────────────────────────
@@ -342,12 +461,14 @@ class MainWindow(QMainWindow):
         self._append_user(text)
         self._response_buf = ""
         self._full_view.append(
-            f'<span style="color:{ASST_COLOR};font-weight:bold;">Eli</span><br>'
+            f'<span style="color:{ASST_COLOR};font-weight:bold;">{self._agent_name}</span><br>'
         )
         self._adapter.submit(text, self._plan_mode)
 
     @Slot(str)
     def _on_think_token(self, token: str):
+        if getattr(self, "_compact_mode", False):
+            return   # suppress thinking display in compact mode
         _insert_plain(self._full_view, token)
         self._auto_scroll(self._full_view)
 
@@ -359,7 +480,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_text_done(self, full_text: str):
-        header = f'<span style="color:{ASST_COLOR};font-weight:bold;">Eli</span><br>'
+        header = f'<span style="color:{ASST_COLOR};font-weight:bold;">{self._agent_name}</span><br>'
         self._compact_view.insertHtml(header + _markdown_to_html(full_text) + "<br><br>")
         self._auto_scroll(self._compact_view)
 
@@ -389,6 +510,16 @@ class MainWindow(QMainWindow):
     @Slot(int, int)
     def _on_usage(self, tokens: int, ctx: int):
         self._stat_msgs.setText(f"Tokens: {tokens:,}")
+        if ctx > 0:
+            pct = int(tokens / ctx * 100)
+            self._ctx_bar.setValue(pct)
+            self._ctx_label.setText(f"{tokens // 1000:.1f}k / {ctx // 1000:.0f}k tokens ({pct}%)")
+            self._ctx_bar.setStyleSheet(
+                "QProgressBar::chunk { background: #ef4444; }" if pct >= 80 else
+                "QProgressBar::chunk { background: #fbbf24; }" if pct >= 60 else
+                "QProgressBar::chunk { background: #7dff7d; }"
+            )
+            self._ctx_warn.setVisible(pct >= 75)
 
     @Slot(str)
     def _on_system_msg(self, text: str):
@@ -403,6 +534,8 @@ class MainWindow(QMainWindow):
     def _on_turn_done(self):
         self._full_view.append("<br>")
         self._plan_mode = False
+        self._plan_btn.setChecked(False)
+        self._stop_btn.setEnabled(False)
         self._set_input_enabled(True)
         self._update_status()
 
@@ -487,9 +620,11 @@ class MainWindow(QMainWindow):
         if running:
             self._stat_status.setText("● Running")
             self._stat_status.setStyleSheet("color: #7dff7d;")
+            self._server_status.setStyleSheet("color: #7dff7d; font-size: 14px;")
         else:
             self._stat_status.setText("● Offline")
             self._stat_status.setStyleSheet("color: #ef4444;")
+            self._server_status.setStyleSheet("color: #ef4444; font-size: 14px;")
         self._vram_label.setText(vram_label)
         self._stat_speed.setText(speed_text)
         self._vram_bar.setValue(vram_pct)
@@ -503,6 +638,78 @@ class MainWindow(QMainWindow):
     def _on_approval_changed(self, val: str):
         self._adapter.submit_slash(f"/approval {val}")
         self._update_status()
+
+    @Slot()
+    def _on_stream_started(self):
+        self._stop_btn.setEnabled(True)
+
+    @Slot()
+    def _on_esc(self):
+        if self._completer.isVisible():
+            self._completer.hide()
+        elif self._stop_btn.isEnabled():
+            self._adapter.cancel()
+        else:
+            self._input.clear()
+
+    @Slot(bool)
+    def _on_compact_toggled(self, checked: bool):
+        # Compact toggle suppresses thinking tokens in the display (display-side only).
+        # It does NOT call /compact (which is a one-shot summarisation command).
+        self._compact_mode = checked
+        save_state(compact_mode=checked)
+        self._update_status()
+
+    @Slot(str)
+    def _on_command_chosen(self, cmd: str):
+        """Paste chosen slash command into input and move cursor to end."""
+        self._input.setPlainText(cmd + " ")
+        cursor = self._input.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self._input.setTextCursor(cursor)
+        self._input.setFocus()
+
+    @Slot()
+    def _on_new_session(self):
+        self._adapter.submit_slash("/clear")
+
+    @Slot()
+    def _on_resume_last(self):
+        self._adapter.submit_slash("/resume")
+
+    @Slot()
+    def _on_browse_sessions(self):
+        sessions = list_sessions()
+        if not sessions:
+            QMessageBox.information(self, "Sessions", "No saved sessions found.")
+            return
+        dlg = _SessionPickerDialog(sessions, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_name:
+            self._adapter.submit_slash(f"/resume {dlg.selected_name}")
+
+    @Slot()
+    def _on_browse_queue_results(self):
+        QMessageBox.information(self, "Queue Results", "Queue results viewer coming in SP5.")
+
+    @Slot()
+    def _on_save_session(self):
+        self._adapter.submit_slash("/save")
+
+    @Slot()
+    def _on_input_changed(self):
+        text = self._input.toPlainText()
+        if text.startswith("/") and "\n" not in text:
+            has_matches = self._completer.update_filter(text.rstrip())
+            if has_matches:
+                input_pos = self._input.mapToGlobal(self._input.rect().topLeft())
+                popup_height = min(220, self._completer.sizeHintForRow(0) * self._completer.count() + 4)
+                self._completer.setFixedWidth(self._input.width())
+                self._completer.move(input_pos.x(), input_pos.y() - popup_height)
+                self._completer.show()
+            else:
+                self._completer.hide()
+        else:
+            self._completer.hide()
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -522,8 +729,43 @@ class MainWindow(QMainWindow):
             sb.setValue(sb.maximum())
 
     def _set_input_enabled(self, enabled: bool):
-        self._input.setEnabled(enabled)
         self._send_btn.setEnabled(enabled)
+        self._input.setFocus()
+
+
+class _SessionPickerDialog(QDialog):
+    """Modal dialog to browse and select a saved session."""
+
+    def __init__(self, sessions: list[dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Browse Sessions")
+        self.setMinimumWidth(420)
+        self.selected_name: str | None = None
+
+        layout = QVBoxLayout(self)
+        self._list = QListWidget()
+        for s in sessions:
+            tok = s.get("token_estimate", 0)
+            label = f"{s['stem']}  —  {s.get('saved_at', '')}  ~{tok:,} tokens"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, s["stem"])
+            self._list.addItem(item)
+        layout.addWidget(self._list)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._list.itemDoubleClicked.connect(lambda _: self._on_accept())
+
+    def _on_accept(self):
+        item = self._list.currentItem()
+        if item:
+            self.selected_name = item.data(Qt.ItemDataRole.UserRole)
+            self.accept()
 
 
 # ── Module-level helpers ───────────────────────────────────────────────────────
