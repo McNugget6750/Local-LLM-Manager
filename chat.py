@@ -1780,7 +1780,10 @@ class ChatSession:
         self.approval_level: str    = "auto"
         self._session_path: Path | None = None
         self._in_subagent: bool     = False
-        self.compact_mode: bool     = False
+        self.compact_mode: bool         = False
+        self.compact_threshold: float   = CTX_COMPACT_THRESH
+        self.keep_recent: int           = CTX_KEEP_RECENT
+        self.input_compress_limit: int  = INPUT_COMPRESS_CHARS
         self.role: str              = "eli"  # active role name
         self._project_config: dict  = {}
         self._approval_notes: str   = ""  # injected into tool result after dispatch
@@ -2340,7 +2343,23 @@ class ChatSession:
         Returns (approved: bool, notes: str).
         Notes are non-empty when user chose 'b' or 'n' and typed something.
         Caller injects notes into the tool result (approved) or rejection message (denied).
+        In TUI mode, posts an approval_request event and awaits a Future resolved by the modal.
         """
+        if self.tui_queue:
+            future: asyncio.Future = asyncio.get_running_loop().create_future()
+            await self.tui_queue.put({
+                "type": "approval_request",
+                "title": title,
+                "message": message,
+                "style": style,
+                "future": future,
+            })
+            try:
+                return await future
+            except Exception:
+                return False, ""
+
+        # CLI mode
         console.print(Panel(message, title=f"[{style}]{title}[/{style}]", border_style=style))
         loop = asyncio.get_event_loop()
         try:
@@ -3662,11 +3681,36 @@ async def _voice_speak(text: str) -> None:
 
 
 async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_tools: bool = False) -> None:
-    """Blocking voice conversation loop. Exit: q+Enter or Ctrl+C."""
+    """Blocking voice conversation loop. Exit: Escape (ptt/auto) or q+Enter (CLI).
+    TUI-aware: when session.tui_queue is set, emits events instead of console.print.
+    """
+    _tq = session.tui_queue  # None in CLI, asyncio.Queue in TUI
+
+    async def _sys(text: str) -> None:
+        """Emit a status line — TUI system event or console.print."""
+        if _tq:
+            await _tq.put({"type": "system", "text": text})
+        else:
+            console.print(f"[dim]{text}[/dim]")
+
+    async def _voice_msg(role: str, text: str) -> None:
+        """Emit a transcript/reply line as a chat bubble or console line."""
+        if _tq:
+            # Reuse text_done so the drain loop renders it as a message widget
+            src = "eli" if role == "assistant" else "eli"
+            prefix = "You said" if role == "user" else "Eli"
+            await _tq.put({"type": "system", "text": f"[{prefix}] {text}"})
+        else:
+            label = "[bold green]You:[/bold green]" if role == "user" else "[bold cyan]Eli:[/bold cyan]"
+            console.print(f"{label} {text}")
+
     try:
         import sounddevice  # noqa: F401 — check it's available
     except ImportError:
-        console.print("[red]sounddevice not installed. Run: .venv\\Scripts\\pip install sounddevice[/red]")
+        if _tq:
+            await _tq.put({"type": "system", "text": "sounddevice not installed — voice unavailable"})
+        else:
+            console.print("[red]sounddevice not installed. Run: .venv\\Scripts\\pip install sounddevice[/red]")
         return
 
     # Load persona from agents/voice.md; fall back to inline constant
@@ -3707,17 +3751,11 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_
         listener = _kb.Listener(on_press=on_press, on_release=on_release)
         listener.start()
 
-        tools_note = "  [yellow]tools: on[/yellow]" if use_tools else "  [dim]tools: off[/dim]"
-        console.print(Panel(
-            f"Voice mode [bold]PTT[/bold] — hold [bold cyan]{PTT_KEY}[/bold cyan] to speak, release to send.\n"
-            f"[dim]Press Escape to exit.[/dim]{tools_note}",
-            border_style="magenta",
-        ))
+        tools_note = "tools: on" if use_tools else "tools: off"
+        await _sys(f"Voice PTT — hold {PTT_KEY} to speak, release to send. ESC to exit. {tools_note}")
 
         try:
             while not quit_event.is_set():
-                console.print("[dim]waiting for PTT...[/dim]", end="\r")
-
                 while not ptt_start.is_set() and not quit_event.is_set():
                     await asyncio.sleep(0.05)
 
@@ -3730,10 +3768,10 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_
 
                 transcript = await _voice_transcribe(audio)
                 if not transcript:
-                    console.print("[dim]  (nothing heard)[/dim]")
+                    await _sys("(nothing heard)")
                     continue
 
-                console.print(f"[bold green]You:[/bold green] {transcript}")
+                await _voice_msg("user", transcript)
                 history.append({"role": "user", "content": transcript})
 
                 reply = await _voice_model_call(history, session.client, session=session, use_tools=use_tools)
@@ -3741,6 +3779,7 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_
                     continue
                 history.append({"role": "assistant", "content": reply})
 
+                await _voice_msg("assistant", reply)
                 await _voice_speak(reply)
                 await asyncio.sleep(VOICE_POST_TTS_DELAY)
 
@@ -3753,7 +3792,10 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_
         try:
             import webrtcvad  # noqa: F401
         except ImportError:
-            console.print("[red]webrtcvad not installed. Run: .venv\\Scripts\\pip install webrtcvad[/red]")
+            if _tq:
+                await _tq.put({"type": "system", "text": "webrtcvad not installed — auto voice unavailable"})
+            else:
+                console.print("[red]webrtcvad not installed. Run: .venv\\Scripts\\pip install webrtcvad[/red]")
             return
 
         def on_press_auto(key):
@@ -3763,26 +3805,21 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_
         listener = _kb.Listener(on_press=on_press_auto)
         listener.start()
 
-        tools_note = "  [yellow]tools: on[/yellow]" if use_tools else "  [dim]tools: off[/dim]"
-        console.print(Panel(
-            "Voice mode [bold]AUTO[/bold] — speak naturally, pause to send.\n"
-            f"[dim]Press Escape to exit.[/dim]{tools_note}",
-            border_style="magenta",
-        ))
+        tools_note = "tools: on" if use_tools else "tools: off"
+        await _sys(f"Voice AUTO — speak naturally, pause to send. ESC to exit. {tools_note}")
 
         try:
             while not quit_event.is_set():
-                console.print("[dim]listening...[/dim]", end="\r")
                 audio = await _voice_record_auto(quit_event)
                 if not audio or quit_event.is_set():
                     break
 
                 transcript = await _voice_transcribe(audio)
                 if not transcript:
-                    console.print("[dim]  (nothing heard)[/dim]")
+                    await _sys("(nothing heard)")
                     continue
 
-                console.print(f"[bold green]You:[/bold green] {transcript}")
+                await _voice_msg("user", transcript)
                 history.append({"role": "user", "content": transcript})
 
                 reply = await _voice_model_call(history, session.client, session=session, use_tools=use_tools)
@@ -3790,6 +3827,7 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_
                     continue
                 history.append({"role": "assistant", "content": reply})
 
+                await _voice_msg("assistant", reply)
                 await _voice_speak(reply)
                 await asyncio.sleep(VOICE_POST_TTS_DELAY)
 
@@ -3798,7 +3836,7 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_
         finally:
             listener.stop()
 
-    console.print(Rule("[dim]Voice mode ended[/dim]", style="dim"))
+    await _sys("Voice mode ended")
 
 
 # ── Slash command handler ─────────────────────────────────────────────────────
