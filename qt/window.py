@@ -632,11 +632,13 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_think_changed(self, val: str):
         self._adapter.submit_slash(f"/think {val}")
+        save_state(think_level=val)
         self._update_status()
 
     @Slot(str)
     def _on_approval_changed(self, val: str):
         self._adapter.submit_slash(f"/approval {val}")
+        save_state(approval_level=val)
         self._update_status()
 
     @Slot()
@@ -730,6 +732,7 @@ class MainWindow(QMainWindow):
 
     def _set_input_enabled(self, enabled: bool):
         self._send_btn.setEnabled(enabled)
+        self._input.setReadOnly(not enabled)
         self._input.setFocus()
 
 
