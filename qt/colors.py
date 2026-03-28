@@ -10,9 +10,13 @@ BORDER_CODE = "#555555"
 ACCENT      = "#7ec8e3"
 TEXT_MUTED  = "#888888"
 TEXT_DIM    = "#666666"
-USER_COLOR  = "#36d7b7"
-ASST_COLOR  = "#7dff7d"
-RED         = "#ef4444"
+USER_COLOR   = "#36d7b7"
+ASST_COLOR   = "#7dff7d"
+RED          = "#ef4444"
+ELI_BORDER   = "#cc2222"   # red accent — Eli speech and tool calls
+REMOTE_COLOR = "#38bdf8"   # bright blue — remote HTTP submissions
+ELI_BG       = "#130808"   # dark red background for Eli blocks
+AGENT_BG     = "#130d00"   # dark orange background for agent blocks
 
 QSS = f"""
 QMainWindow, QDialog {{
@@ -110,6 +114,21 @@ QLineEdit, QComboBox {{
 QComboBox::drop-down {{
     border: none;
 }}
+QSpinBox {{
+    background: {BG_PANEL};
+    border: 1px solid {BORDER};
+    color: #cccccc;
+    padding: 2px 4px;
+}}
+QSpinBox::up-button, QSpinBox::down-button {{
+    background: #2a2a4a;
+    border-left: 1px solid {BORDER};
+    width: 16px;
+}}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
+    background: #3a3a5a;
+    border-color: {ACCENT};
+}}
 QProgressBar {{
     background: #222222;
     border: none;
@@ -122,16 +141,35 @@ QProgressBar::chunk {{
     border-radius: 2px;
 }}
 QScrollBar:vertical {{
-    background: {BG_SIDEBAR};
+    background: #050510;
     width: 8px;
     border: none;
 }}
 QScrollBar::handle:vertical {{
-    background: {BORDER};
+    background: #1e3a5f;
     border-radius: 4px;
     min-height: 20px;
 }}
+QScrollBar::handle:vertical:hover {{
+    background: #2a5080;
+}}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0px;
+}}
+QScrollBar:horizontal {{
+    background: #050510;
+    height: 8px;
+    border: none;
+}}
+QScrollBar::handle:horizontal {{
+    background: #1e3a5f;
+    border-radius: 4px;
+    min-width: 20px;
+}}
+QScrollBar::handle:horizontal:hover {{
+    background: #2a5080;
+}}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+    width: 0px;
 }}
 """

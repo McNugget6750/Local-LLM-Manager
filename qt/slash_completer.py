@@ -25,6 +25,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/skills",        "List available skills"),
     ("/skill",         "Invoke a skill explicitly"),
     ("/queue-results", "List recent agent queue runs"),
+    ("/excerpt",       "Insert selected editor code into prompt with line numbers"),
 ]
 
 
@@ -35,9 +36,8 @@ class SlashCompleter(QListWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowFlags(
-            Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
-        )
+        # Plain child widget — no Popup flag. Popup grabs OS keyboard events
+        # and blocks typing in the input field even with NoFocus set.
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setMaximumHeight(220)
         self.itemClicked.connect(self._on_item_clicked)

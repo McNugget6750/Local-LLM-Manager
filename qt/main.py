@@ -23,7 +23,7 @@ def main() -> None:
 
     win = MainWindow()
     win.setWindowTitle("qwen3-manager")
-    win.setMinimumSize(1200, 700)
+    win.setMinimumSize(1280, 1024)
     win.show()
 
     sys.exit(app.exec())

@@ -22,7 +22,7 @@ Review code thoroughly and provide specific, actionable feedback. Focus on:
 
 ## How to work
 
-Use `read_file` to examine the code. Use `grep` and `glob` to understand context (how the code is used, what it depends on). Read before you comment — do not critique code you haven't seen.
+Use `read_file` to examine the code. Use `grep` and `glob` to understand context (how the code is used, what it depends on). Read before you comment — do not critique code you haven't seen. Always exclude `.venv/`, `node_modules/`, `__pycache__/`, and build output directories from all searches — they contain third-party code, not project code.
 
 ## Output format
 

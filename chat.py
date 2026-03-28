@@ -736,6 +736,51 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "highlight_in_editor",
+            "description": (
+                "Highlight a passage in the GUI editor panel with a yellow background. "
+                "Use this to draw the user's attention to a specific part of the open file — "
+                "e.g. after explaining something, to show exactly which lines you mean. "
+                "The highlight is cleared when the user clicks, sends a message, or the file is edited. "
+                "For a single-line character range, also provide start_col and end_col."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":       {"type": "string",  "description": "Absolute path to the file (must already be open or openable in the editor)."},
+                    "start_line": {"type": "integer", "description": "First line to highlight (1-based)."},
+                    "end_line":   {"type": "integer", "description": "Last line to highlight (1-based, inclusive)."},
+                    "start_col":  {"type": "integer", "description": "Start column for character-level highlight on a single line (0-based, optional)."},
+                    "end_col":    {"type": "integer", "description": "End column for character-level highlight on a single line (0-based, exclusive, optional)."},
+                },
+                "required": ["path", "start_line", "end_line"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_in_editor",
+            "description": (
+                "Open a file in the GUI editor panel and scroll to a specific line. "
+                "Use this when the user asks 'where is X in the code?' or 'can you show me Y?' "
+                "so they can see the relevant location without manually navigating to it. "
+                "The user will be shown a confirmation dialog if the file differs from the one "
+                "currently open."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to the file to open."},
+                    "line": {"type": "integer", "description": "1-based line number to scroll to (optional)."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
 ]
 
 DANGEROUS_PATTERNS = [
@@ -823,8 +868,49 @@ class ToolCallAccumulator:
             "function": {"name": self.name, "arguments": self.arguments},
         }
 
+# ── Debug stream capture ──────────────────────────────────────────────────────
+_debug_file: "IO[str] | None" = None
+_debug_path: str = ""
+
+
+def _debug_open(path: str) -> str:
+    """Open (or reopen) the debug capture file. Returns the resolved path."""
+    global _debug_file, _debug_path
+    import datetime
+    _debug_close()
+    if not path or path in ("1", "on", "true"):
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = f"debug_stream_{ts}.log"
+    resolved = str(Path(path).resolve())
+    _debug_file = open(resolved, "a", encoding="utf-8", buffering=1)  # line-buffered
+    _debug_path = resolved
+    return resolved
+
+
+def _debug_close() -> None:
+    global _debug_file, _debug_path
+    if _debug_file:
+        try:
+            _debug_file.close()
+        except Exception:
+            pass
+        _debug_file = None
+        _debug_path = ""
+
+
+def _debug_write_line(line: str) -> None:
+    if _debug_file:
+        try:
+            _debug_file.write(line + "\n")
+        except Exception:
+            pass
+
+
 # ── SSE stream parser ─────────────────────────────────────────────────────────
-async def stream_events(response: httpx.Response) -> AsyncIterator[tuple[str, Any]]:
+async def stream_events(
+    response: httpx.Response,
+    label: str = "",
+) -> AsyncIterator[tuple[str, Any]]:
     """
     Parse an SSE stream from the llama-server and yield typed events:
       ("think", token)
@@ -844,7 +930,16 @@ async def stream_events(response: httpx.Response) -> AsyncIterator[tuple[str, An
         if token:
             yield ("think" if is_thinking else "text", token)
 
+    if _debug_file:
+        import datetime
+        ts = datetime.datetime.now().isoformat(timespec="milliseconds")
+        _debug_write_line(f"\n{'='*72}")
+        _debug_write_line(f"=== {ts}  {label}")
+        _debug_write_line(f"{'='*72}")
+
     async for line in response.aiter_lines():
+        if _debug_file:
+            _debug_write_line(line)
         if not line.startswith("data: "):
             continue
         raw = line[6:]
@@ -1132,6 +1227,112 @@ def _is_exec(command: str) -> bool:
         "", stripped, flags=_re.IGNORECASE,
     )
     return bool(_re.search(r'\b\S+\.(py|js|sh|bat|ps1|exe)\b', candidate, _re.IGNORECASE))
+
+
+def _fmt_tool_args(name: str, args: dict) -> str:
+    """Format tool args as a human-readable string for approval dialogs."""
+    if not args:
+        return ""
+    # Keys to show first for each tool, in order
+    priority = {
+        "bash":       ["command"],
+        "read_file":  ["path", "file_path", "offset", "limit"],
+        "write_file": ["path", "file_path"],
+        "edit":       ["path", "file_path", "old_string", "new_string"],
+        "glob":       ["pattern", "path"],
+        "grep":       ["pattern", "path"],
+        "list_dir":   ["path"],
+        "web_fetch":  ["url"],
+        "web_search": ["query"],
+        "task_list":  ["operation", "title", "id", "status"],
+    }
+    keys = priority.get(name, [])
+    ordered = [k for k in keys if k in args] + [k for k in args if k not in keys]
+    lines = []
+    for k in ordered:
+        v = args[k]
+        v_str = str(v)
+        if len(v_str) > 200:
+            v_str = v_str[:197] + "..."
+        lines.append(f"{k}: {v_str}")
+    return "\n".join(lines)
+
+
+def _matches_session_rule(name: str, args: dict, rules: list[str]) -> bool:
+    """Return True if this tool call is covered by a session-level allow rule."""
+    path = args.get("path", "")
+    cmd  = args.get("command", "")
+    for rule in rules:
+        if rule.startswith("path_prefix:"):
+            prefix = rule[len("path_prefix:"):]
+            if path and os.path.normcase(path).startswith(os.path.normcase(prefix)):
+                return True
+        elif rule.startswith("cmd_pattern:"):
+            pattern = rule[len("cmd_pattern:"):]
+            if cmd and fnmatch.fnmatch(cmd.strip(), pattern):
+                return True
+        elif rule.startswith("tool:"):
+            tool = rule[len("tool:"):]
+            if name == tool:
+                return True
+    return False
+
+
+def _build_approval_check(
+    name: str,
+    args: dict,
+    approval_level: str,
+    prefix: str = "",
+    session_rules: list[str] | None = None,
+) -> tuple[bool, str, str, str]:
+    """Return (ask_needed, title, message, style) for a tool call approval check.
+
+    `prefix` is prepended to titles (e.g. "Sub-Agent — ") to distinguish sub-agent prompts.
+    Returns ask_needed=False when no approval is required.
+    """
+    if approval_level == "yolo":
+        return False, "", "", "yellow"
+
+    cmd = args.get("command", "") if name == "bash" else ""
+    ask_needed = False
+    ask_title = f"{prefix}Approval Required"
+    ask_msg = ""
+    ask_style = "yellow"
+
+    if name == "bash" and _is_dangerous(cmd):
+        ask_needed = True
+        ask_title = f"{prefix}Warning — Dangerous Command"
+        ask_msg = f"Dangerous command detected:\n\n{_fmt_tool_args(name, args)}"
+        ask_style = "red"
+    elif name == "bash" and _is_install(cmd):
+        ask_needed = True
+        ask_title = f"{prefix}Install Guard"
+        ask_msg = (
+            f"Package install detected:\n\n{_fmt_tool_args(name, args)}\n\n"
+            "Run it? Or install yourself and press Enter when ready."
+        )
+        ask_style = "yellow"
+    elif name == "bash" and approval_level == "auto" and _is_exec(cmd):
+        ask_needed = True
+        ask_title = f"{prefix}Script Execution"
+        ask_msg = f"Script execution detected:\n\n{_fmt_tool_args(name, args)}"
+        ask_style = "yellow"
+    elif approval_level == "ask-all":
+        ask_needed = True
+        ask_title = f"{prefix}Approval Required"
+        ask_msg = f"Tool: {name}\n\n{_fmt_tool_args(name, args)}"
+    elif approval_level == "ask-writes":
+        WRITE_TOOLS = {"bash", "write_file", "edit"}
+        if name in WRITE_TOOLS or (name == "task_list" and args.get("operation") != "read"):
+            ask_needed = True
+            ask_title = f"{prefix}Write Operation — {name}"
+            ask_msg = f"Write operation — {name}:\n\n{_fmt_tool_args(name, args)}"
+
+    # Session rules can suppress non-dangerous prompts (install/exec/ask-writes/ask-all)
+    if ask_needed and ask_style != "red" and session_rules and _matches_session_rule(name, args, session_rules):
+        return False, "", "", "yellow"
+
+    return ask_needed, ask_title, ask_msg, ask_style
 
 
 def _menu_select(options: list[str]) -> int:
@@ -1738,12 +1939,30 @@ async def _invoke_skill(skill_name: str, skill_args: str, session: "ChatSession"
                 title="[cyan]Skill[/cyan]",
                 border_style="cyan",
             ))
+        _skill_id = f"__skill_{skill_name}"
+        is_error = False
+        if session.tui_queue:
+            await session.tui_queue.put({
+                "type": "tool_start",
+                "id": _skill_id,
+                "name": "spawn_agent",
+                "args": f'{{"task": {__import__("json").dumps(skill_args[:120])}}}',
+            })
         try:
             result = await session._tool_spawn_agent(expanded, skill_args, tools, think, max_iter)
         except Exception as e:
             result = f"[skill agent error: {e}]"
+            is_error = True
             if not session.tui_queue:
                 console.print(f"[red]Skill agent failed: {e}[/red]")
+        if session.tui_queue:
+            await session.tui_queue.put({
+                "type": "tool_done",
+                "id": _skill_id,
+                "name": "spawn_agent",
+                "result": result,
+                "is_error": is_error,
+            })
         # Feed the report back to Eli via a proper send_and_stream call so it lands in
         # Eli's message history as a valid user→assistant exchange. This is necessary for:
         #   (a) Eli to actually read and process the research findings
@@ -1787,6 +2006,7 @@ class ChatSession:
         self.role: str              = "eli"  # active role name
         self._project_config: dict  = {}
         self._approval_notes: str   = ""  # injected into tool result after dispatch
+        self.session_rules: list[str] = []  # persistent allow-rules for this session
         self.tui_queue: asyncio.Queue | None = None  # set by TUI to receive typed events
 
     async def __aenter__(self):
@@ -2008,12 +2228,17 @@ class ChatSession:
 
             self.messages = new_messages
             self.tokens_used = 0
-            console.print(Rule(
-                f"[yellow]Context compacted[/yellow] [dim]({orig_count} → {len(self.messages)} messages)[/dim]",
-                style="yellow",
-            ))
+            msg = f"Context compacted ({orig_count} → {len(self.messages)} messages)"
+            if self.tui_queue:
+                await self.tui_queue.put({"type": "system", "text": msg})
+            else:
+                console.print(Rule(f"[yellow]{msg}[/yellow]", style="yellow"))
         except Exception as e:
-            console.print(f"[yellow]Compaction failed — history unchanged[/yellow] [dim]({e})[/dim]")
+            err = f"Compaction failed — history unchanged: {e}"
+            if self.tui_queue:
+                await self.tui_queue.put({"type": "system", "text": err})
+            else:
+                console.print(f"[yellow]{err}[/yellow]")
         finally:
             self._compacting = False
 
@@ -2056,6 +2281,21 @@ class ChatSession:
             self._session_path = _save_session(self.messages, self._n_fixed, self._session_path)
         except Exception:
             pass
+
+    def rollback_partial_turn(self) -> None:
+        """Strip any incomplete assistant/tool messages added during a cancelled turn.
+
+        Leaves the last user message in place so the model knows what was asked.
+        If the last message is also a user message with no response at all, removes it
+        to avoid a duplicate when the user re-submits.
+        """
+        # Remove trailing non-user messages (incomplete assistant/tool state)
+        while len(self.messages) > self._n_fixed and self.messages[-1]["role"] != "user":
+            self.messages.pop()
+        # If the very last message is a user message with nothing after it,
+        # the turn was cancelled before any response — remove it so re-submit works cleanly.
+        if len(self.messages) > self._n_fixed and self.messages[-1]["role"] == "user":
+            self.messages.pop()
 
     async def send_and_stream(self, user_text: str, plan_mode: bool = False):
         user_text = await self._maybe_compact_input(user_text)
@@ -2132,7 +2372,10 @@ class ChatSession:
                     think_title = "[dim]Thinking (deep)...[/dim]" if self.think_level == "deep" else "[dim]Thinking...[/dim]"
                     think_border = "blue" if self.think_level == "deep" else "dim"
 
-                    async for event_type, data in stream_events(response):
+                    async for event_type, data in stream_events(
+                        response,
+                        label=f"send_and_stream | model={self.model} | {BASE_URL}",
+                    ):
                         if event_type == "think":
                             thinking_buf += data
                             if self.tui_queue:
@@ -2337,7 +2580,14 @@ class ChatSession:
             resolved = self.cwd / resolved
         return str(resolved)
 
-    async def _approval_prompt(self, title: str, message: str, style: str = "yellow") -> tuple[bool, str]:
+    async def _approval_prompt(
+        self,
+        title: str,
+        message: str,
+        style: str = "yellow",
+        tool_name: str = "",
+        tool_args_str: str = "",
+    ) -> tuple[bool, str]:
         """Three-option approval prompt: y / b (yes, but...) / n (no, with reason).
 
         Returns (approved: bool, notes: str).
@@ -2352,6 +2602,8 @@ class ChatSession:
                 "title": title,
                 "message": message,
                 "style": style,
+                "tool_name": tool_name,
+                "tool_args_str": tool_args_str,
                 "future": future,
             })
             try:
@@ -2462,6 +2714,26 @@ class ChatSession:
                 )
             elif name == "speak":
                 return await tool_speak(args.get("text", ""))
+            elif name == "highlight_in_editor":
+                path = args.get("path", "")
+                start_line = int(args.get("start_line", 1))
+                end_line   = int(args.get("end_line", start_line))
+                if self.tui_queue:
+                    await self.tui_queue.put({
+                        "type":       "highlight_in_editor",
+                        "path":       path,
+                        "start_line": start_line,
+                        "end_line":   end_line,
+                        "start_col":  int(args.get("start_col", -1)),
+                        "end_col":    int(args.get("end_col",   -1)),
+                    })
+                return f"[highlighted {path} lines {start_line}–{end_line}]"
+            elif name == "open_in_editor":
+                path = args.get("path", "")
+                line = int(args.get("line", 1))
+                if self.tui_queue:
+                    await self.tui_queue.put({"type": "open_in_editor", "path": path, "line": line})
+                return f"[opened {path} at line {line} in editor]"
             else:
                 return f"[unknown tool: {name}]"
         except Exception as e:
@@ -2528,8 +2800,16 @@ class ChatSession:
                 if not ready:
                     return f"[error: server failed to start model '{model}' — agent aborted]"
 
+        import datetime as _dt
+        _today = _dt.date.today().strftime("%Y-%m-%d")
+        _ctx = (
+            f"\n\n[Session Context]\n"
+            f"Today's date: {_today}\n"
+            f"Current working directory: {self.cwd}\n"
+            f"All relative file paths resolve against this directory."
+        )
         messages: list[dict] = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_prompt + _ctx},
             {"role": "user", "content": task},
         ]
 
@@ -2584,7 +2864,10 @@ class ChatSession:
                     with _live_ctx as live:
                         show_thinking = think != "off" and not self.compact_mode
 
-                        async for event_type, data in stream_events(response):
+                        async for event_type, data in stream_events(
+                            response,
+                            label=f"spawn_agent[iter] | model={model or self.model} | {BASE_URL}",
+                        ):
                             if event_type == "think":
                                 thinking_buf += data
                                 if self.tui_queue:
@@ -2636,7 +2919,8 @@ class ChatSession:
                                 else:
                                     live.update(Text(""))
 
-                final_text = assistant_content
+                if assistant_content:          # keep last meaningful text; don't overwrite with ""
+                    final_text = assistant_content
 
                 # Fallback: model emitted tool calls as text
                 if not tool_calls_received and assistant_content:
@@ -2702,50 +2986,31 @@ class ChatSession:
                                 return tc["id"], tc_result
 
                         # Apply same approval rules as top-level _call_tool
-                        if self.approval_level != "yolo" and tc_name == "bash":
-                            cmd = tc_args.get("command", "")
-                            ask_needed = False
-                            ask_title = "Sub-Agent Approval Required"
-                            ask_msg = ""
-                            ask_style = "yellow"
-                            if _is_dangerous(cmd):
-                                ask_needed = True
-                                ask_title = "Sub-Agent — Dangerous Command"
-                                ask_msg = f"[red]Dangerous command from sub-agent![/red]\n[dim]{cmd}[/dim]"
-                                ask_style = "red"
-                            elif _is_install(cmd):
-                                ask_needed = True
-                                ask_title = "Sub-Agent — Install Guard"
-                                ask_msg = (
-                                    f"[yellow]Sub-agent wants to install a package.[/yellow]\n[dim]{cmd}[/dim]\n"
-                                    "Run it? Or install yourself and press Enter when ready."
-                                )
-                                ask_style = "yellow"
-                            elif self.approval_level == "auto" and _is_exec(cmd):
-                                ask_needed = True
-                                ask_title = "Sub-Agent — Script Execution"
-                                ask_msg = f"[yellow]Sub-agent script execution detected.[/yellow]\n[dim]{cmd}[/dim]"
-                                ask_style = "yellow"
-                            elif self.approval_level == "ask-all":
-                                ask_needed = True
-                                ask_msg = "[yellow]Sub-agent bash command — approve?[/yellow]"
-                            elif self.approval_level == "ask-writes":
-                                ask_needed = True
-                                ask_msg = "[yellow]Sub-agent bash command — approve?[/yellow]"
-                            if ask_needed:
-                                _sa_approved, _sa_notes = await self._approval_prompt(ask_title, ask_msg, ask_style)
-                                if not _sa_approved:
-                                    _reason = f" User says: {_sa_notes}." if _sa_notes else ""
-                                    tc_result = f"[cancelled by user]{_reason}"
-                                    if not self.tui_queue:
-                                        console.print(Panel(
-                                            tc_result,
-                                            title="[dim cyan]Agent Tool Result[/dim cyan]",
-                                            border_style="cyan",
-                                        ))
-                                    return tc["id"], tc_result
-                                if _sa_notes:
-                                    self._approval_notes = _sa_notes
+                        _sa_ask, _sa_title, _sa_msg, _sa_style = _build_approval_check(
+                            tc_name, tc_args, self.approval_level,
+                            prefix="Sub-Agent — ", session_rules=self.session_rules
+                        )
+                        if _sa_ask:
+                            import json as _json
+                            _sa_args_str = _json.dumps(tc_args, ensure_ascii=False)
+                            _sa_approved, _sa_notes = await self._approval_prompt(
+                                _sa_title, _sa_msg, _sa_style,
+                                tool_name=tc_name, tool_args_str=_sa_args_str,
+                            )
+                            if not _sa_approved:
+                                _reason = f" User says: {_sa_notes}." if _sa_notes else ""
+                                tc_result = f"[cancelled by user]{_reason}"
+                                if not self.tui_queue:
+                                    console.print(Panel(
+                                        tc_result,
+                                        title="[dim cyan]Agent Tool Result[/dim cyan]",
+                                        border_style="cyan",
+                                    ))
+                                return tc["id"], tc_result
+                            if _sa_notes.startswith("session_allow:"):
+                                self.session_rules.append(_sa_notes[len("session_allow:"):])
+                            elif _sa_notes:
+                                self._approval_notes = _sa_notes
                         tc_result = await self._dispatch_tool(tc_name, tc_args)
                         if self._approval_notes:
                             tc_result += f"\n[Note from user: {self._approval_notes}]"
@@ -2860,7 +3125,9 @@ class ChatSession:
                               "stream": True, "temperature": 0.3},
                         headers={"Accept": "text/event-stream"},
                     ) as resp:
-                        async for ev_type, ev_data in stream_events(resp):
+                        async for ev_type, ev_data in stream_events(
+                            resp, label=f"agent-summary | {BASE_URL}"
+                        ):
                             if ev_type == "text":
                                 final_text += ev_data
                                 if self.tui_queue:
@@ -3083,7 +3350,9 @@ class ChatSession:
                                           "stream": True, "temperature": 0.3},
                                     headers={"Accept": "text/event-stream"},
                                 ) as resp:
-                                    async for ev_type, ev_data in stream_events(resp):
+                                    async for ev_type, ev_data in stream_events(
+                                        resp, label=f"queue_agents-summary | {BASE_URL}"
+                                    ):
                                         if ev_type == "text":
                                             final_text += ev_data
                             except Exception:
@@ -3115,7 +3384,9 @@ class ChatSession:
                         response.raise_for_status()
                         _live = _NullLive() if (self.tui_queue or self.compact_mode) else Live(console=console, refresh_per_second=8)
                         with _live as live:
-                            async for ev_type, ev_data in stream_events(response):
+                            async for ev_type, ev_data in stream_events(
+                                response, label=f"queue_agents[iter] | model={current_model} | {BASE_URL}"
+                            ):
                                 if ev_type == "text":
                                     text_buf += ev_data
                                     assistant_content += ev_data
@@ -3317,45 +3588,23 @@ class ChatSession:
                     self._approval_notes = _np_notes
 
         # Approval guard
-        if self.approval_level != "yolo":
-            cmd = args.get("command", "") if name == "bash" else ""
-            ask_needed = False
-            ask_title = "Approval Required"
-            ask_msg = ""
-            ask_style = "yellow"
-            if name == "bash" and _is_dangerous(cmd):
-                ask_needed = True
-                ask_title = "Warning — Dangerous Command"
-                ask_msg = f"[red]Dangerous command detected![/red]\n[dim]{cmd}[/dim]"
-                ask_style = "red"
-            elif name == "bash" and _is_install(cmd):
-                ask_needed = True
-                ask_title = "Install Guard"
-                ask_msg = (
-                    f"[yellow]Package install detected.[/yellow]\n[dim]{cmd}[/dim]\n"
-                    "Run it? Or install yourself and press Enter when ready."
-                )
-                ask_style = "yellow"
-            elif name == "bash" and self.approval_level == "auto" and _is_exec(cmd):
-                ask_needed = True
-                ask_title = "Script Execution"
-                ask_msg = f"[yellow]Script execution detected.[/yellow]\n[dim]{cmd}[/dim]"
-                ask_style = "yellow"
-            elif self.approval_level == "ask-all":
-                ask_needed = True
-                ask_msg = f"[yellow]Approve tool call?[/yellow]"
-            elif self.approval_level == "ask-writes":
-                WRITE_TOOLS = {"bash", "write_file", "edit"}
-                if name in WRITE_TOOLS or (name == "task_list" and args.get("operation") != "read"):
-                    ask_needed = True
-                    ask_msg = "[yellow]Write operation — approve?[/yellow]"
-            if ask_needed:
-                _approved, _notes = await self._approval_prompt(ask_title, ask_msg, ask_style)
-                if not _approved:
-                    _reason = f" User says: {_notes}." if _notes else ""
-                    return f"[cancelled by user]{_reason}"
-                if _notes:
-                    self._approval_notes = _notes
+        _ask, _ask_title, _ask_msg, _ask_style = _build_approval_check(
+            name, args, self.approval_level, session_rules=self.session_rules
+        )
+        if _ask:
+            import json as _json
+            _args_str = _json.dumps(args, ensure_ascii=False)
+            _approved, _notes = await self._approval_prompt(
+                _ask_title, _ask_msg, _ask_style,
+                tool_name=name, tool_args_str=_args_str,
+            )
+            if not _approved:
+                _reason = f" User says: {_notes}." if _notes else ""
+                return f"[cancelled by user]{_reason}"
+            if _notes.startswith("session_allow:"):
+                self.session_rules.append(_notes[len("session_allow:"):])
+            elif _notes:
+                self._approval_notes = _notes
 
         # Dispatch
         result = await self._dispatch_tool(name, args)
@@ -3536,7 +3785,9 @@ async def _voice_model_call(
             headers={"Accept": "text/event-stream"},
         ) as response:
             response.raise_for_status()
-            async for event_type, data in stream_events(response):
+            async for event_type, data in stream_events(
+                response, label=f"simple-stream | {BASE_URL}"
+            ):
                 if event_type == "text":
                     reply_parts.append(data)
                     console.print(data, end="", markup=False)
@@ -3854,6 +4105,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                     "[bold]/think \\[off|on|deep\\][/bold]   Set thinking level (or cycle)",
                     "[bold]/save \\[path\\][/bold]           Save conversation to JSON",
                     "[bold]/compact[/bold]               Summarise older messages to free context",
+                    "[bold]/debug \\[path|off\\][/bold]     Capture raw SSE stream to file (default: debug_stream_TIMESTAMP.log)",
                     "[bold]/status[/bold]                Show token usage and context window info",
                     "[bold]/sessions[/bold]              List saved sessions",
                     "[bold]/resume \\[name\\][/bold]         Load a saved session (replaces current)",
@@ -3913,6 +4165,20 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                   "deep": "[yellow]deep — thorough reasoning, temp 0.3[/yellow]"}
         console.print(f"Think level: {labels[session.think_level]}")
         _save_state(think_level=session.think_level)
+        return True
+
+    elif name == "/debug":
+        import chat as _chat_mod
+        if len(parts) > 1 and parts[1].lower() in ("off", "0", "false"):
+            _chat_mod._debug_close()
+            console.print("[dim]Debug stream capture: off[/dim]")
+        elif _chat_mod._debug_file:
+            console.print(f"[dim]Debug stream capture already active → {_chat_mod._debug_path}[/dim]")
+            console.print("[dim]Use /debug off to stop.[/dim]")
+        else:
+            path_arg = parts[1] if len(parts) > 1 else "1"
+            resolved = _chat_mod._debug_open(path_arg)
+            console.print(f"[yellow]Debug stream capture: on → {resolved}[/yellow]")
         return True
 
     elif name == "/compact":
