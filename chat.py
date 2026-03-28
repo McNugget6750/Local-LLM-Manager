@@ -722,14 +722,62 @@ TOOLS = [
                 "Use for: task-done notifications, questions that need the user at the keyboard, "
                 "unexpected blockers. "
                 "Keep to 1–2 short sentences — conversational length. "
-                "Do NOT narrate ongoing work, repeat what is already on screen, or read out long results."
+                "Do NOT narrate ongoing work, repeat what is already on screen, or read out long results. "
+                "Formatting rules: substitute '.' with '...' to create natural pauses. "
+                "Only use punctuation from this set: . , ? ! ' "
+                "Write currency as words, e.g. '20.45 Dollars' not '$20.45'."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "text": {"type": "string", "description": "Text to speak (1–2 sentences max)"},
+                    "text": {"type": "string", "description": "Text to speak (1–2 sentences max). Use '...' for pauses. Only .,?!' punctuation allowed."},
                 },
                 "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "highlight_in_editor",
+            "description": (
+                "Highlight a passage in the GUI editor panel with a yellow background. "
+                "Use this to draw the user's attention to a specific part of the open file — "
+                "e.g. after explaining something, to show exactly which lines you mean. "
+                "The highlight is cleared when the user clicks, sends a message, or the file is edited. "
+                "For a single-line character range, also provide start_col and end_col."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":       {"type": "string",  "description": "Absolute path to the file (must already be open or openable in the editor)."},
+                    "start_line": {"type": "integer", "description": "First line to highlight (1-based)."},
+                    "end_line":   {"type": "integer", "description": "Last line to highlight (1-based, inclusive)."},
+                    "start_col":  {"type": "integer", "description": "Start column for character-level highlight on a single line (0-based, optional)."},
+                    "end_col":    {"type": "integer", "description": "End column for character-level highlight on a single line (0-based, exclusive, optional)."},
+                },
+                "required": ["path", "start_line", "end_line"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_in_editor",
+            "description": (
+                "Open a file in the GUI editor panel and scroll to a specific line. "
+                "Use this when the user asks 'where is X in the code?' or 'can you show me Y?' "
+                "so they can see the relevant location without manually navigating to it. "
+                "The user will be shown a confirmation dialog if the file differs from the one "
+                "currently open."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to the file to open."},
+                    "line": {"type": "integer", "description": "1-based line number to scroll to (optional)."},
+                },
+                "required": ["path"],
             },
         },
     },
@@ -820,8 +868,49 @@ class ToolCallAccumulator:
             "function": {"name": self.name, "arguments": self.arguments},
         }
 
+# ── Debug stream capture ──────────────────────────────────────────────────────
+_debug_file: "IO[str] | None" = None
+_debug_path: str = ""
+
+
+def _debug_open(path: str) -> str:
+    """Open (or reopen) the debug capture file. Returns the resolved path."""
+    global _debug_file, _debug_path
+    import datetime
+    _debug_close()
+    if not path or path in ("1", "on", "true"):
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = f"debug_stream_{ts}.log"
+    resolved = str(Path(path).resolve())
+    _debug_file = open(resolved, "a", encoding="utf-8", buffering=1)  # line-buffered
+    _debug_path = resolved
+    return resolved
+
+
+def _debug_close() -> None:
+    global _debug_file, _debug_path
+    if _debug_file:
+        try:
+            _debug_file.close()
+        except Exception:
+            pass
+        _debug_file = None
+        _debug_path = ""
+
+
+def _debug_write_line(line: str) -> None:
+    if _debug_file:
+        try:
+            _debug_file.write(line + "\n")
+        except Exception:
+            pass
+
+
 # ── SSE stream parser ─────────────────────────────────────────────────────────
-async def stream_events(response: httpx.Response) -> AsyncIterator[tuple[str, Any]]:
+async def stream_events(
+    response: httpx.Response,
+    label: str = "",
+) -> AsyncIterator[tuple[str, Any]]:
     """
     Parse an SSE stream from the llama-server and yield typed events:
       ("think", token)
@@ -841,7 +930,16 @@ async def stream_events(response: httpx.Response) -> AsyncIterator[tuple[str, An
         if token:
             yield ("think" if is_thinking else "text", token)
 
+    if _debug_file:
+        import datetime
+        ts = datetime.datetime.now().isoformat(timespec="milliseconds")
+        _debug_write_line(f"\n{'='*72}")
+        _debug_write_line(f"=== {ts}  {label}")
+        _debug_write_line(f"{'='*72}")
+
     async for line in response.aiter_lines():
+        if _debug_file:
+            _debug_write_line(line)
         if not line.startswith("data: "):
             continue
         raw = line[6:]
@@ -1129,6 +1227,112 @@ def _is_exec(command: str) -> bool:
         "", stripped, flags=_re.IGNORECASE,
     )
     return bool(_re.search(r'\b\S+\.(py|js|sh|bat|ps1|exe)\b', candidate, _re.IGNORECASE))
+
+
+def _fmt_tool_args(name: str, args: dict) -> str:
+    """Format tool args as a human-readable string for approval dialogs."""
+    if not args:
+        return ""
+    # Keys to show first for each tool, in order
+    priority = {
+        "bash":       ["command"],
+        "read_file":  ["path", "file_path", "offset", "limit"],
+        "write_file": ["path", "file_path"],
+        "edit":       ["path", "file_path", "old_string", "new_string"],
+        "glob":       ["pattern", "path"],
+        "grep":       ["pattern", "path"],
+        "list_dir":   ["path"],
+        "web_fetch":  ["url"],
+        "web_search": ["query"],
+        "task_list":  ["operation", "title", "id", "status"],
+    }
+    keys = priority.get(name, [])
+    ordered = [k for k in keys if k in args] + [k for k in args if k not in keys]
+    lines = []
+    for k in ordered:
+        v = args[k]
+        v_str = str(v)
+        if len(v_str) > 200:
+            v_str = v_str[:197] + "..."
+        lines.append(f"{k}: {v_str}")
+    return "\n".join(lines)
+
+
+def _matches_session_rule(name: str, args: dict, rules: list[str]) -> bool:
+    """Return True if this tool call is covered by a session-level allow rule."""
+    path = args.get("path", "")
+    cmd  = args.get("command", "")
+    for rule in rules:
+        if rule.startswith("path_prefix:"):
+            prefix = rule[len("path_prefix:"):]
+            if path and os.path.normcase(path).startswith(os.path.normcase(prefix)):
+                return True
+        elif rule.startswith("cmd_pattern:"):
+            pattern = rule[len("cmd_pattern:"):]
+            if cmd and fnmatch.fnmatch(cmd.strip(), pattern):
+                return True
+        elif rule.startswith("tool:"):
+            tool = rule[len("tool:"):]
+            if name == tool:
+                return True
+    return False
+
+
+def _build_approval_check(
+    name: str,
+    args: dict,
+    approval_level: str,
+    prefix: str = "",
+    session_rules: list[str] | None = None,
+) -> tuple[bool, str, str, str]:
+    """Return (ask_needed, title, message, style) for a tool call approval check.
+
+    `prefix` is prepended to titles (e.g. "Sub-Agent — ") to distinguish sub-agent prompts.
+    Returns ask_needed=False when no approval is required.
+    """
+    if approval_level == "yolo":
+        return False, "", "", "yellow"
+
+    cmd = args.get("command", "") if name == "bash" else ""
+    ask_needed = False
+    ask_title = f"{prefix}Approval Required"
+    ask_msg = ""
+    ask_style = "yellow"
+
+    if name == "bash" and _is_dangerous(cmd):
+        ask_needed = True
+        ask_title = f"{prefix}Warning — Dangerous Command"
+        ask_msg = f"Dangerous command detected:\n\n{_fmt_tool_args(name, args)}"
+        ask_style = "red"
+    elif name == "bash" and _is_install(cmd):
+        ask_needed = True
+        ask_title = f"{prefix}Install Guard"
+        ask_msg = (
+            f"Package install detected:\n\n{_fmt_tool_args(name, args)}\n\n"
+            "Run it? Or install yourself and press Enter when ready."
+        )
+        ask_style = "yellow"
+    elif name == "bash" and approval_level == "auto" and _is_exec(cmd):
+        ask_needed = True
+        ask_title = f"{prefix}Script Execution"
+        ask_msg = f"Script execution detected:\n\n{_fmt_tool_args(name, args)}"
+        ask_style = "yellow"
+    elif approval_level == "ask-all":
+        ask_needed = True
+        ask_title = f"{prefix}Approval Required"
+        ask_msg = f"Tool: {name}\n\n{_fmt_tool_args(name, args)}"
+    elif approval_level == "ask-writes":
+        WRITE_TOOLS = {"bash", "write_file", "edit"}
+        if name in WRITE_TOOLS or (name == "task_list" and args.get("operation") != "read"):
+            ask_needed = True
+            ask_title = f"{prefix}Write Operation — {name}"
+            ask_msg = f"Write operation — {name}:\n\n{_fmt_tool_args(name, args)}"
+
+    # Session rules can suppress non-dangerous prompts (install/exec/ask-writes/ask-all)
+    if ask_needed and ask_style != "red" and session_rules and _matches_session_rule(name, args, session_rules):
+        return False, "", "", "yellow"
+
+    return ask_needed, ask_title, ask_msg, ask_style
 
 
 def _menu_select(options: list[str]) -> int:
@@ -1486,10 +1690,29 @@ async def tool_edit(path: str, old_string: str, new_string: str) -> str:
         return f"[error: {e}]"
 
 
+def _tts_preprocess(text: str) -> str:
+    """Normalise text for TTS: currency, punctuation strip, period → ellipsis."""
+    import re as _re
+    # Protect existing ellipses from double-expansion
+    text = text.replace("...", "\x00")
+    # Currency: $20.45 → 20.45 Dollars
+    text = _re.sub(r"\$(\d+(?:\.\d+)?)", r"\1 Dollars", text)
+    # Strip anything not in the allowed set (letters, digits, space, .,?!', placeholder)
+    text = _re.sub(r"[^a-zA-Z0-9 .,?!'\x00]", " ", text)
+    # Expand sentence-ending periods to ellipses (not decimal points between digits)
+    text = _re.sub(r"(?<!\d)\.(?!\d)", "...", text)
+    # Restore protected ellipses
+    text = text.replace("\x00", "...")
+    # Collapse runs of spaces
+    text = _re.sub(r" {2,}", " ", text).strip()
+    return text
+
+
 async def tool_speak(text: str) -> str:
+    text = _tts_preprocess(text)
     try:
         async with httpx.AsyncClient() as c:
-            r = await c.post("http://127.0.0.1:1236/play", json={"text": text}, timeout=10)
+            r = await c.post("http://127.0.0.1:1236/play", json={"text": text}, timeout=30)
         return "spoken" if r.is_success else f"[voice error: {r.status_code}]"
     except Exception as e:
         return f"[voice unavailable: {e}]"
@@ -1560,6 +1783,8 @@ async def tool_web_fetch(url: str) -> str:
 SEARXNG_URL = "http://localhost:8888"  # optional — used only if reachable
 
 async def tool_web_search(query: str, max_results: int = 6) -> str:
+    if not query or not query.strip():
+        return "[error: web_search requires a non-empty query — the model may have produced malformed tool call arguments]"
     # Opportunistic SearXNG check (2s timeout — silent fail if not running)
     try:
         async with httpx.AsyncClient(timeout=2) as client:
@@ -1708,18 +1933,49 @@ async def _invoke_skill(skill_name: str, skill_args: str, session: "ChatSession"
         tools      = skill.get("agent_tools") or None
         think      = skill.get("think_level") or None
         max_iter   = int(skill.get("max_iterations", 10))
-        console.print(Panel(
-            f"[dim]Invoking agent skill '[bold]{skill_name}[/bold]'...[/dim]",
-            title="[cyan]Skill[/cyan]",
-            border_style="cyan",
-        ))
-        result = await session._tool_spawn_agent(expanded, skill_args, tools, think, max_iter)
-        session.messages.append({"role": "assistant", "content": result})
-        console.print(Panel(
-            Markdown(result),
-            title=f"[cyan]Skill Result — {skill_name}[/cyan]",
-            border_style="cyan",
-        ))
+        if not session.tui_queue:
+            console.print(Panel(
+                f"[dim]Invoking agent skill '[bold]{skill_name}[/bold]'...[/dim]",
+                title="[cyan]Skill[/cyan]",
+                border_style="cyan",
+            ))
+        _skill_id = f"__skill_{skill_name}"
+        is_error = False
+        if session.tui_queue:
+            await session.tui_queue.put({
+                "type": "tool_start",
+                "id": _skill_id,
+                "name": "spawn_agent",
+                "args": f'{{"task": {__import__("json").dumps(skill_args[:120])}}}',
+            })
+        try:
+            result = await session._tool_spawn_agent(expanded, skill_args, tools, think, max_iter)
+        except Exception as e:
+            result = f"[skill agent error: {e}]"
+            is_error = True
+            if not session.tui_queue:
+                console.print(f"[red]Skill agent failed: {e}[/red]")
+        if session.tui_queue:
+            await session.tui_queue.put({
+                "type": "tool_done",
+                "id": _skill_id,
+                "name": "spawn_agent",
+                "result": result,
+                "is_error": is_error,
+            })
+        # Feed the report back to Eli via a proper send_and_stream call so it lands in
+        # Eli's message history as a valid user→assistant exchange. This is necessary for:
+        #   (a) Eli to actually read and process the research findings
+        #   (b) tokens_used to update (fixes "0% context" display after research)
+        #   (c) message sequence integrity (avoids back-to-back "assistant" messages)
+        _return_prompt = skill.get("return_prompt") or (
+            "The agent has completed the above report. "
+            "Acknowledge receipt in one sentence only — do NOT summarize. "
+            "The full content is in your context."
+        )
+        await session.send_and_stream(
+            f"[Agent Report — '{skill_name}']\n\n{result}\n\n{_return_prompt}"
+        )
     else:
         await session.send_and_stream(expanded)
     return True
@@ -1743,22 +1999,28 @@ class ChatSession:
         self.approval_level: str    = "auto"
         self._session_path: Path | None = None
         self._in_subagent: bool     = False
-        self.compact_mode: bool     = False
+        self.compact_mode: bool         = False
+        self.compact_threshold: float   = CTX_COMPACT_THRESH
+        self.keep_recent: int           = CTX_KEEP_RECENT
+        self.input_compress_limit: int  = INPUT_COMPRESS_CHARS
         self.role: str              = "eli"  # active role name
         self._project_config: dict  = {}
         self._approval_notes: str   = ""  # injected into tool result after dispatch
+        self.session_rules: list[str] = []  # persistent allow-rules for this session
+        self.tui_queue: asyncio.Queue | None = None  # set by TUI to receive typed events
 
     async def __aenter__(self):
         await self._health_check()
         await self._detect_ctx_window()
         await self._refresh_project_config()
-        console.print(
-            Panel(
-                "[bold cyan]Qwen3 Chat[/bold cyan]  —  connected to [green]localhost:1234[/green]\n"
-                "Type [bold]/help[/bold] for commands  |  [bold]Alt+Enter[/bold] newline  |  [bold]Shift+Tab[/bold] cycle mode  |  [bold]Ctrl+O[/bold] compact  |  [bold]Ctrl+D[/bold] exit",
-                border_style="cyan",
+        if not self.tui_queue:
+            console.print(
+                Panel(
+                    "[bold cyan]Qwen3 Chat[/bold cyan]  —  connected to [green]localhost:1234[/green]\n"
+                    "Type [bold]/help[/bold] for commands  |  [bold]Alt+Enter[/bold] newline  |  [bold]Shift+Tab[/bold] cycle mode  |  [bold]Ctrl+O[/bold] compact  |  [bold]Ctrl+D[/bold] exit",
+                    border_style="cyan",
+                )
             )
-        )
         return self
 
     async def __aexit__(self, *_):
@@ -1966,12 +2228,17 @@ class ChatSession:
 
             self.messages = new_messages
             self.tokens_used = 0
-            console.print(Rule(
-                f"[yellow]Context compacted[/yellow] [dim]({orig_count} → {len(self.messages)} messages)[/dim]",
-                style="yellow",
-            ))
+            msg = f"Context compacted ({orig_count} → {len(self.messages)} messages)"
+            if self.tui_queue:
+                await self.tui_queue.put({"type": "system", "text": msg})
+            else:
+                console.print(Rule(f"[yellow]{msg}[/yellow]", style="yellow"))
         except Exception as e:
-            console.print(f"[yellow]Compaction failed — history unchanged[/yellow] [dim]({e})[/dim]")
+            err = f"Compaction failed — history unchanged: {e}"
+            if self.tui_queue:
+                await self.tui_queue.put({"type": "system", "text": err})
+            else:
+                console.print(f"[yellow]{err}[/yellow]")
         finally:
             self._compacting = False
 
@@ -2014,6 +2281,21 @@ class ChatSession:
             self._session_path = _save_session(self.messages, self._n_fixed, self._session_path)
         except Exception:
             pass
+
+    def rollback_partial_turn(self) -> None:
+        """Strip any incomplete assistant/tool messages added during a cancelled turn.
+
+        Leaves the last user message in place so the model knows what was asked.
+        If the last message is also a user message with no response at all, removes it
+        to avoid a duplicate when the user re-submits.
+        """
+        # Remove trailing non-user messages (incomplete assistant/tool state)
+        while len(self.messages) > self._n_fixed and self.messages[-1]["role"] != "user":
+            self.messages.pop()
+        # If the very last message is a user message with nothing after it,
+        # the turn was cancelled before any response — remove it so re-submit works cleanly.
+        if len(self.messages) > self._n_fixed and self.messages[-1]["role"] == "user":
+            self.messages.pop()
 
     async def send_and_stream(self, user_text: str, plan_mode: bool = False):
         user_text = await self._maybe_compact_input(user_text)
@@ -2080,8 +2362,9 @@ class ChatSession:
             ) as response:
                 response.raise_for_status()
 
-                # Render text live via rich.live
-                with Live(console=console, refresh_per_second=8) as live:
+                # Render text live via rich.live (or null in TUI mode)
+                _live_ctx = _NullLive() if self.tui_queue else Live(console=console, refresh_per_second=8)
+                with _live_ctx as live:
                     thinking_started = False
                     text_started = False
 
@@ -2089,10 +2372,15 @@ class ChatSession:
                     think_title = "[dim]Thinking (deep)...[/dim]" if self.think_level == "deep" else "[dim]Thinking...[/dim]"
                     think_border = "blue" if self.think_level == "deep" else "dim"
 
-                    async for event_type, data in stream_events(response):
+                    async for event_type, data in stream_events(
+                        response,
+                        label=f"send_and_stream | model={self.model} | {BASE_URL}",
+                    ):
                         if event_type == "think":
-                            if show_thinking:
-                                thinking_buf += data
+                            thinking_buf += data
+                            if self.tui_queue:
+                                await self.tui_queue.put({"type": "think_token", "text": data})
+                            elif show_thinking:
                                 live.update(
                                     Panel(
                                         Text(thinking_buf, style="dim italic"),
@@ -2102,33 +2390,42 @@ class ChatSession:
                                 )
 
                         elif event_type == "text":
-                            if thinking_buf and show_thinking:
-                                # Commit thinking panel, start fresh for text
-                                live.update(Text(""))
-                                live.stop()
-                                console.print(
-                                    Panel(
-                                        Text(thinking_buf, style="dim italic"),
-                                        title=think_title.replace("...", ""),
-                                        border_style=think_border,
+                            if self.tui_queue:
+                                text_buf += data
+                                assistant_content += data
+                                await self.tui_queue.put({"type": "text_token", "text": data})
+                            else:
+                                if thinking_buf and show_thinking:
+                                    # Commit thinking panel, start fresh for text
+                                    live.update(Text(""))
+                                    live.stop()
+                                    console.print(
+                                        Panel(
+                                            Text(thinking_buf, style="dim italic"),
+                                            title=think_title.replace("...", ""),
+                                            border_style=think_border,
+                                        )
                                     )
-                                )
-                                live.start()
-                                thinking_buf = ""
+                                    live.start()
+                                    thinking_buf = ""
 
-                            text_buf += data
-                            assistant_content += data
-                            live.update(Markdown(text_buf))
+                                text_buf += data
+                                assistant_content += data
+                                live.update(Markdown(text_buf))
 
                         elif event_type == "tool_calls":
                             tool_calls_received = data
-                            live.update(Text(""))
+                            if not self.tui_queue:
+                                live.update(Text(""))
 
                         elif event_type == "usage":
                             usage_data = data
 
                         elif event_type == "stop":
-                            live.update(Markdown(text_buf) if text_buf else Text(""))
+                            if self.tui_queue:
+                                await self.tui_queue.put({"type": "text_done", "text": text_buf})
+                            else:
+                                live.update(Markdown(text_buf) if text_buf else Text(""))
 
             # Update token tracking
             if usage_data:
@@ -2153,7 +2450,11 @@ class ChatSession:
 
             # Auto-announce if model produced no text before first tool call
             if tool_calls_received and not text_buf.strip():
-                console.print(f"[dim]{_tool_announce(tool_calls_received)}[/dim]")
+                if self.tui_queue:
+                    tool_names = ", ".join(tc["function"]["name"] for tc in tool_calls_received)
+                    await self.tui_queue.put({"type": "system", "text": f"→ {tool_names}…"})
+                else:
+                    console.print(f"[dim]{_tool_announce(tool_calls_received)}[/dim]")
 
             # Append assistant message
             if tool_calls_received:
@@ -2179,6 +2480,12 @@ class ChatSession:
                 # Stop the entire batch immediately if any gate rejects a call.
                 _batch: list = []
                 _gate_rejected = False
+
+                async def _emit_tool_done(tc_name: str, tc_id: str, result: str) -> None:
+                    if self.tui_queue:
+                        is_err = result.startswith(("[error", "[unknown", "[blocked", "[cancelled", _GATE_REJECTED_PREFIX))
+                        await self.tui_queue.put({"type": "tool_done", "id": tc_id, "name": tc_name, "result": result, "is_error": is_err})
+
                 for tc in tool_calls_received:
                     if _gate_rejected:
                         break
@@ -2187,18 +2494,23 @@ class ChatSession:
                     else:
                         # Flush pending reads in parallel first
                         if _batch:
-                            for _tc_id, _result in await asyncio.gather(*[_run_one(t) for t in _batch]):
+                            _results = await asyncio.gather(*[_run_one(t) for t in _batch])
+                            for _bt, (_tc_id, _result) in zip(_batch, _results):
                                 self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
+                                await _emit_tool_done(_bt["function"]["name"], _tc_id, _result)
                             _batch = []
                         # Then run the write op sequentially
                         _tc_id, _result = await _run_one(tc)
                         self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
+                        await _emit_tool_done(tc["function"]["name"], _tc_id, _result)
                         if _result.startswith(_GATE_REJECTED_PREFIX):
                             _gate_rejected = True
                 # Flush any remaining reads (only if not rejected)
                 if _batch and not _gate_rejected:
-                    for _tc_id, _result in await asyncio.gather(*[_run_one(t) for t in _batch]):
+                    _results = await asyncio.gather(*[_run_one(t) for t in _batch])
+                    for _bt, (_tc_id, _result) in zip(_batch, _results):
                         self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
+                        await _emit_tool_done(_bt["function"]["name"], _tc_id, _result)
                 # Loop: send tool results back to model
                 continue
             else:
@@ -2206,7 +2518,10 @@ class ChatSession:
                     self.messages.append({"role": "assistant", "content": assistant_content})
                 break
 
-        if self.tokens_used:
+        if self.tui_queue:
+            await self.tui_queue.put({"type": "usage", "tokens": self.tokens_used, "ctx": self.ctx_window})
+            await self.tui_queue.put({"type": "done"})
+        elif self.tokens_used:
             pct   = self.tokens_used / self.ctx_window
             style = "yellow" if pct > 0.6 else "dim"
             label = f"~{self.tokens_used / 1000:.1f}k / {self.ctx_window / 1000:.0f}k tokens"
@@ -2265,13 +2580,38 @@ class ChatSession:
             resolved = self.cwd / resolved
         return str(resolved)
 
-    async def _approval_prompt(self, title: str, message: str, style: str = "yellow") -> tuple[bool, str]:
+    async def _approval_prompt(
+        self,
+        title: str,
+        message: str,
+        style: str = "yellow",
+        tool_name: str = "",
+        tool_args_str: str = "",
+    ) -> tuple[bool, str]:
         """Three-option approval prompt: y / b (yes, but...) / n (no, with reason).
 
         Returns (approved: bool, notes: str).
         Notes are non-empty when user chose 'b' or 'n' and typed something.
         Caller injects notes into the tool result (approved) or rejection message (denied).
+        In TUI mode, posts an approval_request event and awaits a Future resolved by the modal.
         """
+        if self.tui_queue:
+            future: asyncio.Future = asyncio.get_running_loop().create_future()
+            await self.tui_queue.put({
+                "type": "approval_request",
+                "title": title,
+                "message": message,
+                "style": style,
+                "tool_name": tool_name,
+                "tool_args_str": tool_args_str,
+                "future": future,
+            })
+            try:
+                return await future
+            except Exception:
+                return False, ""
+
+        # CLI mode
         console.print(Panel(message, title=f"[{style}]{title}[/{style}]", border_style=style))
         loop = asyncio.get_event_loop()
         try:
@@ -2374,6 +2714,26 @@ class ChatSession:
                 )
             elif name == "speak":
                 return await tool_speak(args.get("text", ""))
+            elif name == "highlight_in_editor":
+                path = args.get("path", "")
+                start_line = int(args.get("start_line", 1))
+                end_line   = int(args.get("end_line", start_line))
+                if self.tui_queue:
+                    await self.tui_queue.put({
+                        "type":       "highlight_in_editor",
+                        "path":       path,
+                        "start_line": start_line,
+                        "end_line":   end_line,
+                        "start_col":  int(args.get("start_col", -1)),
+                        "end_col":    int(args.get("end_col",   -1)),
+                    })
+                return f"[highlighted {path} lines {start_line}–{end_line}]"
+            elif name == "open_in_editor":
+                path = args.get("path", "")
+                line = int(args.get("line", 1))
+                if self.tui_queue:
+                    await self.tui_queue.put({"type": "open_in_editor", "path": path, "line": line})
+                return f"[opened {path} at line {line} in editor]"
             else:
                 return f"[unknown tool: {name}]"
         except Exception as e:
@@ -2418,31 +2778,44 @@ class ChatSession:
             commands = _load_commands()
             if model not in commands:
                 available = "  ·  ".join(commands) or "(none)"
-                console.print(f"[dim yellow]⚠ unknown model '{model}' — using current model. Available: {available}[/dim yellow]")
+                if not self.tui_queue:
+                    console.print(f"[dim yellow]⚠ unknown model '{model}' — using current model. Available: {available}[/dim yellow]")
                 model = None
             # Capture what's running now so we can restore it afterward
             restore_profile = await _find_active_profile()
             if restore_profile == model:
                 # Already on the right model — no switch needed, no restore needed
                 restore_profile = None
-                console.print(f"[dim]  Model already loaded: {model}[/dim]")
+                if not self.tui_queue:
+                    console.print(f"[dim]  Model already loaded: {model}[/dim]")
             else:
-                console.print(Panel(
-                    f"[yellow]Switching server to:[/yellow] {model}\n"
-                    f"[dim]Will restore '{restore_profile or 'original'}' after agent finishes.[/dim]",
-                    title="[yellow]Model Switch[/yellow]",
-                    border_style="yellow",
-                ))
+                if not self.tui_queue:
+                    console.print(Panel(
+                        f"[yellow]Switching server to:[/yellow] {model}\n"
+                        f"[dim]Will restore '{restore_profile or 'original'}' after agent finishes.[/dim]",
+                        title="[yellow]Model Switch[/yellow]",
+                        border_style="yellow",
+                    ))
                 ready = await _switch_server(model)
                 if not ready:
                     return f"[error: server failed to start model '{model}' — agent aborted]"
 
+        import datetime as _dt
+        _today = _dt.date.today().strftime("%Y-%m-%d")
+        _ctx = (
+            f"\n\n[Session Context]\n"
+            f"Today's date: {_today}\n"
+            f"Current working directory: {self.cwd}\n"
+            f"All relative file paths resolve against this directory."
+        )
         messages: list[dict] = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_prompt + _ctx},
             {"role": "user", "content": task},
         ]
 
-        if self.compact_mode:
+        if self.tui_queue:
+            await self.tui_queue.put({"type": "system", "text": f"Agent: {task[:200]}{'…' if len(task) > 200 else ''}"})
+        elif self.compact_mode:
             quote = random.choice(COMPACT_QUOTES)
             console.print(f"[dim cyan]  ◌ {quote}[/dim cyan]")
         else:
@@ -2487,43 +2860,57 @@ class ChatSession:
                     headers={"Accept": "text/event-stream"},
                 ) as response:
                     response.raise_for_status()
-                    _live_ctx = _NullLive() if self.compact_mode else Live(console=console, refresh_per_second=8)
+                    _live_ctx = _NullLive() if (self.tui_queue or self.compact_mode) else Live(console=console, refresh_per_second=8)
                     with _live_ctx as live:
                         show_thinking = think != "off" and not self.compact_mode
 
-                        async for event_type, data in stream_events(response):
+                        async for event_type, data in stream_events(
+                            response,
+                            label=f"spawn_agent[iter] | model={model or self.model} | {BASE_URL}",
+                        ):
                             if event_type == "think":
-                                if show_thinking:
-                                    thinking_buf += data
+                                thinking_buf += data
+                                if self.tui_queue:
+                                    await self.tui_queue.put({"type": "think_token", "text": data})
+                                elif show_thinking:
                                     live.update(Panel(
                                         Text(thinking_buf, style="dim italic"),
                                         title="[dim cyan]Agent Thinking...[/dim cyan]",
                                         border_style="dim cyan",
                                     ))
                             elif event_type == "text":
-                                if thinking_buf and show_thinking:
-                                    live.update(Text(""))
-                                    live.stop()
-                                    console.print(Panel(
-                                        Text(thinking_buf, style="dim italic"),
-                                        title="[dim cyan]Agent Thinking[/dim cyan]",
-                                        border_style="dim cyan",
+                                if self.tui_queue:
+                                    text_buf += data
+                                    assistant_content += data
+                                    final_text = assistant_content
+                                    await self.tui_queue.put({"type": "text_token", "text": data, "source": "agent"})
+                                else:
+                                    if thinking_buf and show_thinking:
+                                        live.update(Text(""))
+                                        live.stop()
+                                        console.print(Panel(
+                                            Text(thinking_buf, style="dim italic"),
+                                            title="[dim cyan]Agent Thinking[/dim cyan]",
+                                            border_style="dim cyan",
+                                        ))
+                                        live.start()
+                                        thinking_buf = ""
+                                    text_buf += data
+                                    assistant_content += data
+                                    final_text = assistant_content
+                                    live.update(Panel(
+                                        Markdown(text_buf),
+                                        title="[cyan]Agent[/cyan]",
+                                        border_style="cyan",
                                     ))
-                                    live.start()
-                                    thinking_buf = ""
-                                text_buf += data
-                                assistant_content += data
-                                final_text = assistant_content  # keep current even if interrupted
-                                live.update(Panel(
-                                    Markdown(text_buf),
-                                    title="[cyan]Agent[/cyan]",
-                                    border_style="cyan",
-                                ))
                             elif event_type == "tool_calls":
                                 tool_calls_received = data
-                                live.update(Text(""))
+                                if not self.tui_queue:
+                                    live.update(Text(""))
                             elif event_type == "stop":
-                                if text_buf:
+                                if self.tui_queue:
+                                    await self.tui_queue.put({"type": "text_done", "text": text_buf, "source": "agent"})
+                                elif text_buf:
                                     live.update(Panel(
                                         Markdown(text_buf),
                                         title="[cyan]Agent[/cyan]",
@@ -2532,7 +2919,8 @@ class ChatSession:
                                 else:
                                     live.update(Text(""))
 
-                final_text = assistant_content
+                if assistant_content:          # keep last meaningful text; don't overwrite with ""
+                    final_text = assistant_content
 
                 # Fallback: model emitted tool calls as text
                 if not tool_calls_received and assistant_content:
@@ -2543,7 +2931,11 @@ class ChatSession:
 
                 # Auto-announce if model produced no text before first tool call
                 if tool_calls_received and not text_buf.strip():
-                    console.print(f"[dim]  {_tool_announce(tool_calls_received)}[/dim]")
+                    if self.tui_queue:
+                        tool_names = ", ".join(tc["function"]["name"] for tc in tool_calls_received)
+                        await self.tui_queue.put({"type": "system", "text": f"  → {tool_names}…"})
+                    else:
+                        console.print(f"[dim]  {_tool_announce(tool_calls_received)}[/dim]")
 
                 if tool_calls_received:
                     messages.append({
@@ -2557,9 +2949,14 @@ class ChatSession:
                         tc_args_str = tc["function"]["arguments"]
                         try:
                             tc_args = json.loads(tc_args_str) if tc_args_str.strip() else {}
-                        except json.JSONDecodeError:
-                            tc_args = {}
-                        if self.compact_mode:
+                        except json.JSONDecodeError as _je:
+                            _err = f"[error: malformed tool arguments — JSON parse failed: {_je}. Raw: {tc_args_str[:200]}]"
+                            if self.tui_queue:
+                                await self.tui_queue.put({"type": "tool_done", "id": tc["id"], "name": tc_name, "result": _err, "is_error": True})
+                            return tc["id"], _err
+                        if self.tui_queue:
+                            await self.tui_queue.put({"type": "tool_start", "id": tc["id"], "name": tc_name, "args": tc_args_str})
+                        elif self.compact_mode:
                             console.print(f"[dim]    ◌ {tc_name}{markup_escape(self._compact_args(tc_name, tc_args))}[/dim]")
                         else:
                             args_display = json.dumps(tc_args, indent=2) if tc_args else "(no args)"
@@ -2572,69 +2969,56 @@ class ChatSession:
                         if tc_name == "bash":
                             cmd = tc_args.get("command", "")
                             if _is_bare_python(cmd):
-                                console.print(Panel(
-                                    f"[red]Bare python/pip call blocked.[/red] Sub-agents must use the project venv.\n"
-                                    f"[dim]{cmd}[/dim]",
-                                    title="[red]Venv Rule Violation[/red]",
-                                    border_style="red",
-                                ))
+                                if not self.tui_queue:
+                                    console.print(Panel(
+                                        f"[red]Bare python/pip call blocked.[/red] Sub-agents must use the project venv.\n"
+                                        f"[dim]{cmd}[/dim]",
+                                        title="[red]Venv Rule Violation[/red]",
+                                        border_style="red",
+                                    ))
                                 tc_result = (
                                     "[blocked: bare python/pip — all Python must run inside the project venv. "
                                     "If no venv exists yet, create one first: python -m venv .venv "
                                     "Then use: .venv\\Scripts\\python.exe  or  .venv\\Scripts\\pip.exe install <pkg>]"
                                 )
-                                console.print(Panel(tc_result, title="[dim cyan]Agent Tool Result[/dim cyan]", border_style="red"))
+                                if not self.tui_queue:
+                                    console.print(Panel(tc_result, title="[dim cyan]Agent Tool Result[/dim cyan]", border_style="red"))
                                 return tc["id"], tc_result
 
                         # Apply same approval rules as top-level _call_tool
-                        if self.approval_level != "yolo" and tc_name == "bash":
-                            cmd = tc_args.get("command", "")
-                            ask_needed = False
-                            ask_title = "Sub-Agent Approval Required"
-                            ask_msg = ""
-                            ask_style = "yellow"
-                            if _is_dangerous(cmd):
-                                ask_needed = True
-                                ask_title = "Sub-Agent — Dangerous Command"
-                                ask_msg = f"[red]Dangerous command from sub-agent![/red]\n[dim]{cmd}[/dim]"
-                                ask_style = "red"
-                            elif _is_install(cmd):
-                                ask_needed = True
-                                ask_title = "Sub-Agent — Install Guard"
-                                ask_msg = (
-                                    f"[yellow]Sub-agent wants to install a package.[/yellow]\n[dim]{cmd}[/dim]\n"
-                                    "Run it? Or install yourself and press Enter when ready."
-                                )
-                                ask_style = "yellow"
-                            elif self.approval_level == "auto" and _is_exec(cmd):
-                                ask_needed = True
-                                ask_title = "Sub-Agent — Script Execution"
-                                ask_msg = f"[yellow]Sub-agent script execution detected.[/yellow]\n[dim]{cmd}[/dim]"
-                                ask_style = "yellow"
-                            elif self.approval_level == "ask-all":
-                                ask_needed = True
-                                ask_msg = "[yellow]Sub-agent bash command — approve?[/yellow]"
-                            elif self.approval_level == "ask-writes":
-                                ask_needed = True
-                                ask_msg = "[yellow]Sub-agent bash command — approve?[/yellow]"
-                            if ask_needed:
-                                _sa_approved, _sa_notes = await self._approval_prompt(ask_title, ask_msg, ask_style)
-                                if not _sa_approved:
-                                    _reason = f" User says: {_sa_notes}." if _sa_notes else ""
-                                    tc_result = f"[cancelled by user]{_reason}"
+                        _sa_ask, _sa_title, _sa_msg, _sa_style = _build_approval_check(
+                            tc_name, tc_args, self.approval_level,
+                            prefix="Sub-Agent — ", session_rules=self.session_rules
+                        )
+                        if _sa_ask:
+                            import json as _json
+                            _sa_args_str = _json.dumps(tc_args, ensure_ascii=False)
+                            _sa_approved, _sa_notes = await self._approval_prompt(
+                                _sa_title, _sa_msg, _sa_style,
+                                tool_name=tc_name, tool_args_str=_sa_args_str,
+                            )
+                            if not _sa_approved:
+                                _reason = f" User says: {_sa_notes}." if _sa_notes else ""
+                                tc_result = f"[cancelled by user]{_reason}"
+                                if not self.tui_queue:
                                     console.print(Panel(
                                         tc_result,
                                         title="[dim cyan]Agent Tool Result[/dim cyan]",
                                         border_style="cyan",
                                     ))
-                                    return tc["id"], tc_result
-                                if _sa_notes:
-                                    self._approval_notes = _sa_notes
+                                return tc["id"], tc_result
+                            if _sa_notes.startswith("session_allow:"):
+                                self.session_rules.append(_sa_notes[len("session_allow:"):])
+                            elif _sa_notes:
+                                self._approval_notes = _sa_notes
                         tc_result = await self._dispatch_tool(tc_name, tc_args)
                         if self._approval_notes:
                             tc_result += f"\n[Note from user: {self._approval_notes}]"
                             self._approval_notes = ""
-                        if self.compact_mode:
+                        if self.tui_queue:
+                            is_err = tc_result.startswith(("[error", "[unknown", "[blocked", "[cancelled"))
+                            await self.tui_queue.put({"type": "tool_done", "id": tc["id"], "name": tc_name, "result": tc_result, "is_error": is_err})
+                        elif self.compact_mode:
                             console.print(f"[dim]      → {markup_escape(self._compact_result(tc_result))}[/dim]")
                         else:
                             border = "cyan" if not tc_result.startswith("[error") and not tc_result.startswith("[unknown") and not tc_result.startswith("[blocked") else "red"
@@ -2645,8 +3029,50 @@ class ChatSession:
                             ))
                         return tc["id"], tc_result
 
+                    _FETCH_SUMMARIZE_THRESHOLD = 2_000  # chars — below this, summarizing isn't worth it
+                    _FETCH_INPUT_CAP = 40_000           # chars fed to the summarizer (hard ceiling)
+
+                    async def _summarize_fetch(raw: str) -> str:
+                        """Distil a long web_fetch result down to task-relevant facts only."""
+                        prompt = (
+                            "Extract ONLY the facts, figures, dates, names, and quotes from the "
+                            "following web page content that are directly relevant to this research task:\n\n"
+                            f"Task: {task[:400]}\n\n"
+                            "Return a dense, factual summary — no fluff, no navigation, no ads. "
+                            "Keep important quotes verbatim. If nothing is relevant, say so in one sentence.\n\n"
+                            f"Content:\n{raw[:_FETCH_INPUT_CAP]}"
+                        )
+                        try:
+                            r = await self.client.post(
+                                f"{BASE_URL}/v1/chat/completions",
+                                json={
+                                    "model": self.model,
+                                    "messages": [
+                                        {"role": "system", "content": "You are a precise research extraction assistant. Be concise and factual."},
+                                        {"role": "user", "content": prompt},
+                                    ],
+                                    "stream": False,
+                                    "temperature": 0.1,
+                                    "chat_template_kwargs": {"enable_thinking": False},
+                                },
+                                timeout=60,
+                            )
+                            r.raise_for_status()
+                            summary = r.json()["choices"][0]["message"]["content"].strip()
+                            if summary:
+                                if not self.tui_queue:
+                                    console.print(f"[dim]  ↳ web fetch distilled: {len(raw):,} → {len(summary):,} chars[/dim]")
+                                return summary
+                        except Exception as e:
+                            if not self.tui_queue:
+                                console.print(f"[dim yellow]  ↳ fetch summarize failed ({e}), using truncation[/dim yellow]")
+                        return raw[:_FETCH_INPUT_CAP] + "\n[...truncated]"
+
                     for tc in tool_calls_received:
                         tc_id, tc_result_val = await _run_agent_tool(tc)
+                        tc_name = tc["function"]["name"]
+                        if tc_name == "web_fetch" and len(tc_result_val) > _FETCH_SUMMARIZE_THRESHOLD:
+                            tc_result_val = await _summarize_fetch(tc_result_val)
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc_id,
@@ -2663,9 +3089,11 @@ class ChatSession:
             # Graceful summarise — always attempt when:
             #   (a) agent produced no text output at all, or
             #   (b) hit max iterations while still in a tool-call loop
+            #   (c) agent concluded naturally but wrote < 200 chars (likely a bare "done" message)
             # This covers both model-switch and same-model agents.
             _last_role = messages[-1]["role"] if messages else "user"
-            _needs_summary = (not final_text) or (_hit_max_iter and _last_role == "tool")
+            _thin_conclusion = bool(final_text) and len(final_text.strip()) < 200
+            _needs_summary = (not final_text) or _thin_conclusion or (_hit_max_iter and _last_role == "tool")
             if _needs_summary and len(messages) > 2:
                 _stop_reason = (
                     "You have reached the maximum number of tool-use iterations."
@@ -2677,35 +3105,47 @@ class ChatSession:
                         "role": "user",
                         "content": (
                             f"{_stop_reason} "
-                            "Please provide a concise summary of: what you did, what you found "
-                            "or created, and any file paths or key results the caller should know about."
+                            "Write a comprehensive research report covering everything you found. "
+                            "Structure it with clear sections: Key Findings, Details & Evidence, "
+                            "Sources, and Conclusions. Include all specific facts, figures, dates, "
+                            "names, and quotes that are relevant. Do not omit important findings — "
+                            "the caller will use this report as their primary record of the research."
                         ),
                     })
-                    console.print("[dim cyan]  Agent reached iteration limit — requesting summary...[/dim cyan]")
+                    if not self.tui_queue:
+                        console.print("[dim cyan]  Agent reached iteration limit — requesting summary...[/dim cyan]")
+                    # Send system + user task + all assistant messages + last tool results.
+                    # We want all the agent's reasoning visible, but tool results are large
+                    # so we keep only the last 20 messages to stay within context.
+                    _summary_msgs = messages[:2] + messages[-20:]
                     async with self.client.stream(
                         "POST",
                         f"{BASE_URL}/v1/chat/completions",
-                        json={"model": self.model, "messages": messages,
+                        json={"model": self.model, "messages": _summary_msgs,
                               "stream": True, "temperature": 0.3},
                         headers={"Accept": "text/event-stream"},
                     ) as resp:
-                        async for ev_type, ev_data in stream_events(resp):
+                        async for ev_type, ev_data in stream_events(
+                            resp, label=f"agent-summary | {BASE_URL}"
+                        ):
                             if ev_type == "text":
                                 final_text += ev_data
+                                if self.tui_queue:
+                                    await self.tui_queue.put({"type": "text_token", "text": ev_data, "source": "agent"})
                 except Exception:
                     pass  # best-effort only
 
             if model and restore_profile:
-                console.print(Panel(
-                    f"[dim]Restoring server: {restore_profile}[/dim]",
-                    title="[yellow]Model Restore[/yellow]",
-                    border_style="yellow",
-                ))
+                if not self.tui_queue:
+                    console.print(Panel(
+                        f"[dim]Restoring server: {restore_profile}[/dim]",
+                        title="[yellow]Model Restore[/yellow]",
+                        border_style="yellow",
+                    ))
                 await _switch_server(restore_profile)
 
-        if self.compact_mode and final_text:
-            first_line = final_text.split("\n")[0][:120]
-            console.print(f"[dim cyan]  ✓ {first_line}[/dim cyan]")
+        if self.compact_mode and not self.tui_queue and final_text:
+            console.print(Panel(Markdown(final_text), title="[cyan]Agent Report[/cyan]", border_style="cyan"))
         return final_text or "[sub-agent returned no text]"
 
     async def _tool_analyze_image(self, images: list[str], prompt: str | None = None) -> str:
@@ -2853,7 +3293,8 @@ class ChatSession:
 
             # Switch model only when needed
             if target_model and target_model != current_model:
-                console.print(f"[dim yellow]  Switching to: {target_model}[/dim yellow]")
+                if not self.tui_queue:
+                    console.print(f"[dim yellow]  Switching to: {target_model}[/dim yellow]")
                 switched = await _switch_server(target_model)
                 if not switched:
                     results.append({
@@ -2863,7 +3304,8 @@ class ChatSession:
                         "result": f"[error: failed to switch to model '{target_model}']",
                         "duration_seconds": 0.0,
                     })
-                    console.print(f"[red]  Agent {agent_num}/{total} skipped — model switch failed[/red]")
+                    if not self.tui_queue:
+                        console.print(f"[red]  Agent {agent_num}/{total} skipped — model switch failed[/red]")
                     continue
                 current_model = target_model
 
@@ -2877,13 +3319,14 @@ class ChatSession:
                 {"role": "user",   "content": task},
             ]
 
-            console.print(Panel(
-                f"[bold]Task:[/bold] {task[:200]}{'...' if len(task) > 200 else ''}\n"
-                f"[dim]Model: {target_model or current_model or 'current'}  ·  "
-                f"Timeout: {timeout_s}s  ·  Max iter: {max_iter}[/dim]",
-                title=f"[cyan]Queue Agent {agent_num}/{total}[/cyan]",
-                border_style="cyan",
-            ))
+            if not self.tui_queue:
+                console.print(Panel(
+                    f"[bold]Task:[/bold] {task[:200]}{'...' if len(task) > 200 else ''}\n"
+                    f"[dim]Model: {target_model or current_model or 'current'}  ·  "
+                    f"Timeout: {timeout_s}s  ·  Max iter: {max_iter}[/dim]",
+                    title=f"[cyan]Queue Agent {agent_num}/{total}[/cyan]",
+                    border_style="cyan",
+                ))
 
             start_t = loop.time()
             agent_status = "completed"
@@ -2907,7 +3350,9 @@ class ChatSession:
                                           "stream": True, "temperature": 0.3},
                                     headers={"Accept": "text/event-stream"},
                                 ) as resp:
-                                    async for ev_type, ev_data in stream_events(resp):
+                                    async for ev_type, ev_data in stream_events(
+                                        resp, label=f"queue_agents-summary | {BASE_URL}"
+                                    ):
                                         if ev_type == "text":
                                             final_text += ev_data
                             except Exception:
@@ -2937,9 +3382,11 @@ class ChatSession:
                         json=payload, headers={"Accept": "text/event-stream"},
                     ) as response:
                         response.raise_for_status()
-                        _live = _NullLive() if self.compact_mode else Live(console=console, refresh_per_second=8)
+                        _live = _NullLive() if (self.tui_queue or self.compact_mode) else Live(console=console, refresh_per_second=8)
                         with _live as live:
-                            async for ev_type, ev_data in stream_events(response):
+                            async for ev_type, ev_data in stream_events(
+                                response, label=f"queue_agents[iter] | model={current_model} | {BASE_URL}"
+                            ):
                                 if ev_type == "text":
                                     text_buf += ev_data
                                     assistant_content += ev_data
@@ -2997,11 +3444,12 @@ class ChatSession:
 
             duration = round(loop.time() - start_t, 1)
             status_icon = {"completed": "✓", "timeout": "⏱", "error": "✗"}.get(agent_status, "?")
-            console.print(Panel(
-                Markdown(final_text[:500] + ("..." if len(final_text) > 500 else "")) if final_text else "[dim](no output)[/dim]",
-                title=f"[cyan]Agent {agent_num}/{total}  {status_icon} {agent_status}  ({duration}s)[/cyan]",
-                border_style="cyan" if agent_status == "completed" else "yellow" if agent_status == "timeout" else "red",
-            ))
+            if not self.tui_queue:
+                console.print(Panel(
+                    Markdown(final_text[:500] + ("..." if len(final_text) > 500 else "")) if final_text else "[dim](no output)[/dim]",
+                    title=f"[cyan]Agent {agent_num}/{total}  {status_icon} {agent_status}  ({duration}s)[/cyan]",
+                    border_style="cyan" if agent_status == "completed" else "yellow" if agent_status == "timeout" else "red",
+                ))
 
             results.append({
                 "index": idx,
@@ -3016,11 +3464,12 @@ class ChatSession:
 
         # Restore original model if we moved away from it
         if current_model != restore_profile and restore_profile:
-            console.print(Panel(
-                f"[dim]Restoring: {restore_profile}[/dim]",
-                title="[yellow]Model Restore[/yellow]",
-                border_style="yellow",
-            ))
+            if not self.tui_queue:
+                console.print(Panel(
+                    f"[dim]Restoring: {restore_profile}[/dim]",
+                    title="[yellow]Model Restore[/yellow]",
+                    border_style="yellow",
+                ))
             await _switch_server(restore_profile)
 
         # Write results to disk
@@ -3053,11 +3502,13 @@ class ChatSession:
     async def _call_tool(self, name: str, arguments_str: str, call_id: str) -> str:
         try:
             args = json.loads(arguments_str) if arguments_str.strip() else {}
-        except json.JSONDecodeError:
-            args = {}
+        except json.JSONDecodeError as _je:
+            return f"[error: malformed tool arguments — JSON parse failed: {_je}. Raw: {arguments_str[:200]}]"
 
         # Display tool call
-        if self.compact_mode:
+        if self.tui_queue:
+            await self.tui_queue.put({"type": "tool_start", "id": call_id, "name": name, "args": arguments_str})
+        elif self.compact_mode:
             console.print(f"[dim]  ↳ {name}{markup_escape(self._compact_args(name, args))}[/dim]")
         else:
             args_display = json.dumps(args, indent=2) if args else "(no args)"
@@ -3137,45 +3588,23 @@ class ChatSession:
                     self._approval_notes = _np_notes
 
         # Approval guard
-        if self.approval_level != "yolo":
-            cmd = args.get("command", "") if name == "bash" else ""
-            ask_needed = False
-            ask_title = "Approval Required"
-            ask_msg = ""
-            ask_style = "yellow"
-            if name == "bash" and _is_dangerous(cmd):
-                ask_needed = True
-                ask_title = "Warning — Dangerous Command"
-                ask_msg = f"[red]Dangerous command detected![/red]\n[dim]{cmd}[/dim]"
-                ask_style = "red"
-            elif name == "bash" and _is_install(cmd):
-                ask_needed = True
-                ask_title = "Install Guard"
-                ask_msg = (
-                    f"[yellow]Package install detected.[/yellow]\n[dim]{cmd}[/dim]\n"
-                    "Run it? Or install yourself and press Enter when ready."
-                )
-                ask_style = "yellow"
-            elif name == "bash" and self.approval_level == "auto" and _is_exec(cmd):
-                ask_needed = True
-                ask_title = "Script Execution"
-                ask_msg = f"[yellow]Script execution detected.[/yellow]\n[dim]{cmd}[/dim]"
-                ask_style = "yellow"
-            elif self.approval_level == "ask-all":
-                ask_needed = True
-                ask_msg = f"[yellow]Approve tool call?[/yellow]"
-            elif self.approval_level == "ask-writes":
-                WRITE_TOOLS = {"bash", "write_file", "edit"}
-                if name in WRITE_TOOLS or (name == "task_list" and args.get("operation") != "read"):
-                    ask_needed = True
-                    ask_msg = "[yellow]Write operation — approve?[/yellow]"
-            if ask_needed:
-                _approved, _notes = await self._approval_prompt(ask_title, ask_msg, ask_style)
-                if not _approved:
-                    _reason = f" User says: {_notes}." if _notes else ""
-                    return f"[cancelled by user]{_reason}"
-                if _notes:
-                    self._approval_notes = _notes
+        _ask, _ask_title, _ask_msg, _ask_style = _build_approval_check(
+            name, args, self.approval_level, session_rules=self.session_rules
+        )
+        if _ask:
+            import json as _json
+            _args_str = _json.dumps(args, ensure_ascii=False)
+            _approved, _notes = await self._approval_prompt(
+                _ask_title, _ask_msg, _ask_style,
+                tool_name=name, tool_args_str=_args_str,
+            )
+            if not _approved:
+                _reason = f" User says: {_notes}." if _notes else ""
+                return f"[cancelled by user]{_reason}"
+            if _notes.startswith("session_allow:"):
+                self.session_rules.append(_notes[len("session_allow:"):])
+            elif _notes:
+                self._approval_notes = _notes
 
         # Dispatch
         result = await self._dispatch_tool(name, args)
@@ -3191,7 +3620,9 @@ class ChatSession:
             if hook_out:
                 result += f"\n\n{hook_out}"
 
-        if self.compact_mode:
+        if self.tui_queue:
+            pass  # tool_done emitted by send_and_stream after _run_one returns
+        elif self.compact_mode:
             console.print(f"[dim]    → {markup_escape(self._compact_result(result))}[/dim]")
         elif name == "edit" and not result.startswith("[error"):
             from rich.syntax import Syntax
@@ -3354,7 +3785,9 @@ async def _voice_model_call(
             headers={"Accept": "text/event-stream"},
         ) as response:
             response.raise_for_status()
-            async for event_type, data in stream_events(response):
+            async for event_type, data in stream_events(
+                response, label=f"simple-stream | {BASE_URL}"
+            ):
                 if event_type == "text":
                     reply_parts.append(data)
                     console.print(data, end="", markup=False)
@@ -3499,11 +3932,36 @@ async def _voice_speak(text: str) -> None:
 
 
 async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_tools: bool = False) -> None:
-    """Blocking voice conversation loop. Exit: q+Enter or Ctrl+C."""
+    """Blocking voice conversation loop. Exit: Escape (ptt/auto) or q+Enter (CLI).
+    TUI-aware: when session.tui_queue is set, emits events instead of console.print.
+    """
+    _tq = session.tui_queue  # None in CLI, asyncio.Queue in TUI
+
+    async def _sys(text: str) -> None:
+        """Emit a status line — TUI system event or console.print."""
+        if _tq:
+            await _tq.put({"type": "system", "text": text})
+        else:
+            console.print(f"[dim]{text}[/dim]")
+
+    async def _voice_msg(role: str, text: str) -> None:
+        """Emit a transcript/reply line as a chat bubble or console line."""
+        if _tq:
+            # Reuse text_done so the drain loop renders it as a message widget
+            src = "eli" if role == "assistant" else "eli"
+            prefix = "You said" if role == "user" else "Eli"
+            await _tq.put({"type": "system", "text": f"[{prefix}] {text}"})
+        else:
+            label = "[bold green]You:[/bold green]" if role == "user" else "[bold cyan]Eli:[/bold cyan]"
+            console.print(f"{label} {text}")
+
     try:
         import sounddevice  # noqa: F401 — check it's available
     except ImportError:
-        console.print("[red]sounddevice not installed. Run: .venv\\Scripts\\pip install sounddevice[/red]")
+        if _tq:
+            await _tq.put({"type": "system", "text": "sounddevice not installed — voice unavailable"})
+        else:
+            console.print("[red]sounddevice not installed. Run: .venv\\Scripts\\pip install sounddevice[/red]")
         return
 
     # Load persona from agents/voice.md; fall back to inline constant
@@ -3544,17 +4002,11 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_
         listener = _kb.Listener(on_press=on_press, on_release=on_release)
         listener.start()
 
-        tools_note = "  [yellow]tools: on[/yellow]" if use_tools else "  [dim]tools: off[/dim]"
-        console.print(Panel(
-            f"Voice mode [bold]PTT[/bold] — hold [bold cyan]{PTT_KEY}[/bold cyan] to speak, release to send.\n"
-            f"[dim]Press Escape to exit.[/dim]{tools_note}",
-            border_style="magenta",
-        ))
+        tools_note = "tools: on" if use_tools else "tools: off"
+        await _sys(f"Voice PTT — hold {PTT_KEY} to speak, release to send. ESC to exit. {tools_note}")
 
         try:
             while not quit_event.is_set():
-                console.print("[dim]waiting for PTT...[/dim]", end="\r")
-
                 while not ptt_start.is_set() and not quit_event.is_set():
                     await asyncio.sleep(0.05)
 
@@ -3567,10 +4019,10 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_
 
                 transcript = await _voice_transcribe(audio)
                 if not transcript:
-                    console.print("[dim]  (nothing heard)[/dim]")
+                    await _sys("(nothing heard)")
                     continue
 
-                console.print(f"[bold green]You:[/bold green] {transcript}")
+                await _voice_msg("user", transcript)
                 history.append({"role": "user", "content": transcript})
 
                 reply = await _voice_model_call(history, session.client, session=session, use_tools=use_tools)
@@ -3578,6 +4030,7 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_
                     continue
                 history.append({"role": "assistant", "content": reply})
 
+                await _voice_msg("assistant", reply)
                 await _voice_speak(reply)
                 await asyncio.sleep(VOICE_POST_TTS_DELAY)
 
@@ -3590,7 +4043,10 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_
         try:
             import webrtcvad  # noqa: F401
         except ImportError:
-            console.print("[red]webrtcvad not installed. Run: .venv\\Scripts\\pip install webrtcvad[/red]")
+            if _tq:
+                await _tq.put({"type": "system", "text": "webrtcvad not installed — auto voice unavailable"})
+            else:
+                console.print("[red]webrtcvad not installed. Run: .venv\\Scripts\\pip install webrtcvad[/red]")
             return
 
         def on_press_auto(key):
@@ -3600,26 +4056,21 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_
         listener = _kb.Listener(on_press=on_press_auto)
         listener.start()
 
-        tools_note = "  [yellow]tools: on[/yellow]" if use_tools else "  [dim]tools: off[/dim]"
-        console.print(Panel(
-            "Voice mode [bold]AUTO[/bold] — speak naturally, pause to send.\n"
-            f"[dim]Press Escape to exit.[/dim]{tools_note}",
-            border_style="magenta",
-        ))
+        tools_note = "tools: on" if use_tools else "tools: off"
+        await _sys(f"Voice AUTO — speak naturally, pause to send. ESC to exit. {tools_note}")
 
         try:
             while not quit_event.is_set():
-                console.print("[dim]listening...[/dim]", end="\r")
                 audio = await _voice_record_auto(quit_event)
                 if not audio or quit_event.is_set():
                     break
 
                 transcript = await _voice_transcribe(audio)
                 if not transcript:
-                    console.print("[dim]  (nothing heard)[/dim]")
+                    await _sys("(nothing heard)")
                     continue
 
-                console.print(f"[bold green]You:[/bold green] {transcript}")
+                await _voice_msg("user", transcript)
                 history.append({"role": "user", "content": transcript})
 
                 reply = await _voice_model_call(history, session.client, session=session, use_tools=use_tools)
@@ -3627,6 +4078,7 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_
                     continue
                 history.append({"role": "assistant", "content": reply})
 
+                await _voice_msg("assistant", reply)
                 await _voice_speak(reply)
                 await asyncio.sleep(VOICE_POST_TTS_DELAY)
 
@@ -3635,7 +4087,7 @@ async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_
         finally:
             listener.stop()
 
-    console.print(Rule("[dim]Voice mode ended[/dim]", style="dim"))
+    await _sys("Voice mode ended")
 
 
 # ── Slash command handler ─────────────────────────────────────────────────────
@@ -3653,6 +4105,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                     "[bold]/think \\[off|on|deep\\][/bold]   Set thinking level (or cycle)",
                     "[bold]/save \\[path\\][/bold]           Save conversation to JSON",
                     "[bold]/compact[/bold]               Summarise older messages to free context",
+                    "[bold]/debug \\[path|off\\][/bold]     Capture raw SSE stream to file (default: debug_stream_TIMESTAMP.log)",
                     "[bold]/status[/bold]                Show token usage and context window info",
                     "[bold]/sessions[/bold]              List saved sessions",
                     "[bold]/resume \\[name\\][/bold]         Load a saved session (replaces current)",
@@ -3712,6 +4165,20 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                   "deep": "[yellow]deep — thorough reasoning, temp 0.3[/yellow]"}
         console.print(f"Think level: {labels[session.think_level]}")
         _save_state(think_level=session.think_level)
+        return True
+
+    elif name == "/debug":
+        import chat as _chat_mod
+        if len(parts) > 1 and parts[1].lower() in ("off", "0", "false"):
+            _chat_mod._debug_close()
+            console.print("[dim]Debug stream capture: off[/dim]")
+        elif _chat_mod._debug_file:
+            console.print(f"[dim]Debug stream capture already active → {_chat_mod._debug_path}[/dim]")
+            console.print("[dim]Use /debug off to stop.[/dim]")
+        else:
+            path_arg = parts[1] if len(parts) > 1 else "1"
+            resolved = _chat_mod._debug_open(path_arg)
+            console.print(f"[yellow]Debug stream capture: on → {resolved}[/yellow]")
         return True
 
     elif name == "/compact":

@@ -19,7 +19,7 @@ For review-only tasks (spawned for proposal review): produce a written assessmen
 
 ## How to work
 
-1. **Read before writing.** Use `read_file`, `glob`, and `grep` to understand the existing codebase, conventions, and dependencies before touching anything.
+1. **Read before writing.** Use `read_file`, `glob`, and `grep` to understand the existing codebase, conventions, and dependencies before touching anything. Always exclude `.venv/`, `node_modules/`, `__pycache__/`, and build output directories from all searches — they contain third-party code, not project code.
 2. **Plan first.** For non-trivial tasks, outline your approach in a few sentences before writing code.
 3. **Minimum change.** Only touch what is necessary. Don't refactor, clean up, or add features beyond what was asked.
 4. **Test your assumptions.** Use `bash` to run the code, check output, verify file contents — don't assume it works.

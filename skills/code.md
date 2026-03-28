@@ -4,7 +4,7 @@ description: Write production-quality, fully tested code. Reads the existing cod
 spawn_agent: true
 think_level: deep
 max_iterations: 35
-triggers: [implement, write the code, build this, add feature, fix bug, create function, write a]
+triggers: [implement, write the code, build this, add feature, fix bug, create function, write a function, write a class, write a script, write a module]
 ---
 
 # Production Code Writing Protocol
