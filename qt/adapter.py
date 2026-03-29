@@ -322,6 +322,7 @@ class QtChatAdapter(QThread):
     done            = Signal()
     stream_started  = Signal()                     # fires at start of each turn
     clear_chat      = Signal()
+    cwd_changed     = Signal(str)          # new CWD path after /resume or /cd
 
     # Voice signals (emitted by _VoiceThread directly)
     voice_activity      = Signal(str)
@@ -550,6 +551,8 @@ class QtChatAdapter(QThread):
                 )
             elif etype == "clear_chat":
                 self.clear_chat.emit()
+            elif etype == "cwd_changed":
+                self.cwd_changed.emit(event.get("cwd", ""))
             elif etype == "system":
                 self.system_msg.emit(event.get("text", ""))
             elif etype == "error":

@@ -181,6 +181,16 @@ async def list_voices():
     return {"voices": _kokoro.get_voices(), "current": current_voice}
 
 
+@app.post("/shutdown")
+async def shutdown():
+    """Stop audio playback and exit cleanly."""
+    import os, signal, asyncio
+    sd.stop()
+    # Trigger uvicorn's graceful shutdown from within the event loop
+    asyncio.get_event_loop().call_later(0.1, lambda: os.kill(os.getpid(), signal.SIGINT))
+    return {"ok": True}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=1236)

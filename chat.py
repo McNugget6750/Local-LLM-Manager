@@ -303,7 +303,7 @@ def _format_project_config(config: dict) -> str:
 def _session_token_estimate(messages: list[dict]) -> int:
     return sum(len(m.get("content") or "") for m in messages) // CHARS_PER_TOKEN
 
-def _save_session(messages: list[dict], n_fixed: int, session_path: Path | None = None) -> Path:
+def _save_session(messages: list[dict], n_fixed: int, session_path: Path | None = None, cwd: Path | None = None) -> Path:
     SESSIONS_DIR.mkdir(exist_ok=True)
     if session_path is None:
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -312,6 +312,7 @@ def _save_session(messages: list[dict], n_fixed: int, session_path: Path | None 
     data = {
         "saved_at": datetime.now().isoformat(),
         "token_estimate": _session_token_estimate(conversation),
+        "cwd": str(cwd) if cwd else None,
         "messages": conversation,
     }
     session_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -324,16 +325,16 @@ def _save_session(messages: list[dict], n_fixed: int, session_path: Path | None 
     _save_state(last_session=session_path.stem)
     return session_path
 
-def _load_session(name: str | None = None) -> tuple[list[dict], Path] | tuple[None, None]:
+def _load_session(name: str | None = None) -> tuple[list[dict], Path, str | None] | tuple[None, None, None]:
     if not SESSIONS_DIR.exists():
-        return None, None
+        return None, None, None
     all_sessions = sorted(p for p in SESSIONS_DIR.glob("*.json") if p.name != "state.json")
     if not all_sessions:
-        return None, None
+        return None, None, None
     if name:
         candidates = [s for s in all_sessions if name in s.stem]
         if not candidates:
-            return None, None
+            return None, None, None
         target = candidates[-1]
     else:
         # Prefer last-used session from state; fall back to newest file
@@ -346,9 +347,9 @@ def _load_session(name: str | None = None) -> tuple[list[dict], Path] | tuple[No
             target = all_sessions[-1]
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
-        return data.get("messages", []), target
+        return data.get("messages", []), target, data.get("cwd")
     except Exception:
-        return None, None
+        return None, None, None
 
 def _load_state() -> dict:
     """Load persisted session settings (think level, role, etc.)."""
@@ -2270,7 +2271,7 @@ class ChatSession:
 
     def _autosave(self) -> None:
         try:
-            self._session_path = _save_session(self.messages, self._n_fixed, self._session_path)
+            self._session_path = _save_session(self.messages, self._n_fixed, self._session_path, cwd=self.cwd)
         except Exception:
             pass
 
@@ -2439,7 +2440,7 @@ class ChatSession:
                 ) // CHARS_PER_TOKEN
 
             # Auto-compact if approaching context limit
-            if not self._compacting and self.tokens_used >= int(self.ctx_window * CTX_COMPACT_THRESH):
+            if not self._compacting and self.tokens_used >= int(self.ctx_window * self.compact_threshold):
                 await self._compact_history()
 
             # Fallback: model emitted tool calls as text (e.g. 30B with custom template)
@@ -4296,7 +4297,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
 
     elif name == "/resume":
         resume_name = parts[1] if len(parts) > 1 else None
-        saved_msgs, sess_path = _load_session(resume_name)
+        saved_msgs, sess_path, saved_cwd = _load_session(resume_name)
         if not saved_msgs:
             hint = resume_name or "latest"
             console.print(f"[yellow]No session found matching '{hint}'[/yellow]")
@@ -4306,6 +4307,11 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         session._n_fixed = len(_initial)
         session._session_path = sess_path
         session.tokens_used = session.tokens_prompt = session.tokens_completion = 0
+        if saved_cwd and Path(saved_cwd).is_dir():
+            session.cwd = Path(saved_cwd)
+            await session._refresh_project_config()
+            if session.tui_queue:
+                await session.tui_queue.put({"type": "cwd_changed", "cwd": str(session.cwd)})
         console.print(Rule(f"[cyan]Session loaded: {sess_path.name}[/cyan]", style="cyan"))
         return True
 
@@ -4340,6 +4346,8 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         session.cwd = new_path
         console.print(f"[green]Working directory: {session.cwd}[/green]")
         await session._refresh_project_config()
+        if session.tui_queue:
+            await session.tui_queue.put({"type": "cwd_changed", "cwd": str(session.cwd)})
         return True
 
     elif name == "/pwd":
@@ -4716,10 +4724,12 @@ async def main():
             chat.model         = state.get("model",         MODEL)
             chat.role          = state.get("role",          "eli")
             last_name          = state.get("last_session")  # stem, e.g. "2025-01-01_12-00-00"
-            saved_msgs, sess_path = _load_session(last_name)
+            saved_msgs, sess_path, saved_cwd = _load_session(last_name)
             if saved_msgs:
                 chat.messages.extend(saved_msgs)
                 chat._session_path = sess_path
+                if saved_cwd and Path(saved_cwd).is_dir():
+                    chat.cwd = Path(saved_cwd)
                 role_note = f"  role: {chat.role}" if chat.role != "eli" else ""
                 think_note = f"  think: {chat.think_level}"
                 console.print(Rule(
@@ -4731,10 +4741,12 @@ async def main():
 
         # ── --resume: load named (or latest) session only ─────────────────────
         elif do_resume:
-            saved_msgs, sess_path = _load_session(resume_name)
+            saved_msgs, sess_path, saved_cwd = _load_session(resume_name)
             if saved_msgs:
                 chat.messages.extend(saved_msgs)
                 chat._session_path = sess_path
+                if saved_cwd and Path(saved_cwd).is_dir():
+                    chat.cwd = Path(saved_cwd)
                 console.print(Rule(f"[cyan]Session resumed: {sess_path.name}[/cyan]", style="cyan"))
             else:
                 hint = resume_name or "latest"

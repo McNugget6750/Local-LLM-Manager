@@ -706,11 +706,23 @@ class ServerManager(tk.Tk):
 
     def _stop_voice_server(self) -> None:
         if self._voice_proc and self._voice_proc.poll() is None:
-            self._voice_proc.terminate()
+            # Ask the server to stop audio and exit cleanly before hard-killing
             try:
-                self._voice_proc.wait(timeout=5)
+                import urllib.request
+                urllib.request.urlopen(
+                    urllib.request.Request("http://127.0.0.1:1236/shutdown", data=b"", method="POST"),
+                    timeout=2,
+                )
+            except Exception:
+                pass
+            try:
+                self._voice_proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                self._voice_proc.kill()
+                self._voice_proc.terminate()
+                try:
+                    self._voice_proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self._voice_proc.kill()
         self._voice_proc = None
         self._on_voice_server_stopped()
 
@@ -1059,9 +1071,10 @@ class ServerManager(tk.Tk):
     # ── Open Chat ────────────────────────────────────────────────────────────
     def _open_chat(self):
         here = os.path.dirname(os.path.abspath(__file__))
-        chat_bat = os.path.join(here, "chat.bat")
+        python = os.path.join(here, ".venv", "Scripts", "python.exe")
+        main   = os.path.join(here, "qt", "main.py")
         subprocess.Popen(
-            ["cmd", "/c", "start", "cmd", "/k", chat_bat, "--continue"],
+            [python, main, "--continue"],
             cwd=here,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )

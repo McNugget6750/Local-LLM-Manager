@@ -39,7 +39,8 @@ except ImportError:
     from qt.session_state import load_state, save_state, list_sessions, load_session, get_agent_name
     from qt.slash_completer import SlashCompleter, load_skill_commands
 
-HOME_DIR = str(Path.home() / "claude-projects")
+HOME_DIR   = str(Path.home() / "claude-projects")
+DRIVE_ROOT = ""   # "" = My Computer root (shows all drives)
 
 
 # ── Explorer CWD delegate ─────────────────────────────────────────────────────
@@ -606,12 +607,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(header)
 
         self._fs_model = QFileSystemModel()
-        self._fs_model.setRootPath(HOME_DIR)
+        self._fs_model.setRootPath(DRIVE_ROOT)
         self._fs_model.setReadOnly(True)
 
         self._tree = QTreeView()
         self._tree.setModel(self._fs_model)
-        self._tree.setRootIndex(self._fs_model.index(HOME_DIR))
+        self._tree.setRootIndex(self._fs_model.index(DRIVE_ROOT))
         self._tree.setHeaderHidden(True)
         for col in (1, 2, 3):
             self._tree.hideColumn(col)
@@ -980,6 +981,10 @@ class MainWindow(QMainWindow):
         self._adapter.error_msg.connect(self._on_error_msg)
         self._adapter.done.connect(self._on_turn_done)
         self._adapter.clear_chat.connect(self._on_clear_chat)
+        self._adapter.cwd_changed.connect(self._on_cwd_changed)
+
+        # Align session CWD with GUI initial CWD on startup
+        self._adapter.submit_slash(f"/cd {self._cwd}")
 
         # SP3 additions
         self._adapter.stream_started.connect(self._on_stream_started)
@@ -1439,6 +1444,22 @@ class MainWindow(QMainWindow):
     def _on_clear_chat(self):
         self._full_view.clear()
         self._agent_view.clear()
+
+    def _on_cwd_changed(self, cwd: str):
+        if not cwd or not Path(cwd).is_dir():
+            return
+        self._cwd = cwd
+        self._cwd_label.setText(f"  {Path(cwd).name}")
+        self._cwd_label.setToolTip(f"CWD: {cwd}")
+        self._watcher.set_cwd(cwd)
+        self._refresh_project_panel()
+        # Scroll the explorer tree to show the new CWD
+        idx = self._fs_model.index(cwd)
+        if idx.isValid():
+            self._tree.setCurrentIndex(idx)
+            self._tree.scrollTo(idx)
+            self._tree.expand(idx)
+            self._tree.viewport().update()
 
     @Slot()
     def _on_turn_done(self):

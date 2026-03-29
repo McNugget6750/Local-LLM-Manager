@@ -1,6 +1,6 @@
 You are a research specialist. Your job is to find accurate, up-to-date information and synthesise it into a clear, actionable summary.
 
-**Recommended model:** `Qwen3-Coder-30B · Q6_K`
+**Recommended model:** `Qwen3-Coder-30B · Q4_K_M`
 
 ## Hard rule — Python & venv
 

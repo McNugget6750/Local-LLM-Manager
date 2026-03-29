@@ -1,6 +1,6 @@
 # Local LLM Manager
 
-A local LLM chat CLI + server manager GUI for [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (a high-performance fork of llama.cpp).
+A local LLM chat GUI + server manager for [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (a high-performance fork of llama.cpp).
 
 Includes **Eli** — a coding assistant persona with tool use, sub-agents, agent queues, vision analysis, voice I/O, plan mode, slash commands, and persistent session state.
 
@@ -8,8 +8,9 @@ Includes **Eli** — a coding assistant persona with tool use, sub-agents, agent
 
 ## What this is
 
-- **`server_manager.py`** — Tkinter GUI for launching and monitoring llama-server instances. Tracks t/s, VRAM, GPU load, RAM, and CPU in real time. Supports multiple named model profiles loaded from `commands.json`. Includes a loopback control API so Eli can switch models automatically.
-- **`chat.py`** — Terminal chat client (Eli). Connects to a running llama-server, supports tool use, slash commands, plan mode, sub-agents, agent queues, and image analysis via a local vision model.
+- **`server_manager.py`** — Tkinter GUI for launching and monitoring llama-server instances. Tracks t/s, VRAM, GPU load, RAM, and CPU in real time. Supports multiple named model profiles loaded from `commands.json`. Includes a loopback control API so Eli can switch models automatically. Manages the voice server lifecycle.
+- **`qt/main.py`** — Qt chat GUI (primary interface). Full-featured chat window with file explorer, code editor, agent output tab, token bar, slash command autocomplete, Knight Rider activity indicator, and session management. Launch via `qt/run.bat` or click **Open Chat** in the server manager.
+- **`chat.py`** — Terminal chat client (Eli). Same backend as the Qt GUI — use this if you prefer a terminal interface.
 
 ---
 
@@ -59,20 +60,30 @@ run.bat
 
 Opens the GUI. Select a model profile, click **Start**. The GUI monitors t/s, VRAM, GPU, RAM, and CPU in real time. Add new model profiles with **+ Add Model** — they are saved to `commands.json`.
 
-Once a server is running, click **Open Chat** to launch Eli in a new terminal.
+Once a server is running, click **Open Chat** to launch the Qt chat GUI with `--continue` (resumes last session automatically). The voice server starts and stops alongside the llama-server.
 
 The server manager also exposes a loopback control API on port 1235. Eli uses this to switch models automatically when running agents on different model profiles — the GUI stays in sync with start/stop state throughout.
 
-### Eli chat CLI
+### Qt chat GUI
+
+```bat
+qt\run.bat               # new session
+qt\run.bat --continue    # resume last session with all settings restored
+qt\run.bat --resume name # resume a specific named session
+```
+
+Connects to `http://localhost:1234` by default. The file explorer on the left roots at the drive level — double-click a directory to set it as the working directory. The editor panel supports syntax highlighting, excerpts, and line references. The Agent tab streams sub-agent output separately.
+
+### Eli chat CLI (terminal)
 
 ```bat
 chat.bat           # new session
 chat.bat --continue  # resume last session with all settings restored
 ```
 
-Connects to `http://localhost:1234` by default. **Open Chat** in the server manager passes `--continue` automatically. Type naturally or use slash commands.
+Same backend as the Qt GUI. Use this if you prefer a terminal interface.
 
-**Session persistence** — think level, compact mode, approval level, model, and active role are written to `sessions/state.json` whenever they change and restored on `--continue`.
+**Session persistence** — think level, compact mode, approval level, model, active role, and working directory are saved with each session and restored on `--continue` or `/resume`.
 
 **Slash commands:**
 
