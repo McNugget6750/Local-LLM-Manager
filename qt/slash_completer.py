@@ -4,6 +4,9 @@ slash_completer.py — popup QListWidget for slash command autocomplete.
 Appears above the chat input when the user types '/'. Filters as
 characters are added. Emits command_chosen(str) on selection.
 """
+from __future__ import annotations
+import os
+from pathlib import Path
 from PySide6.QtWidgets import QListWidget, QListWidgetItem
 from PySide6.QtCore import Qt, Signal
 
@@ -29,10 +32,35 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
 ]
 
 
+def load_skill_commands(skills_dir: str) -> list[tuple[str, str]]:
+    """Read skills/*.md and return [("/skillname", description), ...]."""
+    result = []
+    skills_path = Path(skills_dir)
+    if not skills_path.is_dir():
+        return result
+    for md in sorted(skills_path.glob("*.md")):
+        name = f"/{md.stem}"
+        desc = ""
+        try:
+            for line in md.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("#"):
+                    desc = line.lstrip("#").strip()
+                    break
+                if line and not line.startswith("---"):
+                    desc = line[:80]
+                    break
+        except Exception:
+            pass
+        result.append((name, desc or md.stem))
+    return result
+
+
 class SlashCompleter(QListWidget):
     """Popup that autocompletes slash commands above the chat input."""
 
     command_chosen = Signal(str)   # emits the full command string, e.g. "/clear"
+    session_chosen = Signal(str)   # emits session stem when in session-picker mode
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -41,22 +69,46 @@ class SlashCompleter(QListWidget):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setMaximumHeight(220)
         self.itemClicked.connect(self._on_item_clicked)
-        self._populate(SLASH_COMMANDS)
+        self._all_commands: list[tuple[str, str]] = list(SLASH_COMMANDS)
+        self._session_mode: bool = False
+        self._populate(self._all_commands)
 
     # ── Public API ───────────────────────────────────────────────────────────
 
+    def add_commands(self, entries: list[tuple[str, str]]) -> None:
+        """Append additional commands (e.g. skills) to the completer list."""
+        self._all_commands.extend(entries)
+
     def update_filter(self, prefix: str) -> bool:
         """Repopulate list with commands matching prefix. Returns True if any match."""
+        self._session_mode = False
         prefix_lower = prefix.lower()
-        matches = [(cmd, desc) for cmd, desc in SLASH_COMMANDS
+        matches = [(cmd, desc) for cmd, desc in self._all_commands
                    if cmd.startswith(prefix_lower)]
         self._populate(matches)
         if self.count() > 0:
             self.setCurrentRow(0)
         return self.count() > 0
 
+    def set_sessions(self, sessions: list[dict], filter_text: str = "") -> bool:
+        """Switch to session-picker mode and populate with session names."""
+        self._session_mode = True
+        f = filter_text.lower()
+        matches = [s for s in sessions if not f or f in s["stem"].lower()]
+        self.clear()
+        for s in matches:
+            saved = s.get("saved_at", "")[:16]
+            n = s.get("n_messages", 0)
+            label = f"{s['stem']}  —  {saved}  ({n} msgs)"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, s["stem"])
+            self.addItem(item)
+        if self.count() > 0:
+            self.setCurrentRow(0)
+        return self.count() > 0
+
     def select_current(self) -> None:
-        """Emit command_chosen for the currently highlighted row."""
+        """Emit the appropriate signal for the currently highlighted row."""
         item = self.currentItem()
         if item:
             self._emit(item)
@@ -79,7 +131,10 @@ class SlashCompleter(QListWidget):
         self._emit(item)
 
     def _emit(self, item: QListWidgetItem) -> None:
-        cmd = item.data(Qt.ItemDataRole.UserRole)
-        if cmd:
-            self.command_chosen.emit(cmd)
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if data:
+            if self._session_mode:
+                self.session_chosen.emit(data)
+            else:
+                self.command_chosen.emit(data)
             self.hide()

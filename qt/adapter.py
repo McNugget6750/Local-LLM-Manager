@@ -17,7 +17,7 @@ import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
 from PySide6.QtCore import QThread, Signal
-from chat import ChatSession
+from chat import ChatSession, BASE_URL
 from session_state import load_state
 
 
@@ -321,6 +321,7 @@ class QtChatAdapter(QThread):
     error_msg       = Signal(str)
     done            = Signal()
     stream_started  = Signal()                     # fires at start of each turn
+    clear_chat      = Signal()
 
     # Voice signals (emitted by _VoiceThread directly)
     voice_activity      = Signal(str)
@@ -378,6 +379,8 @@ class QtChatAdapter(QThread):
                 session.compact_threshold     = float(_state.get("compact_threshold", 80)) / 100.0
                 session.keep_recent           = int(_state.get("keep_recent", 6))
                 session.input_compress_limit  = int(_state.get("input_compress_limit", 8000))
+                if session._startup_files:
+                    self.system_msg.emit("Context loaded:\n" + "\n".join(session._startup_files))
                 while True:
                     item = await self._work_queue.get()
                     if item is None:
@@ -401,6 +404,17 @@ class QtChatAdapter(QThread):
         while not session.tui_queue.empty():
             session.tui_queue.get_nowait()
 
+        # Quick health probe before touching the session — avoids corrupting history
+        # if the server is not up at all.
+        import httpx as _httpx
+        try:
+            async with _httpx.AsyncClient() as _probe:
+                await _probe.get(f"{BASE_URL}/health", timeout=2.0)
+        except Exception:
+            self.error_msg.emit("Server is offline — start the server and try again.")
+            self.done.emit()
+            return
+
         try:
             self._stream_task = asyncio.create_task(
                 session.send_and_stream(text, plan_mode=plan_mode)
@@ -411,6 +425,13 @@ class QtChatAdapter(QThread):
                 session._autosave()
             except Exception:
                 pass
+        except _httpx.ConnectError:
+            # Server went down mid-turn — remove the dangling user message so
+            # retrying doesn't corrupt history with duplicates.
+            if session.messages and session.messages[-1]["role"] == "user":
+                session.messages.pop()
+            self.error_msg.emit("Server went offline during the request. Please try again.")
+            self.done.emit()
         except Exception as exc:
             self.error_msg.emit(str(exc))
             self.done.emit()
@@ -527,6 +548,8 @@ class QtChatAdapter(QThread):
                     int(event.get("tokens", 0)),
                     int(event.get("ctx", 0)),
                 )
+            elif etype == "clear_chat":
+                self.clear_chat.emit()
             elif etype == "system":
                 self.system_msg.emit(event.get("text", ""))
             elif etype == "error":

@@ -15,14 +15,14 @@ from PySide6.QtWidgets import (
     QLabel, QToolBar, QStatusBar, QComboBox, QLineEdit,
     QTreeView, QTabWidget, QTextBrowser, QPlainTextEdit, QTextEdit,
     QPushButton, QProgressBar, QMessageBox, QFileSystemModel,
-    QScrollArea, QGroupBox, QSlider, QSpinBox, QDialog,
+    QScrollArea, QScrollBar, QGroupBox, QSlider, QSpinBox, QDialog,
     QDialogButtonBox, QListWidget, QListWidgetItem, QSizePolicy, QCheckBox,
     QStyledItemDelegate, QStyleOptionViewItem, QFileDialog,
 )
 from PySide6.QtCore import Qt, QThread, QTimer, QRect, QSize, Signal, Slot
 from PySide6.QtGui import (
     QAction, QColor, QTextCharFormat, QTextCursor, QKeySequence, QShortcut,
-    QPainter, QTextFormat,
+    QPainter, QTextFormat, QLinearGradient, QBrush,
 )
 
 import httpx
@@ -34,10 +34,10 @@ from adapter import QtChatAdapter
 
 try:
     from session_state import load_state, save_state, list_sessions, load_session, get_agent_name
-    from slash_completer import SlashCompleter
+    from slash_completer import SlashCompleter, load_skill_commands
 except ImportError:
     from qt.session_state import load_state, save_state, list_sessions, load_session, get_agent_name
-    from qt.slash_completer import SlashCompleter
+    from qt.slash_completer import SlashCompleter, load_skill_commands
 
 HOME_DIR = str(Path.home() / "claude-projects")
 
@@ -78,8 +78,64 @@ class _LineNumberArea(QWidget):
         self._editor._paint_gutter(event)
 
 
-class _ScrollMarkerBar(QWidget):
-    """Thin overlay drawn over the vertical scrollbar showing highlight positions.
+class _KnightRiderBar(QWidget):
+    """Bouncing red glow bar shown while the model is working."""
+    _H      = 4
+    _SPOT_W = 60
+    _STEP   = 4
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(self._H)
+        self._pos   = 0
+        self._dir   = 1
+        self._active = False
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+
+    def start(self):
+        self._active = True
+        self._pos = 0
+        self._dir = 1
+        self._timer.start()
+        self.update()
+
+    def stop(self):
+        self._active = False
+        self._timer.stop()
+        self.update()
+
+    def _tick(self):
+        w = self.width()
+        self._pos += self._dir * self._STEP
+        if self._pos + self._SPOT_W >= w:
+            self._pos = w - self._SPOT_W
+            self._dir = -1
+        elif self._pos <= 0:
+            self._pos = 0
+            self._dir = 1
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        try:
+            painter.fillRect(self.rect(), QColor("#000000"))
+            if not self._active:
+                return
+            grad = QLinearGradient(self._pos, 0, self._pos + self._SPOT_W, 0)
+            grad.setColorAt(0.0, QColor(0, 0, 0, 0))
+            grad.setColorAt(0.25, QColor(180, 10, 0, 200))
+            grad.setColorAt(0.5,  QColor(255, 40, 0, 255))
+            grad.setColorAt(0.75, QColor(180, 10, 0, 200))
+            grad.setColorAt(1.0, QColor(0, 0, 0, 0))
+            painter.fillRect(self._pos, 0, self._SPOT_W, self._H, QBrush(grad))
+        finally:
+            painter.end()
+
+
+class _MarkedScrollBar(QScrollBar):
+    """Vertical scrollbar subclass that paints tick marks over the native bar.
 
     Two independent mark sets, each with its own colour:
       - model highlights  (amber  #c8a000) — set via set_model_marks()
@@ -87,13 +143,10 @@ class _ScrollMarkerBar(QWidget):
     """
     _MARK_H = 3
 
-    def __init__(self, editor: "CodeEditor"):
-        super().__init__(editor)
-        self._editor = editor
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Vertical, parent)
         self._model_ratios:  list[float] = []
         self._change_ratios: list[float] = []
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.raise_()
 
     def set_model_marks(self, ratios: list[float]) -> None:
         self._model_ratios = ratios
@@ -103,17 +156,8 @@ class _ScrollMarkerBar(QWidget):
         self._change_ratios = ratios
         self.update()
 
-    def update_geometry(self) -> None:
-        sb = self._editor.verticalScrollBar()
-        if not sb.isVisible():
-            self.hide()
-            return
-        pos = self._editor.mapFromGlobal(sb.mapToGlobal(sb.rect().topLeft()))
-        self.setGeometry(pos.x(), pos.y(), sb.width(), sb.height())
-        self.show()
-        self.raise_()
-
     def paintEvent(self, event) -> None:
+        super().paintEvent(event)          # native scrollbar renders first
         if not self._model_ratios and not self._change_ratios:
             return
         from PySide6.QtGui import QPainter, QColor
@@ -138,7 +182,8 @@ class CodeEditor(QPlainTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._gutter = _LineNumberArea(self)
-        self._marker_bar = _ScrollMarkerBar(self)
+        self._marker_bar = _MarkedScrollBar(self)
+        self.setVerticalScrollBar(self._marker_bar)
         self.blockCountChanged.connect(self._update_gutter_width)
         self.updateRequest.connect(self._update_gutter_on_scroll)
         self._update_gutter_width()
@@ -191,7 +236,6 @@ class CodeEditor(QPlainTextEdit):
         self._gutter.setGeometry(
             QRect(cr.left(), cr.top(), self._gutter_width(), cr.height())
         )
-        self._marker_bar.update_geometry()
 
     # ── Gutter painting ──────────────────────────────────────────────────────
 
@@ -347,6 +391,7 @@ class MainWindow(QMainWindow):
         self._active_agents: dict[str, str] = {}   # tool_id → agent color
         self._agent_nesting: int = 0     # >0 means we're inside a spawned agent
         self._current_agent_color: str = "#22d3ee"  # color of innermost active agent
+        self._pending_tools: dict[str, dict] = {}  # tool_id → buffered start metadata
 
         self._watcher = DirWatcher(self)
 
@@ -662,12 +707,18 @@ class MainWindow(QMainWindow):
         input_layout.addLayout(send_col)
 
         layout.addWidget(input_container)
+
+        self._kr_bar = _KnightRiderBar()
+        layout.addWidget(self._kr_bar)
         layout.addSpacing(8)
 
         # Slash completer (positioned dynamically above input)
         self._completer = SlashCompleter(self)
+        _skills_dir = str(Path(__file__).parent.parent / "skills")
+        self._completer.add_commands(load_skill_commands(_skills_dir))
         self._completer.hide()
         self._completer.command_chosen.connect(self._on_command_chosen)
+        self._completer.session_chosen.connect(self._on_session_chosen)
 
         return w
 
@@ -928,6 +979,7 @@ class MainWindow(QMainWindow):
         self._adapter.system_msg.connect(self._on_system_msg)
         self._adapter.error_msg.connect(self._on_error_msg)
         self._adapter.done.connect(self._on_turn_done)
+        self._adapter.clear_chat.connect(self._on_clear_chat)
 
         # SP3 additions
         self._adapter.stream_started.connect(self._on_stream_started)
@@ -1180,7 +1232,7 @@ class MainWindow(QMainWindow):
             self._auto_scroll(self._full_view)
             return
         else:
-            # Nested tool calls (inside a spawned agent) get the agent's color + indent
+            # Non-agent tools: buffer metadata — render as a single combined line on tool_done
             if self._agent_nesting > 0:
                 color = self._current_agent_color
                 indent = "padding-left:22px;"
@@ -1189,31 +1241,14 @@ class MainWindow(QMainWindow):
                 color = _TOOL_COLOR.get(name, TEXT_DIM)
                 indent = ""
                 bg = ELI_BG
-            agent_label = ""
-
-        icon   = _TOOL_ICON.get(name, "⚙")
-        keyarg = _TOOL_KEY_ARG.get(name)
-        detail = str(a.get(keyarg, ""))[:120].replace("\n", " ") if keyarg and keyarg in a else ""
-        detail_safe = detail.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-        content = (
-            f'<span style="display:block;width:100%;color:{color};font-weight:bold;font-family:Consolas,monospace;font-size:11px;">'
-            f'{icon} {name}</span>'
-            f'<span style="display:block;width:100%;color:{color};font-style:italic;">{agent_label}</span>'
-        )
-        if detail_safe:
-            content += f' <span style="color:#555577;font-family:Consolas,monospace;font-size:11px;">{detail_safe}</span>'
-
-        html = (
-            f'<table width="100%" style="border-spacing:0;border-collapse:collapse;table-layout:fixed;margin:1px 0;">'
-            f'<tr>'
-            f'<td width="2" style="background:{color};padding:0;vertical-align:top;"></td>'
-            f'<td width="100%" style="background:{bg};padding:2px 8px;{indent}">'
-            f'{content}'
-            f'</td></tr></table>'
-        )
-        self._full_view.append(html)
-        self._auto_scroll(self._full_view)
+            icon   = _TOOL_ICON.get(name, "⚙")
+            keyarg = _TOOL_KEY_ARG.get(name)
+            detail = str(a.get(keyarg, ""))[:120].replace("\n", " ") if keyarg and keyarg in a else ""
+            detail_safe = detail.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            self._pending_tools[tool_id] = {
+                "name": name, "icon": icon, "color": color,
+                "bg": bg, "indent": indent, "detail": detail_safe,
+            }
 
     @Slot(str, str, str, bool)
     def _on_tool_done_signal(self, tool_id: str, name: str, result: str, is_error: bool):
@@ -1227,28 +1262,47 @@ class MainWindow(QMainWindow):
             color = agent_color or "#22d3ee"
             indent = ""
             bg = AGENT_BG
+            icon      = "✗" if is_error else "✓"
+            err_color = "#ef4444" if is_error else color
+            done_html = (
+                f'<table width="100%" style="border-spacing:0;border-collapse:collapse;table-layout:fixed;margin:1px 0 3px 0;">'
+                f'<tr>'
+                f'<td width="2" style="background:{err_color};padding:0;vertical-align:top;"></td>'
+                f'<td width="100%" style="background:{bg};padding:1px 8px;font-family:Consolas,monospace;font-size:11px;">'
+                f'<span style="color:{err_color};">{icon} {name}</span>'
+                f'</td></tr></table>'
+            )
+            self._full_view.append(done_html)
         else:
-            if self._agent_nesting > 0:
-                color = self._current_agent_color
-                indent = "padding-left:22px;"
-                bg = AGENT_BG
+            # Pop buffered start metadata and render a single combined line
+            pending = self._pending_tools.pop(tool_id, None)
+            if pending:
+                color  = pending["color"]
+                bg     = pending["bg"]
+                indent = pending["indent"]
+                icon   = pending["icon"]
+                detail = pending["detail"]
             else:
-                color = _TOOL_COLOR.get(name, TEXT_DIM)
-                indent = ""
-                bg = ELI_BG
-
-        icon      = "✗" if is_error else "✓"
-        err_color = "#ef4444" if is_error else color
-
-        done_html = (
-            f'<table width="100%" style="border-spacing:0;border-collapse:collapse;table-layout:fixed;margin:1px 0 3px 0;">'
-            f'<tr>'
-            f'<td width="2" style="background:{err_color};padding:0;vertical-align:top;"></td>'
-            f'<td width="100%" style="background:{bg};padding:1px 8px;{indent}font-family:Consolas,monospace;font-size:11px;">'
-            f'<span style="color:{err_color};">{icon} {name}</span>'
-            f'</td></tr></table>'
-        )
-        self._full_view.append(done_html)
+                # Fallback if start was never buffered
+                color  = _TOOL_COLOR.get(name, TEXT_DIM)
+                bg     = AGENT_BG if self._agent_nesting > 0 else ELI_BG
+                indent = "padding-left:22px;" if self._agent_nesting > 0 else ""
+                icon   = _TOOL_ICON.get(name, "⚙")
+                detail = ""
+            outcome_icon  = "✗" if is_error else "✓"
+            outcome_color = "#ef4444" if is_error else color
+            detail_span   = f' <span style="color:#555577;">{detail}</span>' if detail else ""
+            done_html = (
+                f'<table width="100%" style="border-spacing:0;border-collapse:collapse;table-layout:fixed;margin:1px 0 2px 0;">'
+                f'<tr>'
+                f'<td width="2" style="background:{outcome_color};padding:0;vertical-align:top;"></td>'
+                f'<td width="100%" style="background:{bg};padding:2px 8px;{indent}font-family:Consolas,monospace;font-size:11px;">'
+                f'<span style="color:{color};">{icon} {name}</span>'
+                f'{detail_span}'
+                f' <span style="color:{outcome_color};">{outcome_icon}</span>'
+                f'</td></tr></table>'
+            )
+            self._full_view.append(done_html)
 
         # Render agent output with its assigned color and full markdown
         if is_agent_tool:
@@ -1289,10 +1343,8 @@ class MainWindow(QMainWindow):
         path = args.get("path", "")
         cmd  = args.get("command", "")
         if tool_name in ("edit", "write_file") and path:
-            import os as _os
-            parent = _os.path.dirname(path)
-            rule = f"path_prefix:{parent}"
-            rule_label = f"Allow all edits in {parent}"
+            rule = f"path_prefix:{self._cwd}"
+            rule_label = f"Allow all edits/writes in CWD ({self._cwd})"
         elif tool_name == "bash" and cmd:
             first = cmd.strip().split()[0]
             rule = f"cmd_pattern:{first}*"
@@ -1382,6 +1434,11 @@ class MainWindow(QMainWindow):
         self._message_queue.clear()
         self._queue_label.setVisible(False)
         self._set_input_enabled(True)
+
+    @Slot()
+    def _on_clear_chat(self):
+        self._full_view.clear()
+        self._agent_view.clear()
 
     @Slot()
     def _on_turn_done(self):
@@ -1713,6 +1770,12 @@ class MainWindow(QMainWindow):
         self._input.setTextCursor(cursor)
         self._input.setFocus()
 
+    @Slot(str)
+    def _on_session_chosen(self, stem: str):
+        """Submit /resume SESSION directly — no further typing needed."""
+        self._input.clear()
+        self._adapter.submit_slash(f"/resume {stem}")
+
     @Slot()
     def _on_excerpt_changed(self):
         """Capture the Ctrl+drag selection as a silent excerpt and highlight it in red."""
@@ -1827,7 +1890,14 @@ class MainWindow(QMainWindow):
     def _on_input_changed(self):
         text = self._input.toPlainText()
         if text.startswith("/") and "\n" not in text:
-            has_matches = self._completer.update_filter(text.rstrip())
+            stripped = text.rstrip()
+            # /resume triggers session picker
+            if stripped.startswith("/resume"):
+                filter_text = stripped[7:].strip()  # text after "/resume"
+                sessions = list_sessions()
+                has_matches = self._completer.set_sessions(sessions, filter_text)
+            else:
+                has_matches = self._completer.update_filter(stripped)
             if has_matches:
                 # Child widget coords (not global) — avoids OS popup keyboard grab
                 input_pos = self._input.mapTo(self, self._input.rect().topLeft())
@@ -2084,9 +2154,11 @@ class MainWindow(QMainWindow):
         if enabled:
             self._send_btn.setText("Send")
             self._send_btn.setEnabled(True)
+            self._kr_bar.stop()
         else:
             self._send_btn.setText("Queue")
             self._send_btn.setEnabled(True)   # always clickable — queues when busy
+            self._kr_bar.start()
         self._input.setFocus()
 
 

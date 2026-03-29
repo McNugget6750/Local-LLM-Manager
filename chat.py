@@ -234,43 +234,25 @@ async def _switch_server(profile: str, timeout: int = 120) -> bool:
     console.print(f"[red]  Server failed to become healthy within {timeout}s[/red]")
     return False
 
-def _load_mission_objective() -> str | None:
-    """Load MISSION_OBJECTIVE.md from cwd or any parent (up to 5 levels)."""
-    path = Path.cwd()
-    for _ in range(5):
-        candidate = path / "MISSION_OBJECTIVE.md"
-        if candidate.exists():
-            try:
-                return candidate.read_text(encoding="utf-8")
-            except Exception:
-                return None
-        parent = path.parent
-        if parent == path:
-            break
-        path = parent
-    return None
 
 
-def _build_initial_messages() -> list[dict]:
+def _build_initial_messages() -> tuple[list[dict], list[str]]:
+    """Return (messages, full_paths_loaded)."""
     msgs = [{"role": "system", "content": _load_system_prompt()}]
-    loaded: list[str] = ["ELI.md"]
+    eli_path = str((Path(__file__).parent / "ELI.md").resolve())
+    loaded_paths: list[str] = [eli_path]
 
     memory = _load_memory()
     if memory:
         msgs.append({"role": "system", "content": f"[Operational Memory]\n\n{memory}"})
-        loaded.append("MEMORY.md")
-
-    mission = _load_mission_objective()
-    if mission:
-        msgs.append({"role": "system", "content": f"[Mission Objective — auto-loaded from MISSION_OBJECTIVE.md]\n\n{mission}"})
-        loaded.append("MISSION_OBJECTIVE.md")
+        loaded_paths.append(str((Path(__file__).parent / "MEMORY.md").resolve()))
 
     model_ctx = _build_model_context()
     if model_ctx:
         msgs.append({"role": "system", "content": model_ctx})
 
-    console.print(f"[dim]Context loaded: {', '.join(loaded)}[/dim]")
-    return msgs
+    console.print(f"[dim]Context loaded: {', '.join(loaded_paths)}[/dim]")
+    return msgs, loaded_paths
 
 def _load_project_config(cwd: Path) -> dict:
     """Walk up from cwd looking for eli.toml (up to 10 levels). Returns {} if not found."""
@@ -354,7 +336,14 @@ def _load_session(name: str | None = None) -> tuple[list[dict], Path] | tuple[No
             return None, None
         target = candidates[-1]
     else:
-        target = all_sessions[-1]
+        # Prefer last-used session from state; fall back to newest file
+        state = _load_state()
+        last = state.get("last_session")
+        if last:
+            candidates = [s for s in all_sessions if s.stem == last]
+            target = candidates[0] if candidates else all_sessions[-1]
+        else:
+            target = all_sessions[-1]
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
         return data.get("messages", []), target
@@ -1985,9 +1974,10 @@ async def _invoke_skill(skill_name: str, skill_args: str, session: "ChatSession"
 class ChatSession:
     def __init__(self):
         self.client = httpx.AsyncClient(timeout=120.0)
-        _initial = _build_initial_messages()
+        _initial, _startup_paths = _build_initial_messages()
         self.messages: list[dict] = _initial
         self._n_fixed: int          = len(_initial)
+        self._startup_files: list[str] = _startup_paths
         self.think_level: str       = "on"   # "off" | "on" | "deep"
         self.model: str             = MODEL
         self.ctx_window: int        = CTX_WINDOW
@@ -2200,9 +2190,11 @@ class ChatSession:
             # any instructions that may have changed since session start (e.g. ELI.md,
             # MEMORY.md). This mirrors how Claude Code re-reads CLAUDE.md after its own
             # context compaction.
-            fresh_initial = _build_initial_messages()
+            fresh_initial, fresh_paths = _build_initial_messages()
             new_messages = list(fresh_initial)
             self._n_fixed = len(fresh_initial)
+            if self.tui_queue:
+                await self.tui_queue.put({"type": "system", "text": "Context re-read: " + ", ".join(fresh_paths)})
 
             # Re-inject active role right after the refreshed system messages.
             # The original role injection lived in conversation history and was
@@ -2300,6 +2292,15 @@ class ChatSession:
     async def send_and_stream(self, user_text: str, plan_mode: bool = False):
         user_text = await self._maybe_compact_input(user_text)
         self.messages.append({"role": "user", "content": user_text})
+
+        # Per-turn call-count tracking for loop detection.
+        # Key: (tool_name, arguments_string). Resets each user turn.
+        _call_counts: dict[tuple[str, str], int] = {}
+        # How many identical calls are allowed before the next one is blocked.
+        # web_search / web_fetch: block on the 2nd identical call (result won't change).
+        # Everything else: block on the 3rd (allows one legitimate retry).
+        _LOOP_LIMITS: dict[str, int] = {"web_search": 1, "web_fetch": 1, "edit": 1, "write_file": 1}
+        _DEFAULT_LOOP_LIMIT = 2
 
         while True:
             temperature = 0.3 if self.think_level == "deep" else 0.6
@@ -2486,9 +2487,55 @@ class ChatSession:
                         is_err = result.startswith(("[error", "[unknown", "[blocked", "[cancelled", _GATE_REJECTED_PREFIX))
                         await self.tui_queue.put({"type": "tool_done", "id": tc_id, "name": tc_name, "result": result, "is_error": is_err})
 
+                # If any state-changing tool ran in this iteration, the world has changed —
+                # reset loop-detection counts so a legitimate re-run isn't blocked.
+                # BUT preserve counts for file ops themselves so read→edit→read loops
+                # don't escape detection by resetting on each edit.
+                _STATE_CHANGING = {"edit", "write_file"}
+                if any(tc["function"]["name"] in _STATE_CHANGING for tc in tool_calls_received):
+                    _FILE_OPS = {"read_file", "edit", "write_file"}
+                    _call_counts = {k: v for k, v in _call_counts.items() if k[0] in _FILE_OPS}
+
                 for tc in tool_calls_received:
                     if _gate_rejected:
                         break
+
+                    # Loop detection: block repeated identical calls this turn
+                    _tc_name = tc["function"]["name"]
+                    _tc_args = tc["function"]["arguments"]
+                    _canon   = (_tc_name, _tc_args)
+                    _call_counts[_canon] = _call_counts.get(_canon, 0) + 1
+                    _limit   = _LOOP_LIMITS.get(_tc_name, _DEFAULT_LOOP_LIMIT)
+                    if _call_counts[_canon] > _limit:
+                        _loop_advice = {
+                            "bash": (
+                                "The environment has not changed since the last run — repeating "
+                                "the same command will produce the same result. "
+                                "Write a script that handles the problem differently, "
+                                "or use write_file/edit to change the inputs before re-running."
+                            ),
+                            "web_search": (
+                                "A search with these exact terms has already been executed. "
+                                "Reformulate with different keywords, broaden or narrow the query, "
+                                "or synthesize your final answer from the results already retrieved."
+                            ),
+                            "web_fetch": (
+                                "This URL has already been fetched this turn. "
+                                "The content will not have changed. Use what you already retrieved."
+                            ),
+                        }
+                        _advice = _loop_advice.get(
+                            _tc_name,
+                            "Try a different approach or formulate your final answer from what you already have.",
+                        )
+                        _warn = (
+                            f"[loop-detected] {_tc_name} has been called with these exact "
+                            f"arguments {_call_counts[_canon]} time(s) this turn. {_advice}"
+                        )
+                        self.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": _warn})
+                        await _emit_tool_done(_tc_name, tc["id"], _warn)
+                        continue
+
                     if tc["function"]["name"] in _READ_ONLY_TOOLS:
                         _batch.append(tc)
                     else:
@@ -4135,12 +4182,14 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         return True
 
     elif name == "/clear":
-        _initial = _build_initial_messages()
+        _initial, _ = _build_initial_messages()
         session.messages = _initial
         session._n_fixed = len(_initial)
         session.tokens_used = session.tokens_prompt = session.tokens_completion = 0
         await session._refresh_project_config()
         console.print(Rule("[dim]History cleared[/dim]", style="dim"))
+        if session.tui_queue:
+            await session.tui_queue.put({"type": "clear_chat"})
         return True
 
     elif name == "/tools":
@@ -4217,18 +4266,32 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         _all = [p for p in SESSIONS_DIR.glob("*.json") if p.name != "state.json"] if SESSIONS_DIR.exists() else []
         if not _all:
             console.print("[dim]No saved sessions.[/dim]")
+            if session.tui_queue:
+                await session.tui_queue.put({"type": "system", "text": "No saved sessions."})
             return True
         all_sessions = sorted(_all, reverse=True)
-        lines = []
-        for i, s in enumerate(all_sessions):
-            try:
-                data = json.loads(s.read_text(encoding="utf-8"))
-                tok = data.get("token_estimate", 0)
-                saved_at = data.get("saved_at", "")[:16].replace("T", " ")
-                lines.append(f"[cyan]{s.stem}[/cyan]  [dim]{saved_at}  ~{tok:,} tokens[/dim]")
-            except Exception:
-                lines.append(f"[cyan]{s.stem}[/cyan]  [dim](unreadable)[/dim]")
-        console.print(Panel("\n".join(lines), title="Saved Sessions", border_style="cyan"))
+        if session.tui_queue:
+            rows = []
+            for s in all_sessions:
+                try:
+                    data = json.loads(s.read_text(encoding="utf-8"))
+                    tok = data.get("token_estimate", 0)
+                    saved_at = data.get("saved_at", "")[:16].replace("T", " ")
+                    rows.append(f"{s.stem}  —  {saved_at}  (~{tok:,} tokens)")
+                except Exception:
+                    rows.append(f"{s.stem}  —  (unreadable)")
+            await session.tui_queue.put({"type": "system", "text": "Saved sessions:\n" + "\n".join(rows)})
+        else:
+            lines = []
+            for s in all_sessions:
+                try:
+                    data = json.loads(s.read_text(encoding="utf-8"))
+                    tok = data.get("token_estimate", 0)
+                    saved_at = data.get("saved_at", "")[:16].replace("T", " ")
+                    lines.append(f"[cyan]{s.stem}[/cyan]  [dim]{saved_at}  ~{tok:,} tokens[/dim]")
+                except Exception:
+                    lines.append(f"[cyan]{s.stem}[/cyan]  [dim](unreadable)[/dim]")
+            console.print(Panel("\n".join(lines), title="Saved Sessions", border_style="cyan"))
         return True
 
     elif name == "/resume":
@@ -4238,7 +4301,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
             hint = resume_name or "latest"
             console.print(f"[yellow]No session found matching '{hint}'[/yellow]")
             return True
-        _initial = _build_initial_messages()
+        _initial, _ = _build_initial_messages()
         session.messages = _initial + saved_msgs
         session._n_fixed = len(_initial)
         session._session_path = sess_path

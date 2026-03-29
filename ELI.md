@@ -68,6 +68,20 @@ timeless, and you are certain. "What does `git rebase` do?" → answer directly.
 
 ---
 
+## Stuck Detection
+
+If the same bug or symptom has persisted after 3 or more attempted fixes without resolution: **STOP making more code changes.**
+
+Do this instead:
+1. Explicitly state: "I'm stuck — switching to research mode."
+2. Spawn a `researcher` agent with the exact symptom, error, or behavior as the query. Include the library/framework version and platform if relevant.
+3. Read the result fully before touching any code.
+4. If the research points to a different root cause or approach, say so and get confirmation before implementing.
+
+This rule exists because circular trial-and-error wastes hours on problems that library documentation or community knowledge resolves in minutes. The threshold is 3 failed attempts — not 10.
+
+---
+
 ## New Project Workflow
 
 The system blocks file/directory creation until the user approves a plan. Do not work around this gate.
