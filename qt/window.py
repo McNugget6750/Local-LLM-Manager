@@ -982,6 +982,8 @@ class MainWindow(QMainWindow):
         self._adapter.done.connect(self._on_turn_done)
         self._adapter.clear_chat.connect(self._on_clear_chat)
         self._adapter.cwd_changed.connect(self._on_cwd_changed)
+        self._adapter.session_saved.connect(self._on_session_saved)
+        self._adapter.session_resume_html.connect(self._on_session_resume_html)
 
         # Align session CWD with GUI initial CWD on startup
         self._adapter.submit_slash(f"/cd {self._cwd}")
@@ -1444,6 +1446,34 @@ class MainWindow(QMainWindow):
     def _on_clear_chat(self):
         self._full_view.clear()
         self._agent_view.clear()
+
+    def _on_session_saved(self, json_path: str) -> None:
+        """Save the current chat view HTML alongside the session JSON."""
+        try:
+            html_path = Path(json_path).with_suffix(".html")
+            html_path.write_text(self._full_view.toHtml(), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _on_session_resume_html(self, json_path: str) -> None:
+        """Restore chat view from saved HTML on session resume."""
+        html_path = Path(json_path).with_suffix(".html")
+        if not html_path.exists():
+            return
+        try:
+            html = html_path.read_text(encoding="utf-8")
+        except Exception:
+            return
+        self._full_view.setHtml(html)
+        # Append a visual separator so new messages are clearly distinct
+        self._full_view.append(
+            "<hr style='border:none;border-top:1px solid #333;margin:6px 0;'>"
+            "<p style='color:#444;font-size:10px;text-align:center;margin:2px 0;'>"
+            "─── resume point ───</p>"
+        )
+        # Scroll to bottom so the resume point is visible
+        sb = self._full_view.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def _on_cwd_changed(self, cwd: str):
         if not cwd or not Path(cwd).is_dir():

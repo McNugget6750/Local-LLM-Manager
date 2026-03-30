@@ -323,6 +323,8 @@ class QtChatAdapter(QThread):
     stream_started  = Signal()                     # fires at start of each turn
     clear_chat      = Signal()
     cwd_changed     = Signal(str)          # new CWD path after /resume or /cd
+    session_saved   = Signal(str)          # full path to the saved JSON file
+    session_resume_html = Signal(str)      # full path to JSON; window loads sibling .html
 
     # Voice signals (emitted by _VoiceThread directly)
     voice_activity      = Signal(str)
@@ -424,6 +426,8 @@ class QtChatAdapter(QThread):
             await self._drain_queue(session, self._stream_task)
             try:
                 session._autosave()
+                if session._session_path:
+                    self.session_saved.emit(str(session._session_path))
             except Exception:
                 pass
         except _httpx.ConnectError:
@@ -553,6 +557,8 @@ class QtChatAdapter(QThread):
                 self.clear_chat.emit()
             elif etype == "cwd_changed":
                 self.cwd_changed.emit(event.get("cwd", ""))
+            elif etype == "session_resume_html":
+                self.session_resume_html.emit(event.get("json_path", ""))
             elif etype == "system":
                 self.system_msg.emit(event.get("text", ""))
             elif etype == "error":

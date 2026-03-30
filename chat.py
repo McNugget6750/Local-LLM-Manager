@@ -322,6 +322,12 @@ def _save_session(messages: list[dict], n_fixed: int, session_path: Path | None 
             old.unlink()
         except Exception:
             pass
+        try:
+            html_sibling = old.with_suffix(".html")
+            if html_sibling.exists():
+                html_sibling.unlink()
+        except Exception:
+            pass
     _save_state(last_session=session_path.stem)
     return session_path
 
@@ -4312,6 +4318,8 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
             await session._refresh_project_config()
             if session.tui_queue:
                 await session.tui_queue.put({"type": "cwd_changed", "cwd": str(session.cwd)})
+        if session.tui_queue:
+            await session.tui_queue.put({"type": "session_resume_html", "json_path": str(sess_path)})
         console.print(Rule(f"[cyan]Session loaded: {sess_path.name}[/cyan]", style="cyan"))
         return True
 
