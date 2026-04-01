@@ -2,6 +2,15 @@
 
 import sys
 import pathlib
+import logging
+
+# logging.basicConfig(
+#     level=logging.DEBUG,
+#     format="%(name)s:%(lineno)d %(levelname)s %(message)s",
+# )
+
+logging.basicConfig(level=logging.WARNING)  # global default
+logging.getLogger("slot_manager").setLevel(logging.DEBUG)
 
 # Allow `from chat import ChatSession` and `from qt.adapter import QtChatAdapter`
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))

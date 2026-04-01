@@ -48,6 +48,10 @@ CONTROL_URL  = "http://localhost:1235"   # server_manager.py control API
 TTS_URL      = "http://127.0.0.1:1236"  # eli_server TTS + transcribe
 MODEL = "auto"
 
+# ── Inference Slot Manager ────────────────────────────────────────────────────
+from slot_manager import SlotManager, SlotHandle, _NullContext
+_ism = SlotManager(base_url=BASE_URL)
+
 # ── Tool announce fallback (shown when model emits no text before first tool call) ──
 _TOOL_STATUS = {
     "spawn_agent":  "Looking into this…",
@@ -168,6 +172,54 @@ def _build_model_context() -> str | None:
         lines.append(f"Vision API: {vision_url}  (use analyze_image tool for image analysis)")
     return "\n".join(lines).strip()
 
+def _load_agent_profile(name: str) -> dict:
+    """Load an agent profile .md and return {prompt, write_domains, read_domains, model}.
+
+    If `name` contains whitespace it is treated as a raw inline prompt (no file lookup).
+    Domain fields are parsed from YAML frontmatter:  write_domains: [a, b]
+    """
+    if " " in name.strip():
+        # Raw inline prompt — unknown domains, conservative
+        _m = _re.search(r'\*\*Recommended model:\*\*\s*`([^`]+)`', name)
+        return {"prompt": name, "write_domains": [], "read_domains": [], "model": _m.group(1).strip() if _m else None}
+    profile_path = Path(__file__).parent / "agents" / f"{name}.md"
+    if not profile_path.exists():
+        return {"prompt": name, "write_domains": [], "read_domains": [], "model": None}
+    text = profile_path.read_text(encoding="utf-8")
+    result: dict = {"prompt": text, "write_domains": [], "read_domains": [], "model": None}
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            fm_block = text[3:end]
+            for field in ("write_domains", "read_domains"):
+                m = _re.search(rf'^{field}:\s*\[([^\]]*)\]', fm_block, _re.MULTILINE)
+                if m:
+                    result[field] = [d.strip() for d in m.group(1).split(",") if d.strip()]
+            result["prompt"] = text[end + 4:].strip()
+    _m = _re.search(r'\*\*Recommended model:\*\*\s*`([^`]+)`', result["prompt"])
+    if _m:
+        result["model"] = _m.group(1).strip()
+    return result
+
+
+def _can_run_parallel(profile_a: dict, profile_b: dict) -> bool:
+    """Return True if two agent profiles have no write/read domain conflicts."""
+    aw = set(profile_a.get("write_domains", []))
+    bw = set(profile_b.get("write_domains", []))
+    ar = set(profile_a.get("read_domains", []))
+    br = set(profile_b.get("read_domains", []))
+    return not (aw & bw) and not (aw & br) and not (bw & ar)
+
+
+def _all_can_parallel(profiles: list[dict]) -> bool:
+    """Return True if every pair of profiles can run concurrently."""
+    for i in range(len(profiles)):
+        for j in range(i + 1, len(profiles)):
+            if not _can_run_parallel(profiles[i], profiles[j]):
+                return False
+    return True
+
+
 async def _control(method: str, path: str, body: dict | None = None) -> dict | None:
     """Call the server_manager control API. Returns parsed JSON or None on failure."""
     try:
@@ -185,6 +237,13 @@ async def _find_active_profile() -> str | None:
     data = await _control("GET", "/api/status")
     if data and data.get("running") and data.get("model"):
         return data["model"]
+    return None
+
+
+def _extract_write_path(tc_name: str, tc_args: dict) -> str | None:
+    """Return the file path being written for structured write tools, or None."""
+    if tc_name in ("edit", "write_file"):
+        return tc_args.get("file_path") or tc_args.get("path")
     return None
 
 async def _switch_server(profile: str, timeout: int = 120) -> bool:
@@ -586,13 +645,14 @@ TOOLS = [
         "function": {
             "name": "spawn_agent",
             "description": (
-                "Spawn a single specialized sub-agent and return its result. "
-                "Use for one-off tasks: code review, documentation, research, test writing. "
-                "Agent profiles: code-review, doc-writer, researcher, test-writer, web_designer. "
+                "Spawn a specialized sub-agent and return its result. "
+                "Use for any agent task: code review, documentation, research, test writing. "
+                "Agent profiles: code-review, doc-writer, generic, researcher, test-writer, web_designer. "
                 "Do NOT specify a model unless the user explicitly requested a different one — "
                 "only use profile names listed in the system context (commands.json). "
                 "The server switches automatically and restores the original model when done. "
-                "For multiple agents or pipelines, use queue_agents instead."
+                "To run multiple agents concurrently, call spawn_agent multiple times in the "
+                "same response — the system handles parallelisation automatically."
             ),
             "parameters": {
                 "type": "object",
@@ -672,13 +732,12 @@ TOOLS = [
         "function": {
             "name": "queue_agents",
             "description": (
-                "Run a sequence of agents one after another, each with its own task, model, "
-                "and time budget. Results are stored to disk and returned as a summary. "
-                "Use this for research or development pipelines that need multiple agents. "
-                "Agents run sequentially — model switches only when the next agent needs a "
-                "different model (no redundant reloads). The original model is restored after "
-                "the entire queue completes. Each agent gets a per-agent timeout; on timeout "
-                "the agent is asked to summarise before moving on."
+                "ONLY use this for strict ordered pipelines where agent B cannot start until "
+                "agent A has finished and its output is passed forward (e.g. build → test → "
+                "deploy). NEVER use for: a single agent task, research, code review, or any "
+                "independent tasks. For those, always use spawn_agent instead — it runs in "
+                "background mode and does not block the conversation. queue_agents is always "
+                "synchronous and will block the conversation until all agents complete."
             ),
             "parameters": {
                 "type": "object",
@@ -1995,7 +2054,9 @@ class ChatSession:
         self.cwd: Path              = Path.cwd()
         self.approval_level: str    = "auto"
         self._session_path: Path | None = None
-        self._in_subagent: bool     = False
+        self._subagent_depth: int   = 0    # nesting depth; >0 blocks nested spawn
+        self.server_parallel_slots: int = 1  # filled by _detect_ctx_window
+        self._capabilities_injected: bool = False
         self.compact_mode: bool         = False
         self.compact_threshold: float   = CTX_COMPACT_THRESH
         self.keep_recent: int           = CTX_KEEP_RECENT
@@ -2005,10 +2066,16 @@ class ChatSession:
         self._approval_notes: str   = ""  # injected into tool result after dispatch
         self.session_rules: list[str] = []  # persistent allow-rules for this session
         self.tui_queue: asyncio.Queue | None = None  # set by TUI to receive typed events
+        # Background agent support
+        self._bg_agent_tasks:       list[asyncio.Task] = []
+        self._pending_bg_results:   list[tuple[str, str]] = []   # (tool_call_id, result_text)
+        self._pending_bg_tool_calls: list[dict] = []             # tc dicts for tool_done emit
+        self._write_locks:          dict[str, str] = {}          # abs_path → holder label
 
     async def __aenter__(self):
         await self._health_check()
         await self._detect_ctx_window()
+        self._inject_capabilities()
         await self._refresh_project_config()
         if not self.tui_queue:
             console.print(
@@ -2033,19 +2100,93 @@ class ChatSession:
             sys.exit(1)
 
     async def _detect_ctx_window(self) -> None:
-        try:
-            r = await self.client.get(f"{BASE_URL}/slots", timeout=5)
-            r.raise_for_status()
-            slots = r.json()
-            if isinstance(slots, list) and slots:
-                n_ctx = slots[0].get("n_ctx")
-                if n_ctx and isinstance(n_ctx, int) and n_ctx > 0:
-                    self.ctx_window = n_ctx
-                    console.print(f"[dim]Context window: {n_ctx:,} tokens[/dim]")
-                    return
-        except Exception:
-            pass
+        await _ism.initialize()
+        self.server_parallel_slots = _ism.total_slots()
+        raw = _ism._raw_slots
+        if raw:
+            n_ctx = raw[0].get("n_ctx")
+            if n_ctx and isinstance(n_ctx, int) and n_ctx > 0:
+                self.ctx_window = n_ctx
+                slots_note = f"  ·  {self.server_parallel_slots} parallel slot(s)" if self.server_parallel_slots > 1 else ""
+                console.print(f"[dim]Context window: {n_ctx:,} tokens{slots_note}[/dim]")
+                return
         console.print(f"[dim]Context window: {CTX_WINDOW:,} tokens (default — /slots unavailable)[/dim]")
+
+    def _inject_capabilities(self) -> None:
+        """Inject a one-time system message advertising parallel agent execution."""
+        if self._capabilities_injected:
+            return
+        msg = (
+            "[Agent capabilities]\n"
+            "You may issue multiple spawn_agent tool calls in a single response to run agents "
+            "concurrently. The system automatically groups agents by model, checks domain-level "
+            "resource conflicts, and queries live server capacity — running agents in parallel "
+            "when safe, falling back to sequential when not. You do not need to reason about "
+            "this.\n\n"
+            "IMPORTANT: Use multiple spawn_agent calls (not queue_agents) when you want agents "
+            "to run in parallel. queue_agents is always sequential. Prefer multiple spawn_agent "
+            "calls for independent tasks such as researching different topics simultaneously, "
+            "running a reviewer alongside a designer, or any work with no shared file dependencies.\n\n"
+            "Background mode: when the server has spare inference slots, spawn_agent calls are "
+            "dispatched as background tasks — you will receive a placeholder result immediately. "
+            "Write a brief acknowledgement (e.g. 'Dispatched N agents in background') and end "
+            "your turn. The full agent results are automatically injected into your context at "
+            "the start of the user's next message so you can discuss them then."
+        )
+        self.messages.insert(self._n_fixed, {"role": "system", "content": msg})
+        self._n_fixed += 1
+        self._capabilities_injected = True
+
+    async def _inject_pending_bg_results(self) -> None:
+        """Replace background-agent placeholder tool results with real output.
+
+        Called at the start of the next send_and_stream turn after background agents
+        complete. Only results that have arrived are injected; any still running remain
+        in _pending_bg_results for the following turn.
+        """
+        results_map = {tc_id: result for tc_id, result in self._pending_bg_results}
+        self._pending_bg_results.clear()
+        for msg in self.messages:
+            if msg.get("role") == "tool" and msg.get("tool_call_id") in results_map:
+                msg["content"] = results_map[msg["tool_call_id"]]
+        self._pending_bg_tool_calls.clear()
+
+    async def _run_background_agent(
+        self, tc: dict, args: dict, label: str, current_model: str | None
+    ) -> None:
+        """Run a single spawn_agent call as a background asyncio Task.
+
+        Acquires an ISM slot for its lifetime. The slot is released in __aexit__
+        regardless of exception or cancellation.
+        Task removal from _bg_agent_tasks is handled by add_done_callback in the caller.
+        """
+        result = "[cancelled]"
+        try:
+            result = await self._tool_spawn_agent(
+                args.get("system_prompt", ""),
+                args.get("task", ""),
+                args.get("tools"),
+                args.get("think_level"),
+                min(args.get("max_iterations", 10), 30),
+                None,                        # model=None: eligibility confirmed same-model
+                agent_label=label,
+                current_model_hint=current_model,
+                _is_background=True,
+            )
+        except asyncio.CancelledError:
+            result = "[agent evicted — 15-minute timeout reached]"
+            raise
+        except Exception as exc:
+            result = f"[background agent error: {exc}]"
+        self._pending_bg_results.append((tc["id"], result))
+        if self.tui_queue:
+            await self.tui_queue.put({
+                "type": "tool_done",
+                "id": tc["id"],
+                "name": "spawn_agent",
+                "result": result,
+                "is_error": result.startswith(("[error", "[background agent error", "[agent evicted")),
+            })
 
     def _remove_config_message(self) -> None:
         """Remove any previously injected project config system message."""
@@ -2297,6 +2438,9 @@ class ChatSession:
             self.messages.pop()
 
     async def send_and_stream(self, user_text: str, plan_mode: bool = False):
+        # Inject any completed background agent results before Eli sees this message
+        if self._pending_bg_results:
+            await self._inject_pending_bg_results()
         user_text = await self._maybe_compact_input(user_text)
         self.messages.append({"role": "user", "content": user_text})
 
@@ -2484,15 +2628,154 @@ class ChatSession:
                         tc["id"],
                     )
 
-                # Split into runs: flush a parallel batch whenever a write op appears.
-                # Stop the entire batch immediately if any gate rejects a call.
-                _batch: list = []
+                # Split into runs: read-only in parallel, agents in a domain-checked batch,
+                # write ops sequentially.  Stop immediately if any gate rejects a call.
+                _batch: list = []        # pending read-only calls
+                _agent_batch: list = []  # pending spawn_agent calls
                 _gate_rejected = False
 
                 async def _emit_tool_done(tc_name: str, tc_id: str, result: str) -> None:
                     if self.tui_queue:
                         is_err = result.startswith(("[error", "[unknown", "[blocked", "[cancelled", _GATE_REJECTED_PREFIX))
                         await self.tui_queue.put({"type": "tool_done", "id": tc_id, "name": tc_name, "result": result, "is_error": is_err})
+
+                async def _flush_agent_batch(batch: list) -> None:
+                    """Run spawn_agent calls, grouping by target model, parallelising within each group when domain-safe.
+
+                    Model switching is done once per group (not per agent). Live slot count is
+                    queried after each switch so the capacity reflects the actual loaded model.
+                    A try/finally guarantees the original model is always restored, even on
+                    exception or asyncio cancellation.
+                    """
+                    batch_args = []
+                    for _tc in batch:
+                        try:
+                            _a = json.loads(_tc["function"]["arguments"]) if isinstance(_tc["function"]["arguments"], str) else _tc["function"]["arguments"]
+                        except Exception:
+                            _a = {}
+                        batch_args.append(_a)
+
+                    # Snapshot current model and valid profile names once
+                    _original_model = await _find_active_profile()
+                    _commands = _load_commands()
+
+                    # Group agents by resolved target model; original-model group runs first
+                    _groups: dict = {}
+                    for _tc, _args in zip(batch, batch_args):
+                        _m = _args.get("model")
+                        _tgt = _m if (_m and _m in _commands) else _original_model
+                        _groups.setdefault(_tgt, []).append((_tc, _args))
+                    _ordered = sorted(_groups.items(), key=lambda kv: kv[0] != _original_model)
+
+                    # Background eligibility: all agents target the current model + a free slot exists
+                    _bg_eligible = (
+                        _ism.total_slots() - _ism.in_use() >= 1
+                        and len(_groups) == 1
+                        and list(_groups.keys())[0] == _original_model
+                    )
+                    if _bg_eligible and _original_model is not None:
+                        # Only check profile model when we know the active model;
+                        # if _original_model is None we can't compare, so allow bg.
+                        _all_profiles = [_load_agent_profile(_a.get("system_prompt", "")) for _a in batch_args]
+                        for _ba, _bp in zip(batch_args, _all_profiles):
+                            _pm = _ba.get("model") or _bp.get("model")
+                            if _pm and _pm != _original_model:
+                                _bg_eligible = False
+                                break
+
+                    if _bg_eligible:
+                        # Dispatch as background asyncio Tasks — return placeholders immediately.
+                        # Each task acquires its own ISM slot on start, releases on finish.
+                        for _i, (_tc, _args) in enumerate(zip(batch, batch_args)):
+                            _lbl = f"Agent {_i + 1}" if len(batch) > 1 else ""
+                            _placeholder = "[background: agent dispatched — result pending]"
+                            self.messages.append({"role": "tool", "tool_call_id": _tc["id"], "content": _placeholder})
+                            await _emit_tool_done("spawn_agent", _tc["id"], _placeholder)
+                            _task = asyncio.create_task(
+                                self._run_background_agent(_tc, _args, _lbl, _original_model)
+                            )
+                            # Remove from list when the task is truly done (asyncio marks it done
+                            # only after the coroutine fully returns — not during finally block).
+                            _task.add_done_callback(
+                                lambda t: self._bg_agent_tasks.remove(t)
+                                if t in self._bg_agent_tasks else None
+                            )
+                            self._bg_agent_tasks.append(_task)
+                            self._pending_bg_tool_calls.append(_tc)
+                        return  # no model switch occurred; no try/finally restore needed
+
+                    _current_running = _original_model
+                    _attempted_switch = False
+                    _label_offset = 0
+                    _pair_results: list = []
+
+                    try:
+                        for _target_model, _group in _ordered:
+                            # Switch model if needed (only when original is known)
+                            if _target_model and _target_model != _current_running and _original_model:
+                                _attempted_switch = True
+                                _ok = await _switch_server(_target_model)
+                                if not _ok:
+                                    for _tc, _args in _group:
+                                        _pair_results.append((_tc["id"], f"[error: server failed to start model '{_target_model}' — agent skipped]"))
+                                    _label_offset += len(_group)
+                                    continue
+                                _current_running = _target_model
+                                await _ism.refresh_from_server()   # update slot count for new model
+
+                            # Slot count for parallelism decision
+                            _slots = _ism.total_slots()
+
+                            # Domain conflict check
+                            _profiles = [_load_agent_profile(_a.get("system_prompt", "")) for _, _a in _group]
+                            _run_parallel = _slots >= 2 and len(_group) > 1 and _all_can_parallel(_profiles)
+                            _hint = _target_model  # suppresses per-agent switch/restore
+
+                            if _run_parallel:
+                                _labels = [f"Agent {_label_offset + i + 1}" for i in range(len(_group))]
+                                async def _run_one_parallel(_tc, _args, _label, _h=_hint):
+                                    _res = await self._tool_spawn_agent(
+                                        _args.get("system_prompt", ""),
+                                        _args.get("task", ""),
+                                        _args.get("tools"),
+                                        _args.get("think_level"),
+                                        min(_args.get("max_iterations", 10), 30),
+                                        _args.get("model"),
+                                        agent_label=_label,
+                                        current_model_hint=_h,
+                                    )
+                                    return _tc["id"], _res
+                                _group_results = list(await asyncio.gather(*[
+                                    _run_one_parallel(_tc, _args, _lbl)
+                                    for (_tc, _args), _lbl in zip(_group, _labels)
+                                ]))
+                                _pair_results.extend(_group_results)
+                            else:
+                                for _i, (_tc, _args) in enumerate(_group):
+                                    _lbl = f"Agent {_label_offset + _i + 1}" if len(batch) > 1 else ""
+                                    _res = await self._tool_spawn_agent(
+                                        _args.get("system_prompt", ""),
+                                        _args.get("task", ""),
+                                        _args.get("tools"),
+                                        _args.get("think_level"),
+                                        min(_args.get("max_iterations", 10), 30),
+                                        _args.get("model"),
+                                        agent_label=_lbl,
+                                        current_model_hint=_hint,
+                                    )
+                                    _pair_results.append((_tc["id"], _res))
+
+                            _label_offset += len(_group)
+
+                    finally:
+                        # Always restore original model if any switch was attempted.
+                        # Fires on normal exit, exception, and asyncio cancellation.
+                        if _attempted_switch and _original_model:
+                            await _switch_server(_original_model)
+
+                    for (_tc_id, _result), _tc in zip(_pair_results, batch):
+                        self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
+                        await _emit_tool_done("spawn_agent", _tc_id, _result)
 
                 # If any state-changing tool ran in this iteration, the world has changed —
                 # reset loop-detection counts so a legitimate re-run isn't blocked.
@@ -2543,28 +2826,53 @@ class ChatSession:
                         await _emit_tool_done(_tc_name, tc["id"], _warn)
                         continue
 
-                    if tc["function"]["name"] in _READ_ONLY_TOOLS:
+                    if _tc_name in _READ_ONLY_TOOLS:
                         _batch.append(tc)
+                    elif _tc_name == "spawn_agent":
+                        _agent_batch.append(tc)
                     else:
-                        # Flush pending reads in parallel first
+                        # Write op: flush pending reads and agents first
                         if _batch:
                             _results = await asyncio.gather(*[_run_one(t) for t in _batch])
                             for _bt, (_tc_id, _result) in zip(_batch, _results):
                                 self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
                                 await _emit_tool_done(_bt["function"]["name"], _tc_id, _result)
                             _batch = []
-                        # Then run the write op sequentially
-                        _tc_id, _result = await _run_one(tc)
-                        self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
-                        await _emit_tool_done(tc["function"]["name"], _tc_id, _result)
+                        if _agent_batch:
+                            await _flush_agent_batch(_agent_batch)
+                            _agent_batch = []
+                        # Then run the write op sequentially (with file write locking)
+                        try:
+                            _wl_args = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else (tc["function"]["arguments"] or {})
+                        except Exception:
+                            _wl_args = {}
+                        _wl_path = _extract_write_path(_tc_name, _wl_args)
+                        _wl_abs = os.path.abspath(_wl_path) if _wl_path else None
+                        if _wl_abs and _wl_abs in self._write_locks:
+                            _tc_id = tc["id"]
+                            _result = f"[error: '{os.path.basename(_wl_abs)}' is currently locked for writing by {self._write_locks[_wl_abs]} — retry after it finishes]"
+                            self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
+                            await _emit_tool_done(_tc_name, _tc_id, _result)
+                        else:
+                            if _wl_abs:
+                                self._write_locks[_wl_abs] = "Eli"
+                            try:
+                                _tc_id, _result = await _run_one(tc)
+                                self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
+                                await _emit_tool_done(tc["function"]["name"], _tc_id, _result)
+                            finally:
+                                if _wl_abs:
+                                    self._write_locks.pop(_wl_abs, None)
                         if _result.startswith(_GATE_REJECTED_PREFIX):
                             _gate_rejected = True
-                # Flush any remaining reads (only if not rejected)
+                # Flush any remaining reads and agents (only if not rejected)
                 if _batch and not _gate_rejected:
                     _results = await asyncio.gather(*[_run_one(t) for t in _batch])
                     for _bt, (_tc_id, _result) in zip(_batch, _results):
                         self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
                         await _emit_tool_done(_bt["function"]["name"], _tc_id, _result)
+                if _agent_batch and not _gate_rejected:
+                    await _flush_agent_batch(_agent_batch)
                 # Loop: send tool results back to model
                 continue
             else:
@@ -2744,7 +3052,7 @@ class ChatSession:
                     args.get("checked"),
                 )
             elif name == "spawn_agent":
-                if self._in_subagent:
+                if self._subagent_depth > 0:
                     return "[error: nested sub-agent spawning is not allowed]"
                 return await self._tool_spawn_agent(
                     args.get("system_prompt", ""),
@@ -2755,12 +3063,12 @@ class ChatSession:
                     args.get("model"),
                 )
             elif name == "analyze_image":
-                if self._in_subagent:
+                if self._subagent_depth > 0:
                     return "[error: analyze_image not available inside sub-agents]"
                 images = args.get("images") or ([args["image_path"]] if args.get("image_path") else [])
                 return await self._tool_analyze_image(images, args.get("prompt"))
             elif name == "queue_agents":
-                if self._in_subagent:
+                if self._subagent_depth > 0:
                     return "[error: queue_agents not available inside sub-agents]"
                 return await self._tool_queue_agents(
                     args.get("agents", []),
@@ -2801,22 +3109,25 @@ class ChatSession:
         think_level: str | None = None,
         max_iterations: int = 10,
         model: str | None = None,
+        agent_label: str = "",
+        current_model_hint: str | None = None,
+        _is_background: bool = False,
     ) -> str:
-        """Run an isolated sub-agent loop and return its final text response."""
-        if self._in_subagent:
-            return "[error: nested sub-agent spawning is not allowed]"
+        """Run an isolated sub-agent loop and return its final text response.
+
+        agent_label: display label for the Agent tab (e.g. "Agent 1"). Empty = unlabeled.
+        current_model_hint: pre-fetched active profile name; skips _find_active_profile() call.
+        """
+        # Increment depth immediately before any await so parallel gather is safe
+        self._subagent_depth += 1
 
         # Resolve profile name → system prompt, and auto-extract recommended model
         if system_prompt and " " not in system_prompt.strip():
-            profile_path = Path(__file__).parent / "agents" / f"{system_prompt}.md"
-            if profile_path.exists():
-                system_prompt = profile_path.read_text(encoding="utf-8")
-                # Use the profile's recommended model if caller didn't specify one
-                if not model:
-                    _m = _re.search(r'\*\*Recommended model:\*\*\s*`([^`]+)`', system_prompt)
-                    if _m:
-                        model = _m.group(1).strip()
-            # If not found, use the string as-is (may be a short raw prompt)
+            profile = _load_agent_profile(system_prompt)
+            system_prompt = profile["prompt"]
+            if not model:
+                model = profile.get("model")
+        # If not found, use the string as-is (may be a short raw prompt)
 
         # Build tool list — always exclude spawn_agent from sub-agents
         sub_tools = [t for t in TOOLS if t["function"]["name"] != "spawn_agent"]
@@ -2835,24 +3146,26 @@ class ChatSession:
                 if not self.tui_queue:
                     console.print(f"[dim yellow]⚠ unknown model '{model}' — using current model. Available: {available}[/dim yellow]")
                 model = None
-            # Capture what's running now so we can restore it afterward
-            restore_profile = await _find_active_profile()
-            if restore_profile == model:
-                # Already on the right model — no switch needed, no restore needed
-                restore_profile = None
-                if not self.tui_queue:
-                    console.print(f"[dim]  Model already loaded: {model}[/dim]")
-            else:
-                if not self.tui_queue:
-                    console.print(Panel(
-                        f"[yellow]Switching server to:[/yellow] {model}\n"
-                        f"[dim]Will restore '{restore_profile or 'original'}' after agent finishes.[/dim]",
-                        title="[yellow]Model Switch[/yellow]",
-                        border_style="yellow",
-                    ))
-                ready = await _switch_server(model)
-                if not ready:
-                    return f"[error: server failed to start model '{model}' — agent aborted]"
+            if model:
+                # Use hint from parallel batch if provided (avoids redundant API call)
+                active = current_model_hint if current_model_hint is not None else await _find_active_profile()
+                if active == model:
+                    restore_profile = None  # Already on right model
+                    if not self.tui_queue:
+                        console.print(f"[dim]  Model already loaded: {model}[/dim]")
+                else:
+                    restore_profile = active
+                    if not self.tui_queue:
+                        console.print(Panel(
+                            f"[yellow]Switching server to:[/yellow] {model}\n"
+                            f"[dim]Will restore '{restore_profile or 'original'}' after agent finishes.[/dim]",
+                            title="[yellow]Model Switch[/yellow]",
+                            border_style="yellow",
+                        ))
+                    ready = await _switch_server(model)
+                    if not ready:
+                        self._subagent_depth -= 1
+                        return f"[error: server failed to start model '{model}' — agent aborted]"
 
         import datetime as _dt
         _today = _dt.date.today().strftime("%Y-%m-%d")
@@ -2867,19 +3180,30 @@ class ChatSession:
             {"role": "user", "content": task},
         ]
 
+        _label_prefix = f"[{agent_label}] " if agent_label else ""
         if self.tui_queue:
-            await self.tui_queue.put({"type": "system", "text": f"Agent: {task[:200]}{'…' if len(task) > 200 else ''}"})
+            await self.tui_queue.put({"type": "system", "text": f"{_label_prefix}Agent: {task[:200]}{'…' if len(task) > 200 else ''}", "agent_label": agent_label})
         elif self.compact_mode:
             quote = random.choice(COMPACT_QUOTES)
             console.print(f"[dim cyan]  ◌ {quote}[/dim cyan]")
         else:
+            title_suffix = f" [{agent_label}]" if agent_label else ""
             console.print(Panel(
                 f"[bold cyan]Task:[/bold cyan] {task[:300]}{'...' if len(task) > 300 else ''}",
-                title="[cyan]Sub-Agent Spawned[/cyan]",
+                title=f"[cyan]Sub-Agent Spawned{title_suffix}[/cyan]",
                 border_style="cyan",
             ))
 
-        self._in_subagent = True
+        # Acquire inference slot — inline agents use no timeout; background agents use 15 min.
+        _slot_label = (f"{'Background' if _is_background else 'In-Line'} Agent"
+                       + (f" [{agent_label}]" if agent_label else ""))
+        _slot = await _ism.acquire(_slot_label, timeout_secs=900.0 if _is_background else None)
+        if _is_background:
+            _slot.task = asyncio.current_task()
+        if self.tui_queue:
+            await self.tui_queue.put({"type": "system",
+                "text": f"{_slot_label} using Slot {_slot.index + 1}"})
+
         final_text = ""
         _hit_max_iter = True  # cleared when agent breaks naturally
         try:
@@ -2937,7 +3261,7 @@ class ChatSession:
                                     text_buf += data
                                     assistant_content += data
                                     final_text = assistant_content
-                                    await self.tui_queue.put({"type": "text_token", "text": data, "source": "agent"})
+                                    await self.tui_queue.put({"type": "text_token", "text": data, "source": "agent", "agent_label": agent_label})
                                 else:
                                     if thinking_buf and show_thinking:
                                         live.update(Text(""))
@@ -2963,7 +3287,7 @@ class ChatSession:
                                     live.update(Text(""))
                             elif event_type == "stop":
                                 if self.tui_queue:
-                                    await self.tui_queue.put({"type": "text_done", "text": text_buf, "source": "agent"})
+                                    await self.tui_queue.put({"type": "text_done", "text": text_buf, "source": "agent", "agent_label": agent_label})
                                 elif text_buf:
                                     live.update(Panel(
                                         Markdown(text_buf),
@@ -3065,7 +3389,19 @@ class ChatSession:
                                 self.session_rules.append(_sa_notes[len("session_allow:"):])
                             elif _sa_notes:
                                 self._approval_notes = _sa_notes
-                        tc_result = await self._dispatch_tool(tc_name, tc_args)
+                        # File write lock check for structured write tools
+                        _ag_wl_path = _extract_write_path(tc_name, tc_args)
+                        _ag_wl_abs = os.path.abspath(_ag_wl_path) if _ag_wl_path else None
+                        if _ag_wl_abs and _ag_wl_abs in self._write_locks:
+                            tc_result = f"[error: '{os.path.basename(_ag_wl_abs)}' is currently locked for writing by {self._write_locks[_ag_wl_abs]} — retry after it finishes]"
+                        else:
+                            if _ag_wl_abs:
+                                self._write_locks[_ag_wl_abs] = agent_label or "agent"
+                            try:
+                                tc_result = await self._dispatch_tool(tc_name, tc_args)
+                            finally:
+                                if _ag_wl_abs:
+                                    self._write_locks.pop(_ag_wl_abs, None)
                         if self._approval_notes:
                             tc_result += f"\n[Note from user: {self._approval_notes}]"
                             self._approval_notes = ""
@@ -3138,7 +3474,11 @@ class ChatSession:
                         messages.append({"role": "assistant", "content": assistant_content})
                     break
         finally:
-            self._in_subagent = False
+            self._subagent_depth -= 1
+            if self.tui_queue:
+                await self.tui_queue.put({"type": "system",
+                    "text": f"Releasing Slot {_slot.index + 1} ({_slot_label})"})
+            await _slot.release()
 
             # Graceful summarise — always attempt when:
             #   (a) agent produced no text output at all, or
@@ -3185,7 +3525,7 @@ class ChatSession:
                             if ev_type == "text":
                                 final_text += ev_data
                                 if self.tui_queue:
-                                    await self.tui_queue.put({"type": "text_token", "text": ev_data, "source": "agent"})
+                                    await self.tui_queue.put({"type": "text_token", "text": ev_data, "source": "agent", "agent_label": agent_label})
                 except Exception:
                     pass  # best-effort only
 
@@ -3385,7 +3725,7 @@ class ChatSession:
             start_t = loop.time()
             agent_status = "completed"
             final_text = ""
-            self._in_subagent = True
+            self._subagent_depth += 1
             try:
                 deadline = loop.time() + timeout_s
                 for _iter in range(max_iter):
@@ -3494,7 +3834,7 @@ class ChatSession:
                 agent_status = "error"
                 final_text = final_text or f"[error during agent execution: {e}]"
             finally:
-                self._in_subagent = False
+                self._subagent_depth -= 1
 
             duration = round(loop.time() - start_t, 1)
             status_icon = {"completed": "✓", "timeout": "⏱", "error": "✗"}.get(agent_status, "?")
@@ -4189,6 +4529,14 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         return True
 
     elif name == "/clear":
+        # Cancel background agent tasks and release all ISM slots
+        for _t in list(session._bg_agent_tasks):
+            if not _t.done():
+                _t.cancel()
+        session._bg_agent_tasks.clear()
+        session._pending_bg_results.clear()
+        session._pending_bg_tool_calls.clear()
+        await _ism.force_release_all()
         _initial, _ = _build_initial_messages()
         session.messages = _initial
         session._n_fixed = len(_initial)

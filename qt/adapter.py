@@ -331,10 +331,12 @@ class QtChatAdapter(QThread):
     voice_transcript    = Signal(str)
     voice_reply         = Signal(str)
     voice_server_status = Signal(bool)   # True = server reachable, False = local whisper
-    agent_text_token    = Signal(str)    # text from a spawned sub-agent
+    agent_text_token    = Signal(str, str)  # (token, agent_label) from a spawned sub-agent
     remote_message      = Signal(str)    # remote HTTP submission — show bubble in GUI
     open_in_editor      = Signal(str, int)          # path, line — model requests editor navigation
     highlight_in_editor = Signal(str, int, int, int, int)  # path, start_line, end_line, start_col, end_col
+    bg_agents_complete  = Signal(int)    # all background agents finished; count = number that ran
+    slots_updated       = Signal(int, int)  # total_slots, in_use
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -352,6 +354,9 @@ class QtChatAdapter(QThread):
 
         # Remote HTTP bridge — created in run() to avoid binding socket on main thread
         self._remote = None
+
+        # Background agent drain task
+        self._bg_drain_task: asyncio.Task | None = None
 
     # ── Worker thread (asyncio / chat) ───────────────────────────────────────
 
@@ -384,6 +389,11 @@ class QtChatAdapter(QThread):
                 session.input_compress_limit  = int(_state.get("input_compress_limit", 8000))
                 if session._startup_files:
                     self.system_msg.emit("Context loaded:\n" + "\n".join(session._startup_files))
+                # ISM observer — fires on any slot acquire/release and drives the panel
+                from chat import _ism
+                _ism.on_change(lambda: self.slots_updated.emit(_ism.total_slots(), _ism.in_use()))
+                # Emit initial state now — initialize() already ran, observer wasn't connected yet
+                self.slots_updated.emit(_ism.total_slots(), _ism.in_use())
                 while True:
                     item = await self._work_queue.get()
                     if item is None:
@@ -404,8 +414,20 @@ class QtChatAdapter(QThread):
     # ── Per-turn logic ───────────────────────────────────────────────────────
 
     async def _run_turn(self, session: ChatSession, text: str, plan_mode: bool) -> None:
-        while not session.tui_queue.empty():
-            session.tui_queue.get_nowait()
+        # Cancel persistent bg drain if running between turns
+        if self._bg_drain_task and not self._bg_drain_task.done():
+            self._bg_drain_task.cancel()
+            try:
+                await self._bg_drain_task
+            except asyncio.CancelledError:
+                pass
+        self._bg_drain_task = None
+
+        # Flush stale events only when no background agents are running
+        # (skip flush while bg agents are running — their tokens are still arriving)
+        if not session._bg_agent_tasks:
+            while not session.tui_queue.empty():
+                session.tui_queue.get_nowait()
 
         # Quick health probe before touching the session — avoids corrupting history
         # if the server is not up at all.
@@ -418,6 +440,8 @@ class QtChatAdapter(QThread):
             self.done.emit()
             return
 
+        from chat import _ism
+        _eli_slot = await _ism.acquire("Eli", timeout_secs=None)
         try:
             self._stream_task = asyncio.create_task(
                 session.send_and_stream(text, plan_mode=plan_mode)
@@ -441,6 +465,7 @@ class QtChatAdapter(QThread):
             self.error_msg.emit(str(exc))
             self.done.emit()
         finally:
+            await _eli_slot.release()
             self._stream_task = None
             self._cancel_requested = False
 
@@ -519,7 +544,7 @@ class QtChatAdapter(QThread):
                 self.think_token.emit(event["text"])
             elif etype == "text_token":
                 if event.get("source") == "agent":
-                    self.agent_text_token.emit(event["text"])
+                    self.agent_text_token.emit(event["text"], event.get("agent_label", ""))
                 else:
                     self.text_token.emit(event["text"])
             elif etype == "tool_start":
@@ -575,9 +600,54 @@ class QtChatAdapter(QThread):
                     int(event.get("start_col", -1)),
                     int(event.get("end_col", -1)),
                 )
+            elif etype == "bg_agents_complete":
+                self.bg_agents_complete.emit(event.get("count", 0))
             elif etype == "done":
                 self.done.emit()
+                if session._bg_agent_tasks:
+                    self._bg_drain_task = asyncio.create_task(
+                        self._drain_bg_agents(session)
+                    )
                 return
+
+    async def _drain_bg_agents(self, session: "ChatSession") -> None:
+        """Drain tui_queue between turns while background agents are still running."""
+        _completed = 0
+        _cancelled = False
+        try:
+            while session._bg_agent_tasks:
+                try:
+                    event = await asyncio.wait_for(session.tui_queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+                etype = event.get("type")
+                if etype == "text_token" and event.get("source") == "agent":
+                    self.agent_text_token.emit(event["text"], event.get("agent_label", ""))
+                elif etype == "tool_start":
+                    self.tool_start.emit(event.get("id", ""), event.get("name", ""), event.get("args", ""))
+                elif etype == "tool_done":
+                    _completed += 1
+                    self.tool_done.emit(event.get("id", ""), event.get("name", ""),
+                                        event.get("result", ""), bool(event.get("is_error", False)))
+                elif etype == "system":
+                    self.system_msg.emit(event.get("text", ""))
+                elif etype == "approval_request":
+                    self._pending_future = event["future"]
+                    self.approval_needed.emit(
+                        event.get("title", ""),
+                        event.get("message", ""),
+                        event.get("tool_name", ""),
+                        event.get("tool_args_str", ""),
+                    )
+                    await self._pending_future
+                    self._pending_future = None
+        except asyncio.CancelledError:
+            _cancelled = True
+            raise
+        finally:
+            if not _cancelled and _completed:
+                self.bg_agents_complete.emit(_completed)
+            self._bg_drain_task = None
 
     # ── Thread-safe public API (chat) ────────────────────────────────────────
 

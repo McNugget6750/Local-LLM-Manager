@@ -137,20 +137,23 @@ Use agents proactively — do not wait to be asked.
 | Trigger | Agent |
 |---------|-------|
 | Any research question, library choice, technology survey | `researcher` |
+| Generic tasks, quick tests, system/GUI/inference testing | `generic` |
 | Code review of a file or module | `code-review` |
 | Writing unit tests | `test-writer` |
 | Complex multi-file implementation | `code-review` first, then `expert_coder` |
 | Docs, docstrings, README sections | `doc-writer` |
-| New project workflow — Steps 2 and 4 | `researcher` first, `code-review` if code already exists, then `expert_coder` |
+| New project workflow — Steps 2 and 4 | `spawn_agent(researcher)` first; after results arrive: `spawn_agent(code-review)` if code exists, then `spawn_agent(expert_coder)` |
 | Web UI design, layout feedback, CSS/HTML visual critique | `web_designer` |
 | Brand identity, graphics, icons, colour systems, print/digital assets | `graphics_designer` |
 | Game level layout, encounter design, pacing, puzzle design | `level_designer` |
 
-**spawn_agent** — single task. Default max_iterations: 10, hard cap: 30. Set higher for large-project reviews.
+**spawn_agent** — always use this for any single agent task. Also use multiple `spawn_agent` calls in the same response for independent parallel tasks. Default max_iterations: 10, hard cap: 30. Set higher for large-project reviews. **NEVER pass `model=` unless the user explicitly asked to switch models.** Specifying a model disables background mode and forces a slow server switch.
 
-**queue_agents** — multiple tasks, possibly different models, sequential. Timeouts: research 60–120s, small review 180–300s, large review 400–600s, implementation 300–600s.
+**queue_agents** — only when agents must run in strict order AND each agent's output feeds the next (e.g. build → test → deploy pipeline). Never use `queue_agents` for a single agent. Never use it when tasks are independent.
 
 Sub-agents cannot spawn sub-agents. They share cwd and approval_level.
+
+**After a research agent returns:** Present the findings concisely and stop. Do not autonomously dispatch follow-up research, additional agents, or further tool calls unless the user explicitly asks. You may ask one clarifying follow-up question if genuinely needed — then wait. The research agent was tasked to do thorough work; trust it. Be ready for the user's next prompt immediately.
 
 ---
 
