@@ -615,21 +615,19 @@ async def _invoke_skill(skill_name: str, skill_args: str, session: "ChatSession"
                 "result": result,
                 "is_error": is_error,
             })
-        # Feed the report back to Eli via a proper send_and_stream call so it lands in
-        # Eli's message history as a valid user→assistant exchange. This is necessary for:
-        #   (a) Eli to actually read and process the research findings
-        #   (b) tokens_used to update (fixes "0% context" display after research)
-        #   (c) message sequence integrity (avoids back-to-back "assistant" messages)
-        _return_prompt = skill.get("return_prompt") or (
-            "The agent has completed the above report. "
-            "Acknowledge receipt in one sentence only — do NOT summarize. "
-            "The full content is in your context."
-        )
-        await session.send_and_stream(
-            f"[Agent Report — '{skill_name}']\n\n{result}\n\n{_return_prompt}"
-        )
+        # Inject the agent report directly into message history — no model round-trip.
+        # The report lands as a user→assistant exchange so message sequence stays valid
+        # and Eli can reference it in subsequent turns without an "acknowledge receipt" waste.
+        report_text = f"[Agent Report — '{skill_name}']\n\n{result}"
+        session.messages.append({"role": "user", "content": report_text})
+        session.messages.append({"role": "assistant", "content": "Understood. The agent report is in context."})
     else:
-        await session.send_and_stream(expanded)
+        try:
+            await session.send_and_stream(expanded)
+        except Exception as e:
+            console.print(f"[red]Could not send skill to model: {e}[/red]")
+            if session.tui_queue:
+                await session.tui_queue.put({"type": "error", "text": f"Server not reachable: {e}"})
     return True
 
 
@@ -1282,6 +1280,21 @@ class ChatSession(AgentsMixin):
                             await _emit_tool_done(_bt["function"]["name"], _tc_id, _result)
                     if _agent_batch and not _gate_rejected:
                         await self._flush_agent_batch(_agent_batch, _emit_tool_done)
+                    # If every tool call this turn was speak, display the spoken text and
+                    # end the turn — no follow-up model round needed (avoids the model
+                    # hallucinating "(see above)" instead of writing a real response).
+                    _speak_calls = [tc for tc in tool_calls_received
+                                    if tc["function"]["name"] == "speak"]
+                    if _speak_calls and len(_speak_calls) == len(tool_calls_received):
+                        import json as _j
+                        for _stc in _speak_calls:
+                            try:
+                                _spoken = _j.loads(_stc["function"]["arguments"]).get("text", "")
+                            except Exception:
+                                _spoken = ""
+                            if _spoken and self.tui_queue:
+                                await self.tui_queue.put({"type": "text_done", "text": _spoken})
+                        break
                     # Loop: send tool results back to model
                     continue
                 else:

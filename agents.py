@@ -204,6 +204,7 @@ class AgentsMixin:
                 "name": "spawn_agent",
                 "result": result,
                 "is_error": result.startswith(("[error", "[background agent error", "[agent evicted")),
+                "agent_label": label,
             })
 
     async def _flush_agent_batch(self, batch: list, emit_fn: Callable) -> None:

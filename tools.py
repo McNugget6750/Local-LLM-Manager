@@ -8,6 +8,7 @@ import asyncio
 import fnmatch
 import json
 import os
+import re as _re
 import subprocess
 from pathlib import Path
 
@@ -987,7 +988,6 @@ async def tool_edit(path: str, old_string: str, new_string: str) -> str:
 
 def _tts_preprocess(text: str) -> str:
     """Normalise text for TTS: currency, punctuation strip, period → ellipsis."""
-    import re as _re
     # Protect existing ellipses from double-expansion
     text = text.replace("...", "\x00")
     # Currency: $20.45 → 20.45 Dollars
@@ -1014,7 +1014,6 @@ async def tool_speak(text: str) -> str:
 
 
 async def tool_web_fetch(url: str) -> str:
-    import re as _re
     from html.parser import HTMLParser
 
     class _Stripper(HTMLParser):
@@ -1136,7 +1135,6 @@ async def tool_task_list(
     index: int | None = None,
     checked: bool | None = None,
 ) -> str:
-    import re as _re
     p = Path(path)
     if operation == "read":
         if not p.exists():

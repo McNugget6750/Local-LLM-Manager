@@ -498,6 +498,8 @@ class QtChatAdapter(QThread):
         async def _run_and_signal():
             try:
                 await handle_slash_command(cmd, session)
+            except Exception as exc:
+                await session.tui_queue.put({"type": "error", "text": str(exc)})
             finally:
                 await session.tui_queue.put({"type": "done"})
 
@@ -618,6 +620,7 @@ class QtChatAdapter(QThread):
     async def _drain_bg_agents(self, session: "ChatSession") -> None:
         """Drain tui_queue between turns while background agents are still running."""
         _completed = 0
+        _completed_labels: list[str] = []
         _cancelled = False
         try:
             while session._bg_agent_tasks:
@@ -632,6 +635,8 @@ class QtChatAdapter(QThread):
                     self.tool_start.emit(event.get("id", ""), event.get("name", ""), event.get("args", ""))
                 elif etype == "tool_done":
                     _completed += 1
+                    lbl = event.get("agent_label") or f"agent {_completed}"
+                    _completed_labels.append(lbl)
                     self.tool_done.emit(event.get("id", ""), event.get("name", ""),
                                         event.get("result", ""), bool(event.get("is_error", False)))
                 elif etype == "system":
@@ -663,6 +668,16 @@ class QtChatAdapter(QThread):
         finally:
             if not _cancelled and _completed:
                 self.bg_agents_complete.emit(_completed)
+                label_list = ", ".join(f"'{l}'" for l in _completed_labels)
+                noun = "agent" if _completed == 1 else f"{_completed} agents"
+                notification = (
+                    f"[System: Background {noun} completed ({label_list}). "
+                    f"Results are now in context.\n"
+                    f"Check your current task list. If any items were explicitly waiting on "
+                    f"{'this agent' if _completed == 1 else 'these agents'}, proceed with those now. "
+                    f"If nothing was pending, no action is needed.]"
+                )
+                self._work_queue.put_nowait((notification, False))
             self._bg_drain_task = None
 
     # ── Thread-safe public API (chat) ────────────────────────────────────────

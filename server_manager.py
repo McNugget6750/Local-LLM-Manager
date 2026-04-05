@@ -17,6 +17,7 @@ URL           = f"http://localhost:{PORT}"
 HB_INTERVAL   = 300    # full heartbeat every 5 min
 MAX_LOG_LINES = 8000   # trim log when it exceeds this many lines
 COMMANDS_FILE = os.path.join(os.path.dirname(__file__), "commands.json")
+UI_PREFS_FILE = os.path.join(os.path.dirname(__file__), "ui_prefs.json")
 
 MODELS_DEFAULT = {
     "My Model  ·  ?? t/s  ·  Notes": [
@@ -123,6 +124,18 @@ def _load_models():
 def _save_models(models):
     with open(COMMANDS_FILE, "w") as f:
         json.dump(models, f, indent=2)
+
+
+def _load_prefs() -> dict:
+    try:
+        with open(UI_PREFS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_prefs(prefs: dict) -> None:
+    with open(UI_PREFS_FILE, "w") as f:
+        json.dump(prefs, f, indent=2)
 
 
 def _detect_engine(cmd: list) -> str:
@@ -612,7 +625,7 @@ class ServerManager(tk.Tk):
                     continue
 
                 self._write_log(text, tag)
-                if "HTTP server listening" in text:
+                if "HTTP server listening" in text or "server is listening on" in text:
                     self._set_running()
                 elif "model loaded" in text:
                     self._log_put("Model loaded — waiting for HTTP…", "ok")
@@ -795,17 +808,21 @@ class ServerManager(tk.Tk):
         self._cmb_voice.set("")
 
     def _fetch_voices(self) -> None:
-        """Fetch voice list from TTS server and populate the combobox (runs on UI thread)."""
+        """Fetch voice list from TTS server, populate the combobox, restore saved preference."""
         import urllib.request, json as _json
         try:
             with urllib.request.urlopen("http://127.0.0.1:1236/voices", timeout=3) as r:
                 data = _json.loads(r.read())
-            voices  = data.get("voices", [])
-            current = data.get("current", "")
-            if voices:
-                self._cmb_voice["values"] = voices
-                self._cmb_voice.config(state="readonly")
-                self._cmb_voice.set(current if current in voices else voices[0])
+            voices = data.get("voices", [])
+            if not voices:
+                return
+            self._cmb_voice["values"] = voices
+            self._cmb_voice.config(state="readonly")
+            saved = _load_prefs().get("voice")
+            target = saved if saved in voices else voices[0]
+            self._cmb_voice.set(target)
+            # Always apply to server so it matches UI (server resets on restart)
+            threading.Thread(target=self._set_voice_bg, args=(target,), daemon=True).start()
         except Exception as e:
             self._log_put(f"[voice] Could not fetch voice list: {e}", "warn")
 
@@ -815,9 +832,9 @@ class ServerManager(tk.Tk):
         if not raw:
             return
         self._lbl_voice.config(text="switching…")
-        threading.Thread(target=self._set_voice_bg, args=(raw,), daemon=True).start()
+        threading.Thread(target=self._set_voice_bg, args=(raw, True), daemon=True).start()
 
-    def _set_voice_bg(self, voice_id: str) -> None:
+    def _set_voice_bg(self, voice_id: str, save: bool = False) -> None:
         """POST /voice to the TTS server (background thread)."""
         import urllib.request, urllib.parse, json as _json
         try:
@@ -825,6 +842,10 @@ class ServerManager(tk.Tk):
             req = urllib.request.Request(url, data=b"", method="POST")
             with urllib.request.urlopen(req, timeout=30) as r:
                 _json.loads(r.read())
+            if save:
+                prefs = _load_prefs()
+                prefs["voice"] = voice_id
+                _save_prefs(prefs)
             self._log_q.put((f"[voice] Switched to {voice_id}", "ok"))
             self.after(0, lambda: self._lbl_voice.config(text="running"))
         except Exception as e:
