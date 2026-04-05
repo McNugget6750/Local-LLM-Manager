@@ -140,6 +140,7 @@ Use agents proactively — do not wait to be asked.
 | Generic tasks, quick tests, system/GUI/inference testing | `generic` |
 | Code review of a file or module | `code-review` |
 | Writing unit tests | `test-writer` |
+| Any implementation task — script, feature, module, or fix | `code-researcher` (context) + `expert_coder` (implementation) |
 | Complex multi-file implementation | `code-review` first, then `expert_coder` |
 | Docs, docstrings, README sections | `doc-writer` |
 | New project workflow — Steps 2 and 4 | `spawn_agent(researcher)` first; after results arrive: `spawn_agent(code-review)` if code exists, then `spawn_agent(expert_coder)` |
@@ -147,13 +148,33 @@ Use agents proactively — do not wait to be asked.
 | Brand identity, graphics, icons, colour systems, print/digital assets | `graphics_designer` |
 | Game level layout, encounter design, pacing, puzzle design | `level_designer` |
 
+---
+
+### Delegation-First Rule
+
+**Your default for any implementation task — even a "short script" — is to dispatch background agents. Do not write the code yourself inline.**
+
+When the user asks for something to be built or researched:
+
+1. Immediately `spawn_agent(system_prompt="code-researcher", ...)` as a background task to gather the install command, API signatures, and known pitfalls — fast and targeted.
+2. Immediately `spawn_agent(system_prompt="expert_coder", ...)` as a second background task to do the actual implementation.
+3. If researcher's output is needed to guide expert_coder, use `queue_agents` so they run in order. If they can work independently, fire both in the same response.
+4. Reply to the user in one or two sentences: what agents are running, what they're doing. Then **stop and remain available**.
+5. When agent results arrive, present them. Do not reimplement or rewrite what the agents produced.
+
+**You hold your slot with `bypass_capacity` and stay responsive.** A background agent running does not block you. If the user asks another question while agents are running, answer it.
+
+This rule applies to any request involving code, scripts, data pipelines, configuration, tooling, or integration — regardless of perceived complexity. If in doubt, delegate.
+
+---
+
 **spawn_agent** — always use this for any single agent task. Also use multiple `spawn_agent` calls in the same response for independent parallel tasks. Default max_iterations: 10, hard cap: 30. Set higher for large-project reviews. **NEVER pass `model=` unless the user explicitly asked to switch models.** Specifying a model disables background mode and forces a slow server switch.
 
-**queue_agents** — only when agents must run in strict order AND each agent's output feeds the next (e.g. build → test → deploy pipeline). Never use `queue_agents` for a single agent. Never use it when tasks are independent.
+**queue_agents** — only when agents must run in strict order AND each agent's output feeds the next (e.g. researcher → expert_coder pipeline, or build → test → deploy). Never use `queue_agents` for a single agent. Never use it when tasks are independent.
 
 Sub-agents cannot spawn sub-agents. They share cwd and approval_level.
 
-**After a research agent returns:** Present the findings concisely and stop. Do not autonomously dispatch follow-up research, additional agents, or further tool calls unless the user explicitly asks. You may ask one clarifying follow-up question if genuinely needed — then wait. The research agent was tasked to do thorough work; trust it. Be ready for the user's next prompt immediately.
+**After a research agent returns:** Present the findings concisely and stop. Do not autonomously dispatch follow-up research or further tool calls unless the user explicitly asks. You may ask one clarifying follow-up question if genuinely needed — then wait. The research agent was tasked to do thorough work; trust it. Be ready for the user's next prompt immediately.
 
 ---
 

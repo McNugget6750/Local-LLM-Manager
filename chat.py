@@ -34,7 +34,6 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
-from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.markup import escape as markup_escape
@@ -42,15 +41,15 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-BASE_URL     = "http://localhost:1234"
-CONTROL_URL  = "http://localhost:1235"   # server_manager.py control API
-TTS_URL      = "http://127.0.0.1:1236"  # eli_server TTS + transcribe
+# ── Constants & shared resources ─────────────────────────────────────────────
+from constants import BASE_URL, CONTROL_URL, TTS_URL, console
 MODEL = "auto"
 
-# ── Inference Slot Manager ────────────────────────────────────────────────────
-from slot_manager import SlotManager, SlotHandle, _NullContext
-_ism = SlotManager(base_url=BASE_URL)
+# ── Agents, slot manager, and server control ─────────────────────────────────
+from agents import (
+    AgentsMixin, _ism,
+    _control, _find_active_profile, _extract_write_path, _switch_server,
+)
 
 # ── Tool announce fallback (shown when model emits no text before first tool call) ──
 _TOOL_STATUS = {
@@ -75,224 +74,12 @@ def _tool_announce(tool_calls: list) -> str:
         return _TOOL_STATUS.get(names[0], f"{names[0]}…")
     return "  /  ".join(_TOOL_STATUS.get(n, f"{n}…") for n in names)
 
-# ── Voice mode config ──────────────────────────────────────────────────────────
-PTT_KEY          = "scroll_lock"   # pynput Key name or single char
-VOICE_DEFAULT_MODE = "ptt"         # "ptt" or "auto"
-VOICE_SAMPLE_RATE     = 16000  # Hz — must match what /transcribe expects
-VOICE_SILENCE_TIMEOUT = 2.5    # seconds of silence before auto-send (auto mode)
-VOICE_MIN_SPEECH_MS   = 500    # ms of speech required before transcribing (auto mode)
-VOICE_RMS_THRESHOLD      = 650  # int16 RMS below this is ignored even if VAD says speech
-VOICE_ONSET_FRAMES       = 2    # consecutive speech frames required before recording starts
-VOICE_POST_TTS_DELAY  = 0.6    # seconds to wait after TTS finishes before listening again
-
-VOICE_SYSTEM_PROMPT = """You are a sharp, engaged conversational partner.
-You're a colleague and friend — not an assistant, not a tool.
-
-Rules:
-- Respond in 2–4 sentences. You're in a voice conversation — keep it tight.
-- Challenge ideas. Push back when something seems off. Ask the one question
-  that cuts to the core of the matter.
-- No preamble. No affirmations. Just engage directly with what was said.
-- Think out loud with the person. Build on their idea or dismantle it.
-- When you need to go deeper, do — but never ramble.
-- No lists, no bullet points. Spoken prose only.
-"""
-
-def _vision_url() -> str:
-    """Read vision server URL from commands.json _meta, fallback to localhost:1236."""
-    return _load_commands_meta().get("vision_url", "http://localhost:1236")
-
-def _load_system_prompt() -> str:
-    eli_md = Path(__file__).parent / "ELI.md"
-    if eli_md.exists():
-        return eli_md.read_text(encoding="utf-8")
-    # Fallback if ELI.md is missing
-    return (
-        "You are Eli, a local AI coding assistant running on Qwen3. "
-        "You have access to tools: bash, read_file, write_file, edit, list_dir, glob, grep, web_fetch, web_search. "
-        "Use them proactively. Prefer edit over write_file. Be concise and direct."
-    )
-
-SYSTEM_PROMPT = _load_system_prompt()
-
-def _load_memory() -> str | None:
-    mem = Path(__file__).parent / "MEMORY.md"
-    if mem.exists():
-        return mem.read_text(encoding="utf-8")
-    return None
-
-def _load_commands() -> dict:
-    """Load model profiles from commands.json. Skips meta keys (starting with _)."""
-    commands_file = Path(__file__).parent / "commands.json"
-    if not commands_file.exists():
-        return {}
-    try:
-        data = json.loads(commands_file.read_text(encoding="utf-8"))
-        return {k: v for k, v in data.items() if not k.startswith("_") and isinstance(v, list)}
-    except Exception:
-        return {}
-
-def _load_commands_meta() -> dict:
-    """Load the _meta block from commands.json (profile descriptions, vision_url, etc.)."""
-    commands_file = Path(__file__).parent / "commands.json"
-    if not commands_file.exists():
-        return {}
-    try:
-        data = json.loads(commands_file.read_text(encoding="utf-8"))
-        return data.get("_meta", {})
-    except Exception:
-        return {}
-
-def _build_model_context() -> str | None:
-    """Format available model profiles + descriptions as a system message for injection at startup."""
-    commands = _load_commands()
-    meta = _load_commands_meta()
-    if not commands:
-        return None
-    profiles_meta = meta.get("profiles", {})
-    vision_url = meta.get("vision_url", "")
-    lines = ["[Available Model Profiles — commands.json]", ""]
-    lines.append("Use these profile names exactly when calling spawn_agent(model=...) or queue_agents(agents=[{model: ...}]).")
-    lines.append("")
-    for name in commands:
-        m = profiles_meta.get(name, {})
-        lines.append(f"• {name}")
-        if m.get("description"):
-            lines.append(f"  {m['description']}")
-        if m.get("strengths"):
-            lines.append(f"  Strengths: {m['strengths']}")
-        if m.get("weaknesses"):
-            lines.append(f"  Weaknesses: {m['weaknesses']}")
-        if m.get("speed"):
-            lines.append(f"  Speed: {m['speed']}")
-        if m.get("vision"):
-            lines.append(f"  Vision: yes")
-        lines.append("")
-    if vision_url:
-        lines.append(f"Vision API: {vision_url}  (use analyze_image tool for image analysis)")
-    return "\n".join(lines).strip()
-
-def _load_agent_profile(name: str) -> dict:
-    """Load an agent profile .md and return {prompt, write_domains, read_domains, model}.
-
-    If `name` contains whitespace it is treated as a raw inline prompt (no file lookup).
-    Domain fields are parsed from YAML frontmatter:  write_domains: [a, b]
-    """
-    if " " in name.strip():
-        # Raw inline prompt — unknown domains, conservative
-        _m = _re.search(r'\*\*Recommended model:\*\*\s*`([^`]+)`', name)
-        return {"prompt": name, "write_domains": [], "read_domains": [], "model": _m.group(1).strip() if _m else None}
-    profile_path = Path(__file__).parent / "agents" / f"{name}.md"
-    if not profile_path.exists():
-        return {"prompt": name, "write_domains": [], "read_domains": [], "model": None}
-    text = profile_path.read_text(encoding="utf-8")
-    result: dict = {"prompt": text, "write_domains": [], "read_domains": [], "model": None}
-    if text.startswith("---"):
-        end = text.find("\n---", 3)
-        if end != -1:
-            fm_block = text[3:end]
-            for field in ("write_domains", "read_domains"):
-                m = _re.search(rf'^{field}:\s*\[([^\]]*)\]', fm_block, _re.MULTILINE)
-                if m:
-                    result[field] = [d.strip() for d in m.group(1).split(",") if d.strip()]
-            result["prompt"] = text[end + 4:].strip()
-    _m = _re.search(r'\*\*Recommended model:\*\*\s*`([^`]+)`', result["prompt"])
-    if _m:
-        result["model"] = _m.group(1).strip()
-    return result
-
-
-def _can_run_parallel(profile_a: dict, profile_b: dict) -> bool:
-    """Return True if two agent profiles have no write/read domain conflicts."""
-    aw = set(profile_a.get("write_domains", []))
-    bw = set(profile_b.get("write_domains", []))
-    ar = set(profile_a.get("read_domains", []))
-    br = set(profile_b.get("read_domains", []))
-    return not (aw & bw) and not (aw & br) and not (bw & ar)
-
-
-def _all_can_parallel(profiles: list[dict]) -> bool:
-    """Return True if every pair of profiles can run concurrently."""
-    for i in range(len(profiles)):
-        for j in range(i + 1, len(profiles)):
-            if not _can_run_parallel(profiles[i], profiles[j]):
-                return False
-    return True
-
-
-async def _control(method: str, path: str, body: dict | None = None) -> dict | None:
-    """Call the server_manager control API. Returns parsed JSON or None on failure."""
-    try:
-        async with httpx.AsyncClient() as c:
-            if method == "GET":
-                r = await c.get(f"{CONTROL_URL}{path}", timeout=5)
-            else:
-                r = await c.post(f"{CONTROL_URL}{path}", json=body or {}, timeout=5)
-            return r.json()
-    except Exception:
-        return None
-
-async def _find_active_profile() -> str | None:
-    """Ask server_manager which profile is currently running. Returns profile name or None."""
-    data = await _control("GET", "/api/status")
-    if data and data.get("running") and data.get("model"):
-        return data["model"]
-    return None
-
-
-def _extract_write_path(tc_name: str, tc_args: dict) -> str | None:
-    """Return the file path being written for structured write tools, or None."""
-    if tc_name in ("edit", "write_file"):
-        return tc_args.get("file_path") or tc_args.get("path")
-    return None
-
-async def _switch_server(profile: str, timeout: int = 120) -> bool:
-    """Ask server_manager to switch to a named profile and wait until the server is healthy.
-
-    Flow: POST /api/stop → poll until server goes down → POST /api/start →
-          poll /health until the new model is accepting requests.
-    """
-    # 1. Stop
-    console.print(f"[dim yellow]  Requesting stop via Server Manager...[/dim yellow]")
-    result = await _control("POST", "/api/stop")
-    if result is None:
-        console.print("[red]  Server Manager not reachable on port 1235. Is it running?[/red]")
-        return False
-
-    # 2. Wait for server to go down (max 30 s)
-    for i in range(30):
-        await asyncio.sleep(1)
-        try:
-            async with httpx.AsyncClient() as probe:
-                await probe.get(f"{BASE_URL}/health", timeout=1)
-        except Exception:
-            break  # connection refused — server is down
-    else:
-        console.print("[dim yellow]  Server still up after 30 s, continuing anyway...[/dim yellow]")
-    await asyncio.sleep(1)  # brief settle
-
-    # 3. Start the requested profile
-    console.print(f"[dim yellow]  Requesting start: {profile}[/dim yellow]")
-    result = await _control("POST", "/api/start", {"profile": profile})
-    if result is None or "error" in result:
-        err = result.get("error", "unknown error") if result else "no response"
-        console.print(f"[red]  Start failed: {err}[/red]")
-        return False
-
-    # 4. Poll until healthy
-    for i in range(timeout):
-        await asyncio.sleep(1)
-        try:
-            async with httpx.AsyncClient() as probe:
-                r = await probe.get(f"{BASE_URL}/health", timeout=2)
-                if r.status_code == 200:
-                    console.print(f"[dim green]  Server ready after {i + 1}s[/dim green]")
-                    return True
-        except Exception:
-            pass
-    console.print(f"[red]  Server failed to become healthy within {timeout}s[/red]")
-    return False
-
+from profiles import (
+    _vision_url, _load_system_prompt, _load_memory, _load_commands,
+    _load_commands_meta, _build_model_context, _load_agent_profile,
+    _can_run_parallel, _all_can_parallel, _load_project_config,
+    _format_project_config, SYSTEM_PROMPT,
+)
 
 
 def _build_initial_messages() -> tuple[list[dict], list[str]]:
@@ -312,51 +99,6 @@ def _build_initial_messages() -> tuple[list[dict], list[str]]:
 
     console.print(f"[dim]Context loaded: {', '.join(loaded_paths)}[/dim]")
     return msgs, loaded_paths
-
-def _load_project_config(cwd: Path) -> dict:
-    """Walk up from cwd looking for eli.toml (up to 10 levels). Returns {} if not found."""
-    try:
-        import tomllib as _tomllib
-    except ImportError:
-        return {}
-    path = cwd
-    for _ in range(10):
-        candidate = path / "eli.toml"
-        if candidate.exists():
-            try:
-                return _tomllib.loads(candidate.read_text(encoding="utf-8"))
-            except Exception:
-                return {}
-        parent = path.parent
-        if parent == path:
-            break
-        path = parent
-    return {}
-
-
-def _format_project_config(config: dict) -> str:
-    """Format eli.toml contents as a system message string."""
-    lines = ["[Project Config — eli.toml]"]
-    project = config.get("project", {})
-    if project.get("name"):
-        lines.append(f"Project: {project['name']}")
-    build = config.get("build", {})
-    if build.get("command"):
-        cwd_note = f"  (cwd: {build['cwd']})" if build.get("cwd") else ""
-        lines.append(f"Build: {build['command']}{cwd_note}")
-    test_cfg = config.get("test", {})
-    if test_cfg.get("command"):
-        cwd_note = f"  (cwd: {test_cfg['cwd']})" if test_cfg.get("cwd") else ""
-        lines.append(f"Test: {test_cfg['command']}{cwd_note}")
-    tools = config.get("tools", {})
-    for k, v in tools.items():
-        lines.append(f"{k}: {v}")
-    hooks = config.get("hooks", {})
-    if hooks:
-        hook_parts = [f"{pat} → {action}" for pat, action in hooks.items()]
-        lines.append(f"Hooks: {' | '.join(hook_parts)}")
-    return "\n".join(lines)
-
 
 # ── Session persistence ───────────────────────────────────────────────────────
 def _session_token_estimate(messages: list[dict]) -> int:
@@ -449,423 +191,16 @@ SESSIONS_DIR = Path(__file__).parent / "sessions"
 STATE_FILE   = SESSIONS_DIR / "state.json"
 MAX_SESSIONS = 10
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": (
-                "Run a shell command and return combined stdout+stderr. "
-                "The working directory defaults to the session cwd. "
-                "Use the 'cwd' parameter to run in a different directory — "
-                "prefer this over 'cd X && command' to avoid venv path confusion."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string",  "description": "Shell command to execute"},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)"},
-                    "cwd":     {"type": "string",  "description": "Working directory for this command (absolute path)"},
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": (
-                "Read and return the contents of a file with line numbers. "
-                "Use offset and limit to read a specific range of lines (1-based). "
-                "Line numbers are shown as '  N | content' — do NOT include them in old_string when editing."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path":   {"type": "string",  "description": "File path to read"},
-                    "offset": {"type": "integer", "description": "First line to read, 1-based (default: 1)"},
-                    "limit":  {"type": "integer", "description": "Maximum number of lines to return (default: 200)"},
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Write content to a file, creating parent directories as needed.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "File path to write"},
-                    "content": {"type": "string", "description": "Content to write"},
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_dir",
-            "description": "List contents of a directory.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Directory path (default: current dir)"},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "glob",
-            "description": "Find files matching a glob pattern (supports ** for recursive search).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Glob pattern, e.g. '**/*.py'"},
-                    "path": {"type": "string", "description": "Root directory to search from (default: current dir)"},
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "grep",
-            "description": "Search file contents for a regex pattern, optionally filtered by file glob.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Regex pattern to search for"},
-                    "path": {"type": "string", "description": "Directory or file to search (default: current dir)"},
-                    "glob": {"type": "string", "description": "File glob filter, e.g. '*.py' (default: all files)"},
-                    "case_insensitive": {"type": "boolean", "description": "Case-insensitive search (default: false)"},
-                    "context_lines": {"type": "integer", "description": "Lines of context around each match (default: 2)"},
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ripgrep",
-            "description": (
-                "Fast code search using ripgrep (rg). Preferred over grep for large codebases. "
-                "Supports regex, file-type filters, fixed-string search, context lines."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Regex pattern (or literal if fixed_strings=true)"},
-                    "path": {"type": "string", "description": "Directory or file to search (default '.')"},
-                    "glob": {"type": "string", "description": "File glob filter e.g. '*.cpp'"},
-                    "type_filter": {"type": "string", "description": "ripgrep file type e.g. 'cpp', 'py', 'rust'"},
-                    "case_insensitive": {"type": "boolean", "description": "Case-insensitive search"},
-                    "context_lines": {"type": "integer", "description": "Lines of context around matches (default 2)"},
-                    "fixed_strings": {"type": "boolean", "description": "Treat pattern as literal string (-F flag)"},
-                    "max_results": {"type": "integer", "description": "Max matches to return (default 100)"},
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit",
-            "description": "Replace an exact string in a file with new content. Fails if old_string is not found or matches multiple times.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "File path to edit"},
-                    "old_string": {"type": "string", "description": "Exact string to find and replace"},
-                    "new_string": {"type": "string", "description": "Replacement string"},
-                },
-                "required": ["path", "old_string", "new_string"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_fetch",
-            "description": "Fetch a URL and return its content as plain text (HTML is converted to readable text).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "URL to fetch"},
-                },
-                "required": ["url"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the web using DuckDuckGo and return titles, URLs, and snippets.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "max_results": {"type": "integer", "description": "Number of results to return (default: 6)"},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "task_list",
-            "description": "Read, create, or update a TASKS.md task list for tracking multi-step work. Use 'read' to check current tasks, 'create' to start a new list, 'update' to check/uncheck a task by 0-based index.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "operation": {"type": "string", "description": "'read', 'create', or 'update'"},
-                    "path": {"type": "string", "description": "Path to TASKS.md (default: TASKS.md in current dir)"},
-                    "content": {"type": "string", "description": "Full markdown content for 'create' operation"},
-                    "index": {"type": "integer", "description": "0-based task index for 'update' operation"},
-                    "checked": {"type": "boolean", "description": "True to check off, False to uncheck (for 'update')"},
-                },
-                "required": ["operation"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "spawn_agent",
-            "description": (
-                "Spawn a specialized sub-agent and return its result. "
-                "Use for any agent task: code review, documentation, research, test writing. "
-                "Agent profiles: code-review, doc-writer, generic, researcher, test-writer, web_designer. "
-                "Do NOT specify a model unless the user explicitly requested a different one — "
-                "only use profile names listed in the system context (commands.json). "
-                "The server switches automatically and restores the original model when done. "
-                "To run multiple agents concurrently, call spawn_agent multiple times in the "
-                "same response — the system handles parallelisation automatically."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "system_prompt": {
-                        "type": "string",
-                        "description": (
-                            "Agent profile name (e.g. 'code-review') OR a raw system "
-                            "prompt string. If the value contains no whitespace it is "
-                            "treated as a profile name and loaded from agents/<name>.md."
-                        ),
-                    },
-                    "task": {
-                        "type": "string",
-                        "description": "The task to give the agent.",
-                    },
-                    "tools": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional tool whitelist. Omit for all tools except spawn_agent.",
-                    },
-                    "think_level": {
-                        "type": "string",
-                        "description": "Thinking level: 'off', 'on', or 'deep'. Defaults to parent level.",
-                    },
-                    "max_iterations": {
-                        "type": "integer",
-                        "description": "Max tool-use iterations (default 10, hard max 50). Increase for large codebases or deep research — code-review may need 20–30, research 40–50.",
-                    },
-                    "model": {
-                        "type": "string",
-                        "description": (
-                            "Optional model profile name from commands.json to use for this agent. "
-                            "The server switches to this model before the agent runs and restores "
-                            "the original model afterward. Profile names match the keys in commands.json."
-                        ),
-                    },
-                },
-                "required": ["system_prompt", "task"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "analyze_image",
-            "description": (
-                "Send one or more images to the local vision model and return analysis. "
-                "If vision_external is false in commands.json _meta, the server will switch "
-                "to the vision model, process all images in sequence, then restore the text "
-                "model — minimising load/unload cycles. If vision_external is true the vision "
-                "server is assumed always-on (separate machine/GPU) and no switching occurs. "
-                "Use image_path for a single image, or images[] for a batch."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_path": {
-                        "type": "string",
-                        "description": "Path to a single image file (jpg, png, webp). Ignored if images[] is provided.",
-                    },
-                    "images": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of image paths to analyse in sequence. Use this for batch processing.",
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "What to ask about each image. Applied to all images in a batch.",
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "queue_agents",
-            "description": (
-                "ONLY use this for strict ordered pipelines where agent B cannot start until "
-                "agent A has finished and its output is passed forward (e.g. build → test → "
-                "deploy). NEVER use for: a single agent task, research, code review, or any "
-                "independent tasks. For those, always use spawn_agent instead — it runs in "
-                "background mode and does not block the conversation. queue_agents is always "
-                "synchronous and will block the conversation until all agents complete."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "agents": {
-                        "type": "array",
-                        "description": "Ordered list of agent specs to run.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "system_prompt":    {"type": "string", "description": "Agent profile name or raw system prompt."},
-                                "task":             {"type": "string", "description": "Task to give this agent."},
-                                "model":            {"type": "string", "description": "Optional profile name from commands.json. Only set if the user explicitly requested a different model — do not guess or invent model names."},
-                                "timeout_seconds":  {"type": "integer", "description": "Max seconds for this agent (default 300)."},
-                                "tools":            {"type": "array", "items": {"type": "string"}, "description": "Optional tool whitelist."},
-                                "think_level":      {"type": "string", "description": "'off', 'on', or 'deep'."},
-                                "max_iterations":   {"type": "integer", "description": "Max tool-use iterations (default 10, hard max 50). Increase for large codebases or deep research — code-review may need 20–30, research 40–50."},
-                            },
-                            "required": ["system_prompt", "task"],
-                        },
-                    },
-                    "label": {
-                        "type": "string",
-                        "description": "Human-readable label for this queue run (used in filenames and display).",
-                    },
-                },
-                "required": ["agents"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "speak",
-            "description": (
-                "Speak a brief message aloud via the local TTS server. "
-                "Use for: task-done notifications, questions that need the user at the keyboard, "
-                "unexpected blockers. "
-                "Keep to 1–2 short sentences — conversational length. "
-                "Do NOT narrate ongoing work, repeat what is already on screen, or read out long results. "
-                "Formatting rules: substitute '.' with '...' to create natural pauses. "
-                "Only use punctuation from this set: . , ? ! ' "
-                "Write currency as words, e.g. '20.45 Dollars' not '$20.45'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "Text to speak (1–2 sentences max). Use '...' for pauses. Only .,?!' punctuation allowed."},
-                },
-                "required": ["text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "highlight_in_editor",
-            "description": (
-                "Highlight a passage in the GUI editor panel with a yellow background. "
-                "Use this to draw the user's attention to a specific part of the open file — "
-                "e.g. after explaining something, to show exactly which lines you mean. "
-                "The highlight is cleared when the user clicks, sends a message, or the file is edited. "
-                "For a single-line character range, also provide start_col and end_col."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path":       {"type": "string",  "description": "Absolute path to the file (must already be open or openable in the editor)."},
-                    "start_line": {"type": "integer", "description": "First line to highlight (1-based)."},
-                    "end_line":   {"type": "integer", "description": "Last line to highlight (1-based, inclusive)."},
-                    "start_col":  {"type": "integer", "description": "Start column for character-level highlight on a single line (0-based, optional)."},
-                    "end_col":    {"type": "integer", "description": "End column for character-level highlight on a single line (0-based, exclusive, optional)."},
-                },
-                "required": ["path", "start_line", "end_line"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "open_in_editor",
-            "description": (
-                "Open a file in the GUI editor panel and scroll to a specific line. "
-                "Use this when the user asks 'where is X in the code?' or 'can you show me Y?' "
-                "so they can see the relevant location without manually navigating to it. "
-                "The user will be shown a confirmation dialog if the file differs from the one "
-                "currently open."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute path to the file to open."},
-                    "line": {"type": "integer", "description": "1-based line number to scroll to (optional)."},
-                },
-                "required": ["path"],
-            },
-        },
-    },
-]
-
-DANGEROUS_PATTERNS = [
-    # Filesystem destruction
-    "rm -rf",
-    "rmdir /s",
-    "format ",
-    "mkfs",
-    "dd if=",
-    ":(){:|:&};:",
-    "del /f /s /q",
-    # Process termination
-    "taskkill",
-    "kill -9",
-    "kill -sigkill",
-    "pkill",
-    "killall",
-    "stop-process",
-    # Git — irreversible or history-rewriting operations
-    "git push --force",
-    "git push -f ",
-    "git push -f\t",
-    "git reset --hard",
-    "git clean -f",
-    "git checkout -- .",
-    "git restore .",
-    "git rebase -i",
-    "git filter-branch",
-    "git filter-repo",
-]
+from tools import (
+    TOOLS, DANGEROUS_PATTERNS, _GATE_REJECTED_PREFIX,
+    _is_dangerous, _is_install, _is_bare_python, _is_exec,
+    _fmt_tool_args, _matches_session_rule, _build_approval_check,
+    _menu_select, _new_project_path,
+    tool_bash, tool_read_file, tool_write_file, tool_list_dir,
+    tool_glob, tool_grep, tool_ripgrep, tool_edit,
+    _tts_preprocess, tool_speak, tool_web_fetch, tool_web_search,
+    tool_task_list,
+)
 
 # ── Compact mode ──────────────────────────────────────────────────────────────
 COMPACT_QUOTES = [
@@ -905,8 +240,6 @@ class _NullLive:
     def stop(self): pass
     def start(self): pass
 
-
-console = Console()
 
 # ── ToolCallAccumulator ───────────────────────────────────────────────────────
 @dataclass
@@ -1192,742 +525,6 @@ def _try_parse_text_tool_calls(text: str) -> list[dict] | None:
 
     return calls
 
-# ── Tool executors ────────────────────────────────────────────────────────────
-def _is_dangerous(command: str) -> bool:
-    cmd_lower = command.lower()
-    return any(pat in cmd_lower for pat in DANGEROUS_PATTERNS)
-
-# Sentinel returned by gates when the user rejects a tool call.
-# The dispatch loop watches for this prefix and stops the current batch immediately.
-_GATE_REJECTED_PREFIX = "[GATE_REJECTED]"
-
-INSTALL_PATTERNS = [
-    "pip install", "pip3 install", "python -m pip",
-    "npm install", "npm i ", "yarn add", "yarn install",
-    "conda install", "mamba install",
-    "winget install", "choco install", "scoop install",
-    "apt install", "apt-get install", "brew install",
-]
-
-def _is_install(command: str) -> bool:
-    import re
-    cmd_lower = command.lower()
-    if any(pat in cmd_lower for pat in INSTALL_PATTERNS):
-        return True
-    # Also catch venv pip.exe and pip3.exe forms: pip.exe install, pip3.exe install
-    return bool(re.search(r'pip(?:3)?\.exe\s+install', cmd_lower))
-
-def _is_bare_python(command: str) -> bool:
-    """Detect bare python/pip calls that would hit system Python instead of a venv.
-
-    Splits multi-command pipelines on &&, ||, ;, | and checks each segment.
-    Returns True if ANY segment is a bare python/pip invocation.
-
-    Allowed (returns False):
-      - Explicit venv path: .venv/Scripts/python.exe, venv/bin/python, etc.
-      - Venv creation: python -m venv, py -m venv
-      - Non-python commands chained with python-looking segments won't flag
-    """
-    # Executables that go to system Python when unqualified.
-    _BARE_EXES = _re.compile(
-        r'^(?:python3?(?:\.exe)?|pip3?(?:\.exe)?|py)\s',
-        _re.IGNORECASE,
-    )
-    # A path component that identifies an explicit venv.
-    _VENV_PATH = _re.compile(
-        r'[/\\](?:\.venv|venv|env|\.env)[/\\]',
-        _re.IGNORECASE,
-    )
-    # Venv creation — always allowed regardless of other checks.
-    _VENV_CREATE = _re.compile(
-        r'^(?:python3?(?:\.exe)?|py)\s+.*-m\s+venv\b',
-        _re.IGNORECASE,
-    )
-    # Split on shell sequence operators and pipes (crude but sufficient).
-    segments = _re.split(r'&&|\|\||[;|]', command)
-    for raw in segments:
-        seg = raw.strip()
-        if not seg:
-            continue
-        if not _BARE_EXES.match(seg):
-            continue                       # not a python/pip invocation
-        if _VENV_PATH.search(seg):
-            continue                       # qualified with a venv path
-        if _VENV_CREATE.match(seg):
-            continue                       # creating a venv — always allowed
-        return True                        # bare invocation found
-    return False
-
-# Prefixes that are definitely read-only / safe — don't flag as script execution.
-_EXEC_SAFE_PREFIXES = (
-    "cat ", "type ", "grep ", "rg ", "find ", "ls ", "dir ", "echo ",
-    "git ", "code ", "notepad", "cmake ", "ctest ", "make ", "ninja ",
-    "python --version", "python3 --version", ".venv",
-)
-
-def _is_exec(command: str) -> bool:
-    """Detect script/binary execution (.py/.js/.sh/.bat/.ps1/.exe).
-
-    Python/pip interpreters are stripped before the check so that
-    `path/to/.venv/Scripts/python.exe -c "..."` doesn't falsely trigger.
-    """
-    stripped = command.strip()
-    lower = stripped.lower()
-    if any(lower.startswith(ex) for ex in _EXEC_SAFE_PREFIXES):
-        return False
-    # Strip a leading python/pip interpreter token (quoted or bare) before checking.
-    # This prevents the interpreter path itself (.exe) from triggering the gate.
-    candidate = _re.sub(
-        r'^"?[^\s"]*(?:python\d*(?:\.\d+)?|pip\d*)(?:\.exe)?"?\s+',
-        "", stripped, flags=_re.IGNORECASE,
-    )
-    return bool(_re.search(r'\b\S+\.(py|js|sh|bat|ps1|exe)\b', candidate, _re.IGNORECASE))
-
-
-def _fmt_tool_args(name: str, args: dict) -> str:
-    """Format tool args as a human-readable string for approval dialogs."""
-    if not args:
-        return ""
-    # Keys to show first for each tool, in order
-    priority = {
-        "bash":       ["command"],
-        "read_file":  ["path", "file_path", "offset", "limit"],
-        "write_file": ["path", "file_path"],
-        "edit":       ["path", "file_path", "old_string", "new_string"],
-        "glob":       ["pattern", "path"],
-        "grep":       ["pattern", "path"],
-        "list_dir":   ["path"],
-        "web_fetch":  ["url"],
-        "web_search": ["query"],
-        "task_list":  ["operation", "title", "id", "status"],
-    }
-    keys = priority.get(name, [])
-    ordered = [k for k in keys if k in args] + [k for k in args if k not in keys]
-    lines = []
-    for k in ordered:
-        v = args[k]
-        v_str = str(v)
-        if len(v_str) > 200:
-            v_str = v_str[:197] + "..."
-        lines.append(f"{k}: {v_str}")
-    return "\n".join(lines)
-
-
-def _matches_session_rule(name: str, args: dict, rules: list[str]) -> bool:
-    """Return True if this tool call is covered by a session-level allow rule."""
-    path = args.get("path", "")
-    cmd  = args.get("command", "")
-    for rule in rules:
-        if rule.startswith("path_prefix:"):
-            prefix = rule[len("path_prefix:"):]
-            if path and os.path.normcase(path).startswith(os.path.normcase(prefix)):
-                return True
-        elif rule.startswith("cmd_pattern:"):
-            pattern = rule[len("cmd_pattern:"):]
-            if cmd and fnmatch.fnmatch(cmd.strip(), pattern):
-                return True
-        elif rule.startswith("tool:"):
-            tool = rule[len("tool:"):]
-            if name == tool:
-                return True
-    return False
-
-
-def _build_approval_check(
-    name: str,
-    args: dict,
-    approval_level: str,
-    prefix: str = "",
-    session_rules: list[str] | None = None,
-) -> tuple[bool, str, str, str]:
-    """Return (ask_needed, title, message, style) for a tool call approval check.
-
-    `prefix` is prepended to titles (e.g. "Sub-Agent — ") to distinguish sub-agent prompts.
-    Returns ask_needed=False when no approval is required.
-    """
-    if approval_level == "yolo":
-        return False, "", "", "yellow"
-
-    cmd = args.get("command", "") if name == "bash" else ""
-    ask_needed = False
-    ask_title = f"{prefix}Approval Required"
-    ask_msg = ""
-    ask_style = "yellow"
-
-    if name == "bash" and _is_dangerous(cmd):
-        ask_needed = True
-        ask_title = f"{prefix}Warning — Dangerous Command"
-        ask_msg = f"Dangerous command detected:\n\n{_fmt_tool_args(name, args)}"
-        ask_style = "red"
-    elif name == "bash" and _is_install(cmd):
-        ask_needed = True
-        ask_title = f"{prefix}Install Guard"
-        ask_msg = (
-            f"Package install detected:\n\n{_fmt_tool_args(name, args)}\n\n"
-            "Run it? Or install yourself and press Enter when ready."
-        )
-        ask_style = "yellow"
-    elif name == "bash" and approval_level == "auto" and _is_exec(cmd):
-        ask_needed = True
-        ask_title = f"{prefix}Script Execution"
-        ask_msg = f"Script execution detected:\n\n{_fmt_tool_args(name, args)}"
-        ask_style = "yellow"
-    elif approval_level == "ask-all":
-        ask_needed = True
-        ask_title = f"{prefix}Approval Required"
-        ask_msg = f"Tool: {name}\n\n{_fmt_tool_args(name, args)}"
-    elif approval_level == "ask-writes":
-        WRITE_TOOLS = {"bash", "write_file", "edit"}
-        if name in WRITE_TOOLS or (name == "task_list" and args.get("operation") != "read"):
-            ask_needed = True
-            ask_title = f"{prefix}Write Operation — {name}"
-            ask_msg = f"Write operation — {name}:\n\n{_fmt_tool_args(name, args)}"
-
-    # Session rules can suppress non-dangerous prompts (install/exec/ask-writes/ask-all)
-    if ask_needed and ask_style != "red" and session_rules and _matches_session_rule(name, args, session_rules):
-        return False, "", "", "yellow"
-
-    return ask_needed, ask_title, ask_msg, ask_style
-
-
-def _menu_select(options: list[str]) -> int:
-    """Interactive menu: arrow keys or number keys to select. Returns 0-based index."""
-    import sys, os
-
-    n = len(options)
-    selected = 0
-
-    def _render(sel: int, first: bool) -> None:
-        if not first:
-            sys.stdout.write(f"\033[{n}A")   # move cursor up n lines
-        for i, opt in enumerate(options):
-            if i == sel:
-                sys.stdout.write(f"\r\033[2K  \033[1;36m❯ {i + 1}. {opt}\033[0m\n")
-            else:
-                sys.stdout.write(f"\r\033[2K    {i + 1}. {opt}\n")
-        sys.stdout.flush()
-
-    _render(selected, first=True)
-
-    if os.name == "nt":
-        import msvcrt
-        while True:
-            ch = msvcrt.getwch()
-            if ch in ("\r", "\n"):
-                break
-            if ch in ("1", "2", "3"):
-                idx = int(ch) - 1
-                if 0 <= idx < n:
-                    selected = idx
-                    _render(selected, first=False)
-            if ch in ("\xe0", "\x00"):          # escape prefix for arrow keys
-                arrow = msvcrt.getwch()
-                if arrow == "H":                # up arrow
-                    selected = (selected - 1) % n
-                elif arrow == "P":              # down arrow
-                    selected = (selected + 1) % n
-                _render(selected, first=False)
-    else:
-        import tty, termios
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            while True:
-                ch = sys.stdin.read(1)
-                if ch in ("\r", "\n"):
-                    break
-                if ch == "\x03":                # Ctrl+C
-                    raise KeyboardInterrupt
-                if ch in ("1", "2", "3"):
-                    idx = int(ch) - 1
-                    if 0 <= idx < n:
-                        selected = idx
-                        _render(selected, first=False)
-                if ch == "\x1b":
-                    seq = sys.stdin.read(2)
-                    if seq == "[A":             # up arrow
-                        selected = (selected - 1) % n
-                    elif seq == "[B":           # down arrow
-                        selected = (selected + 1) % n
-                    _render(selected, first=False)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-    return selected
-
-
-def _new_project_path(name: str, args: dict, cwd: Path) -> Path | None:
-    """Return the first new directory that would be created, or None.
-
-    Fires on:
-      - bash commands containing 'mkdir' targeting a path that doesn't exist yet
-      - write_file calls whose parent directory doesn't exist yet
-
-    Used to gate new-project scaffolding behind a plan-approval prompt.
-    """
-    if name == "bash":
-        cmd = args.get("command", "")
-        if "mkdir" not in cmd.lower():
-            return None
-        # Extract the first path argument after mkdir (with optional -p / -m flags)
-        m = _re.search(
-            r'\bmkdir\b(?:\s+(?:-[a-zA-Z0-9]+\s+)*)"?([^\s"&|;><]+)"?',
-            cmd,
-        )
-        if not m:
-            return None
-        target = Path(m.group(1).strip('"\''))
-        if not target.is_absolute():
-            target = cwd / target
-        if not target.exists():
-            return target
-    elif name == "write_file":
-        raw = args.get("path", "")
-        if not raw:
-            return None
-        target = Path(raw)
-        if not target.is_absolute():
-            target = cwd / target
-        if not target.parent.exists():
-            return target.parent
-    return None
-
-
-async def tool_bash(command: str, timeout: int = 30, cwd: Path | None = None) -> str:
-    try:
-        effective_cwd = Path(cwd) if cwd else None
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=str(effective_cwd) if effective_cwd else None,
-        )
-        try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            return f"[timeout after {timeout}s]"
-        output = stdout.decode(errors="replace").rstrip()
-        rc = proc.returncode
-        cwd_line = f"[cwd: {effective_cwd}]\n" if effective_cwd else ""
-        if output:
-            return f"{cwd_line}[exit {rc}]\n{output}" if rc != 0 else f"{cwd_line}{output}"
-        else:
-            return f"{cwd_line}(exit {rc})"
-    except Exception as e:
-        return f"[error: {e}]"
-
-
-async def tool_read_file(path: str, offset: int = 1, limit: int = 200) -> str:
-    try:
-        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
-        total = len(lines)
-        start = max(0, offset - 1)          # convert 1-based to 0-based
-        end   = min(total, start + limit)
-        slice_ = lines[start:end]
-        width  = len(str(start + len(slice_)))
-        numbered = "\n".join(f"{start + i + 1:>{width}} | {l}" for i, l in enumerate(slice_))
-        footer = ""
-        if end < total:
-            footer = f"\n... [{total - end} more lines — use offset={end + 1} to continue]"
-        return numbered + footer
-    except Exception as e:
-        return f"[error: {e}]"
-
-
-async def tool_write_file(path: str, content: str) -> str:
-    p = Path(path)
-    if p.exists():
-        old = p.read_text(encoding="utf-8", errors="replace")
-        old_lines = old.splitlines()
-        new_lines = content.splitlines()
-        added = sum(1 for l in new_lines if l not in old_lines)
-        removed = sum(1 for l in old_lines if l not in new_lines)
-        console.print(
-            Panel(
-                f"[cyan]{path}[/cyan]\n[green]+{added} lines[/green]  [red]-{removed} lines[/red]",
-                title="Write Preview",
-                border_style="yellow",
-            )
-        )
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
-        return f"Written {len(content)} chars to {path}"
-    except Exception as e:
-        return f"[error: {e}]"
-
-
-async def tool_list_dir(path: str = ".") -> str:
-    try:
-        p = Path(path)
-        entries = sorted(p.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
-        lines = []
-        for entry in entries:
-            prefix = "[DIR]  " if entry.is_dir() else "       "
-            size = "" if entry.is_dir() else f"  ({entry.stat().st_size:,} bytes)"
-            lines.append(f"{prefix}{entry.name}{size}")
-        return "\n".join(lines) if lines else "(empty directory)"
-    except Exception as e:
-        return f"[error: {e}]"
-
-
-async def tool_glob(pattern: str, path: str = ".") -> str:
-    import fnmatch
-    try:
-        root = Path(path)
-        matches = sorted(root.glob(pattern))
-        if not matches:
-            return "(no matches)"
-        lines = []
-        for m in matches:
-            suffix = "/" if m.is_dir() else f"  ({m.stat().st_size:,} bytes)"
-            lines.append(f"{m.resolve()}{suffix}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"[error: {e}]"
-
-
-async def tool_grep(
-    pattern: str,
-    path: str = ".",
-    glob: str = "**/*",
-    case_insensitive: bool = False,
-    context_lines: int = 2,
-) -> str:
-    import re
-    try:
-        flags = re.IGNORECASE if case_insensitive else 0
-        regex = re.compile(pattern, flags)
-        root = Path(path)
-
-        # If path is a file, search just that file
-        if root.is_file():
-            candidates = [root]
-        else:
-            candidates = [f for f in root.glob(glob) if f.is_file()]
-
-        output_parts: list[str] = []
-        total_matches = 0
-
-        for filepath in sorted(candidates):
-            try:
-                text = filepath.read_text(encoding="utf-8", errors="replace")
-            except Exception:
-                continue
-            lines = text.splitlines()
-            match_lines = [i for i, ln in enumerate(lines) if regex.search(ln)]
-            if not match_lines:
-                continue
-
-            file_parts = [f"── {filepath.resolve()} ──"]
-            shown: set[int] = set()
-            for mi in match_lines:
-                start = max(0, mi - context_lines)
-                end = min(len(lines) - 1, mi + context_lines)
-                for i in range(start, end + 1):
-                    if i not in shown:
-                        prefix = ">" if i == mi else " "
-                        file_parts.append(f"{prefix} {i+1:4}: {lines[i]}")
-                        shown.add(i)
-                if mi != match_lines[-1]:
-                    next_start = max(0, match_lines[match_lines.index(mi) + 1] - context_lines)
-                    if next_start > end + 1:
-                        file_parts.append("   ...")
-            output_parts.append("\n".join(file_parts))
-            total_matches += len(match_lines)
-
-            if total_matches > 200:
-                output_parts.append("[truncated: too many matches]")
-                break
-
-        if not output_parts:
-            return "(no matches)"
-        return f"({total_matches} match{'es' if total_matches != 1 else ''})\n\n" + "\n\n".join(output_parts)
-    except re.error as e:
-        return f"[regex error: {e}]"
-    except Exception as e:
-        return f"[error: {e}]"
-
-
-async def tool_ripgrep(
-    pattern: str,
-    path: str = ".",
-    glob: str | None = None,
-    type_filter: str | None = None,
-    case_insensitive: bool = False,
-    context_lines: int = 2,
-    fixed_strings: bool = False,
-    max_results: int = 100,
-) -> str:
-    args = ["rg", "--line-number", "--no-heading", "--color=never"]
-    if case_insensitive:
-        args.append("-i")
-    if fixed_strings:
-        args.append("-F")
-    if context_lines:
-        args.extend(["-C", str(context_lines)])
-    if glob:
-        args.extend(["--glob", glob])
-    if type_filter:
-        args.extend(["--type", type_filter])
-    if max_results:
-        args.extend(["-m", str(max_results)])
-    args.append(pattern)
-    args.append(path)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        except asyncio.TimeoutError:
-            proc.kill()
-            return "[timeout after 30s]"
-        if proc.returncode == 1:
-            return "(no matches)"
-        if proc.returncode != 0:
-            err = stderr.decode(errors="replace").strip()
-            return f"[error: rg exit {proc.returncode}: {err}]"
-        output = stdout.decode(errors="replace")
-        lines = output.splitlines()
-        if len(lines) > 200:
-            extra = len(lines) - 200
-            return "\n".join(lines[:200]) + f"\n[+{extra} more lines]"
-        return output if output else "(no matches)"
-    except FileNotFoundError:
-        return "[error: ripgrep not installed — install from https://github.com/BurntSushi/ripgrep]"
-    except Exception as e:
-        return f"[error: {e}]"
-
-
-async def tool_edit(path: str, old_string: str, new_string: str) -> str:
-    try:
-        p = Path(path)
-        if not p.exists():
-            return f"[error: file not found: {path}]"
-        text = p.read_text(encoding="utf-8", errors="replace")
-        count = text.count(old_string)
-        if count == 0:
-            # Give the model a fuzzy hint: find the line in the file most similar to
-            # the first line of old_string so it can correct its old_string.
-            import difflib as _difflib
-            target_first = old_string.splitlines()[0].strip() if old_string.strip() else ""
-            file_lines = text.splitlines()
-            if target_first:
-                matches = _difflib.get_close_matches(target_first, file_lines, n=3, cutoff=0.4)
-                if matches:
-                    hint = "\n".join(f"  {m!r}" for m in matches)
-                    return (
-                        "[error: old_string not found in file]\n"
-                        f"Closest lines in file (use read_file to get exact content):\n{hint}"
-                    )
-            return "[error: old_string not found — use read_file to get the exact content before editing]"
-        if count > 1:
-            return f"[error: old_string found {count} times — make it more specific]"
-        new_text = text.replace(old_string, new_string, 1)
-        p.write_text(new_text, encoding="utf-8")
-        import difflib as _difflib
-        diff = list(_difflib.unified_diff(
-            old_string.splitlines(keepends=False),
-            new_string.splitlines(keepends=False),
-            fromfile=f"a/{p.name}",
-            tofile=f"b/{p.name}",
-            lineterm="",
-        ))
-        if diff:
-            return "\n".join(diff)
-        return f"Edited {p.name}: applied (whitespace-only change)"
-    except Exception as e:
-        return f"[error: {e}]"
-
-
-def _tts_preprocess(text: str) -> str:
-    """Normalise text for TTS: currency, punctuation strip, period → ellipsis."""
-    import re as _re
-    # Protect existing ellipses from double-expansion
-    text = text.replace("...", "\x00")
-    # Currency: $20.45 → 20.45 Dollars
-    text = _re.sub(r"\$(\d+(?:\.\d+)?)", r"\1 Dollars", text)
-    # Strip anything not in the allowed set (letters, digits, space, .,?!', placeholder)
-    text = _re.sub(r"[^a-zA-Z0-9 .,?!'\x00]", " ", text)
-    # Expand sentence-ending periods to ellipses (not decimal points between digits)
-    text = _re.sub(r"(?<!\d)\.(?!\d)", "...", text)
-    # Restore protected ellipses
-    text = text.replace("\x00", "...")
-    # Collapse runs of spaces
-    text = _re.sub(r" {2,}", " ", text).strip()
-    return text
-
-
-async def tool_speak(text: str) -> str:
-    text = _tts_preprocess(text)
-    try:
-        async with httpx.AsyncClient() as c:
-            r = await c.post("http://127.0.0.1:1236/play", json={"text": text}, timeout=30)
-        return "spoken" if r.is_success else f"[voice error: {r.status_code}]"
-    except Exception as e:
-        return f"[voice unavailable: {e}]"
-
-
-async def tool_web_fetch(url: str) -> str:
-    import re as _re
-    from html.parser import HTMLParser
-
-    class _Stripper(HTMLParser):
-        # Tags whose entire subtree is discarded (chrome, boilerplate)
-        SKIP_TAGS = {
-            "script", "style", "head", "noscript",
-            "nav", "header", "footer", "aside",
-            "form", "menu", "menuitem", "banner",
-        }
-        # Tags that introduce a line break in the output
-        BLOCK_TAGS = {"p", "br", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "dt", "dd"}
-
-        def __init__(self):
-            super().__init__()
-            self.parts: list[str] = []
-            self._skip = 0
-
-        def handle_starttag(self, tag, attrs):
-            if tag in self.SKIP_TAGS:
-                self._skip += 1
-            if not self._skip and tag in self.BLOCK_TAGS:
-                self.parts.append("\n")
-
-        def handle_endtag(self, tag):
-            if tag in self.SKIP_TAGS:
-                self._skip = max(0, self._skip - 1)
-            if not self._skip and tag in self.BLOCK_TAGS:
-                self.parts.append("\n")
-
-        def handle_data(self, data):
-            if not self._skip:
-                self.parts.append(data)
-
-        def get_text(self):
-            raw = "".join(self.parts)
-            raw = _re.sub(r"[ \t]+", " ", raw)       # collapse horizontal whitespace
-            raw = _re.sub(r"\n[ \t]+", "\n", raw)    # trim leading spaces on lines
-            raw = _re.sub(r"\n{3,}", "\n\n", raw)    # max one blank line between paragraphs
-            # Drop lines that are just whitespace or a single short word (nav remnants)
-            lines = [l for l in raw.splitlines() if len(l.strip()) > 2 or l == ""]
-            return "\n".join(lines).strip()
-
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; chat.py)"})
-            r.raise_for_status()
-            content_type = r.headers.get("content-type", "")
-            if "html" in content_type:
-                stripper = _Stripper()
-                stripper.feed(r.text)
-                text = stripper.get_text()
-            else:
-                text = r.text
-            if len(text) > 12000:
-                text = text[:12000] + f"\n... [truncated, {len(text)} chars total]"
-            return text
-    except Exception as e:
-        return f"[error: {e}]"
-
-
-SEARXNG_URL = "http://localhost:8888"  # optional — used only if reachable
-
-async def tool_web_search(query: str, max_results: int = 6) -> str:
-    if not query or not query.strip():
-        return "[error: web_search requires a non-empty query — the model may have produced malformed tool call arguments]"
-    # Opportunistic SearXNG check (2s timeout — silent fail if not running)
-    try:
-        async with httpx.AsyncClient(timeout=2) as client:
-            r = await client.get(
-                f"{SEARXNG_URL}/search",
-                params={"q": query, "format": "json", "language": "en-US"},
-            )
-            r.raise_for_status()
-            data = r.json()
-            results = data.get("results", [])[:max_results]
-            if results:
-                lines = []
-                for i, item in enumerate(results, 1):
-                    lines.append(
-                        f"{i}. {item.get('title', '')}\n"
-                        f"   {item.get('url', '')}\n"
-                        f"   {item.get('content', '')}"
-                    )
-                return "\n\n".join(lines)
-    except Exception:
-        pass
-
-    # DuckDuckGo via ddgs (sync — run in thread executor to stay non-blocking)
-    try:
-        from ddgs import DDGS
-    except ImportError:
-        return "[error: ddgs not installed — run: .venv\\Scripts\\pip.exe install ddgs]"
-
-    last_error: Exception | None = None
-    for attempt in range(3):
-        try:
-            loop = asyncio.get_event_loop()
-            results = await loop.run_in_executor(
-                None,
-                lambda: list(DDGS().text(query, max_results=max_results)),
-            )
-            if not results:
-                return "(no results)"
-            lines = []
-            for i, r in enumerate(results, 1):
-                lines.append(f"{i}. {r['title']}\n   {r['href']}\n   {r['body']}")
-            return "\n\n".join(lines)
-        except Exception as e:
-            last_error = e
-            if attempt < 2:
-                await asyncio.sleep(2 ** attempt)  # 1s then 2s before retries
-
-    return f"[error: search failed after 3 attempts — {last_error}]"
-
-async def tool_task_list(
-    operation: str,
-    path: str = "TASKS.md",
-    content: str = "",
-    index: int | None = None,
-    checked: bool | None = None,
-) -> str:
-    import re as _re
-    p = Path(path)
-    if operation == "read":
-        if not p.exists():
-            return f"[no task list at {path}]"
-        return p.read_text(encoding="utf-8")
-    elif operation == "create":
-        if not content:
-            return "[error: content required for create]"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
-        return f"Created {path}"
-    elif operation == "update":
-        if index is None or checked is None:
-            return "[error: index and checked required for update]"
-        if not p.exists():
-            return f"[no task list at {path}]"
-        text = p.read_text(encoding="utf-8")
-        lines = text.splitlines()
-        task_lines = [(i, l) for i, l in enumerate(lines) if _re.match(r"\s*- \[[ x]\]", l)]
-        if index < 0 or index >= len(task_lines):
-            return f"[error: index {index} out of range (0–{len(task_lines)-1})]"
-        line_idx, line = task_lines[index]
-        new_mark = "x" if checked else " "
-        new_line = _re.sub(r"- \[[ x]\]", f"- [{new_mark}]", line, count=1)
-        lines[line_idx] = new_line
-        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        action = "checked" if checked else "unchecked"
-        return f"Task {index} {action}: {new_line.strip()}"
-    else:
-        return f"[unknown operation: {operation}]"
-
 # ── Skills ────────────────────────────────────────────────────────────────────
 def _load_skills() -> dict:
     """Load skill files from skills/*.md. Returns dict[name → skill_dict]."""
@@ -2037,7 +634,7 @@ async def _invoke_skill(skill_name: str, skill_args: str, session: "ChatSession"
 
 
 # ── ChatSession ───────────────────────────────────────────────────────────────
-class ChatSession:
+class ChatSession(AgentsMixin):
     def __init__(self):
         self.client = httpx.AsyncClient(timeout=120.0)
         _initial, _startup_paths = _build_initial_messages()
@@ -2136,57 +733,6 @@ class ChatSession:
         self.messages.insert(self._n_fixed, {"role": "system", "content": msg})
         self._n_fixed += 1
         self._capabilities_injected = True
-
-    async def _inject_pending_bg_results(self) -> None:
-        """Replace background-agent placeholder tool results with real output.
-
-        Called at the start of the next send_and_stream turn after background agents
-        complete. Only results that have arrived are injected; any still running remain
-        in _pending_bg_results for the following turn.
-        """
-        results_map = {tc_id: result for tc_id, result in self._pending_bg_results}
-        self._pending_bg_results.clear()
-        for msg in self.messages:
-            if msg.get("role") == "tool" and msg.get("tool_call_id") in results_map:
-                msg["content"] = results_map[msg["tool_call_id"]]
-        self._pending_bg_tool_calls.clear()
-
-    async def _run_background_agent(
-        self, tc: dict, args: dict, label: str, current_model: str | None
-    ) -> None:
-        """Run a single spawn_agent call as a background asyncio Task.
-
-        Acquires an ISM slot for its lifetime. The slot is released in __aexit__
-        regardless of exception or cancellation.
-        Task removal from _bg_agent_tasks is handled by add_done_callback in the caller.
-        """
-        result = "[cancelled]"
-        try:
-            result = await self._tool_spawn_agent(
-                args.get("system_prompt", ""),
-                args.get("task", ""),
-                args.get("tools"),
-                args.get("think_level"),
-                min(args.get("max_iterations", 10), 30),
-                None,                        # model=None: eligibility confirmed same-model
-                agent_label=label,
-                current_model_hint=current_model,
-                _is_background=True,
-            )
-        except asyncio.CancelledError:
-            result = "[agent evicted — 15-minute timeout reached]"
-            raise
-        except Exception as exc:
-            result = f"[background agent error: {exc}]"
-        self._pending_bg_results.append((tc["id"], result))
-        if self.tui_queue:
-            await self.tui_queue.put({
-                "type": "tool_done",
-                "id": tc["id"],
-                "name": "spawn_agent",
-                "result": result,
-                "is_error": result.startswith(("[error", "[background agent error", "[agent evicted")),
-            })
 
     def _remove_config_message(self) -> None:
         """Remove any previously injected project config system message."""
@@ -2438,459 +984,322 @@ class ChatSession:
             self.messages.pop()
 
     async def send_and_stream(self, user_text: str, plan_mode: bool = False):
-        # Inject any completed background agent results before Eli sees this message
-        if self._pending_bg_results:
-            await self._inject_pending_bg_results()
-        user_text = await self._maybe_compact_input(user_text)
-        self.messages.append({"role": "user", "content": user_text})
+        async with await _ism.acquire("Eli", timeout_secs=None, bypass_capacity=True):
+            # Inject any completed background agent results before Eli sees this message
+            if self._pending_bg_results:
+                await self._inject_pending_bg_results()
+            user_text = await self._maybe_compact_input(user_text)
+            self.messages.append({"role": "user", "content": user_text})
 
-        # Per-turn call-count tracking for loop detection.
-        # Key: (tool_name, arguments_string). Resets each user turn.
-        _call_counts: dict[tuple[str, str], int] = {}
-        # How many identical calls are allowed before the next one is blocked.
-        # web_search / web_fetch: block on the 2nd identical call (result won't change).
-        # Everything else: block on the 3rd (allows one legitimate retry).
-        _LOOP_LIMITS: dict[str, int] = {"web_search": 1, "web_fetch": 1, "edit": 1, "write_file": 1}
-        _DEFAULT_LOOP_LIMIT = 2
+            # Per-turn call-count tracking for loop detection.
+            # Key: (tool_name, arguments_string). Resets each user turn.
+            _call_counts: dict[tuple[str, str], int] = {}
+            # How many identical calls are allowed before the next one is blocked.
+            # web_search / web_fetch: block on the 2nd identical call (result won't change).
+            # Everything else: block on the 3rd (allows one legitimate retry).
+            _LOOP_LIMITS: dict[str, int] = {"web_search": 1, "web_fetch": 1, "edit": 1, "write_file": 1}
+            _DEFAULT_LOOP_LIMIT = 2
 
-        while True:
-            temperature = 0.3 if self.think_level == "deep" else 0.6
-            think_kwargs: dict = {}
-            if self.think_level == "off":
-                think_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-            else:
-                think_kwargs["chat_template_kwargs"] = {"enable_thinking": True}
+            while True:
+                temperature = 0.3 if self.think_level == "deep" else 0.6
+                think_kwargs: dict = {}
+                if self.think_level == "off":
+                    think_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+                else:
+                    think_kwargs["chat_template_kwargs"] = {"enable_thinking": True}
 
-            if plan_mode:
-                plan_system = (
-                    "You are a helpful coding assistant running in a terminal. "
-                    "You are currently in PLAN MODE. "
-                    "Your only job is to output a written plan as plain markdown prose. "
-                    "STRICT RULES for plan mode:\n"
-                    "- You MAY call web_fetch and web_search to research before writing the plan.\n"
-                    "- Do NOT invoke any other tools (bash, edit, write_file, read_file, etc.).\n"
-                    "- DO describe, step by step, exactly what you would do and why: "
-                    "which tools you would call, with what arguments, in what order, "
-                    "and what you expect each step to return.\n"
-                    "- Write the plan as a numbered markdown list. Be specific and actionable.\n"
-                    "- End with a one-sentence summary of the expected outcome.\n"
-                    "Output the plan now, then stop."
-                )
-                plan_tools = [t for t in TOOLS if t["function"]["name"] in ("web_fetch", "web_search")]
-                send_messages = [{"role": "system", "content": plan_system}, *self.messages[1:]]
-                payload = {
-                    "model": self.model,
-                    "messages": send_messages,
-                    "tools": plan_tools,
-                    "tool_choice": "auto",
-                    "stream": True,
-                    "stream_options": {"include_usage": True},
-                    "temperature": temperature,
-                    **think_kwargs,
-                }
-            else:
-                payload = {
-                    "model": self.model,
-                    "messages": self.messages,
-                    "tools": TOOLS,
-                    "tool_choice": "auto",
-                    "stream": True,
-                    "stream_options": {"include_usage": True},
-                    "temperature": temperature,
-                    **think_kwargs,
-                }
+                if plan_mode:
+                    plan_system = (
+                        "You are a helpful coding assistant running in a terminal. "
+                        "You are currently in PLAN MODE. "
+                        "Your only job is to output a written plan as plain markdown prose. "
+                        "STRICT RULES for plan mode:\n"
+                        "- You MAY call web_fetch and web_search to research before writing the plan.\n"
+                        "- Do NOT invoke any other tools (bash, edit, write_file, read_file, etc.).\n"
+                        "- DO describe, step by step, exactly what you would do and why: "
+                        "which tools you would call, with what arguments, in what order, "
+                        "and what you expect each step to return.\n"
+                        "- Write the plan as a numbered markdown list. Be specific and actionable.\n"
+                        "- End with a one-sentence summary of the expected outcome.\n"
+                        "Output the plan now, then stop."
+                    )
+                    plan_tools = [t for t in TOOLS if t["function"]["name"] in ("web_fetch", "web_search")]
+                    send_messages = [{"role": "system", "content": plan_system}, *self.messages[1:]]
+                    payload = {
+                        "model": self.model,
+                        "messages": send_messages,
+                        "tools": plan_tools,
+                        "tool_choice": "auto",
+                        "stream": True,
+                        "stream_options": {"include_usage": True},
+                        "temperature": temperature,
+                        **think_kwargs,
+                    }
+                else:
+                    payload = {
+                        "model": self.model,
+                        "messages": self.messages,
+                        "tools": TOOLS,
+                        "tool_choice": "auto",
+                        "stream": True,
+                        "stream_options": {"include_usage": True},
+                        "temperature": temperature,
+                        **think_kwargs,
+                    }
 
-            thinking_buf = ""
-            text_buf = ""
-            tool_calls_received = []
-            assistant_content = ""
-            usage_data: dict | None = None
+                thinking_buf = ""
+                text_buf = ""
+                tool_calls_received = []
+                assistant_content = ""
+                usage_data: dict | None = None
 
-            async with self.client.stream(
-                "POST",
-                f"{BASE_URL}/v1/chat/completions",
-                json=payload,
-                headers={"Accept": "text/event-stream"},
-            ) as response:
-                response.raise_for_status()
+                async with self.client.stream(
+                    "POST",
+                    f"{BASE_URL}/v1/chat/completions",
+                    json=payload,
+                    headers={"Accept": "text/event-stream"},
+                ) as response:
+                    response.raise_for_status()
 
-                # Render text live via rich.live (or null in TUI mode)
-                _live_ctx = _NullLive() if self.tui_queue else Live(console=console, refresh_per_second=8)
-                with _live_ctx as live:
-                    thinking_started = False
-                    text_started = False
+                    # Render text live via rich.live (or null in TUI mode)
+                    _live_ctx = _NullLive() if self.tui_queue else Live(console=console, refresh_per_second=8)
+                    with _live_ctx as live:
+                        thinking_started = False
+                        text_started = False
 
-                    show_thinking = self.think_level != "off" and not self.compact_mode
-                    think_title = "[dim]Thinking (deep)...[/dim]" if self.think_level == "deep" else "[dim]Thinking...[/dim]"
-                    think_border = "blue" if self.think_level == "deep" else "dim"
+                        show_thinking = self.think_level != "off" and not self.compact_mode
+                        think_title = "[dim]Thinking (deep)...[/dim]" if self.think_level == "deep" else "[dim]Thinking...[/dim]"
+                        think_border = "blue" if self.think_level == "deep" else "dim"
 
-                    async for event_type, data in stream_events(
-                        response,
-                        label=f"send_and_stream | model={self.model} | {BASE_URL}",
-                    ):
-                        if event_type == "think":
-                            thinking_buf += data
-                            if self.tui_queue:
-                                await self.tui_queue.put({"type": "think_token", "text": data})
-                            elif show_thinking:
-                                live.update(
-                                    Panel(
-                                        Text(thinking_buf, style="dim italic"),
-                                        title=think_title,
-                                        border_style=think_border,
-                                    )
-                                )
-
-                        elif event_type == "text":
-                            if self.tui_queue:
-                                text_buf += data
-                                assistant_content += data
-                                await self.tui_queue.put({"type": "text_token", "text": data})
-                            else:
-                                if thinking_buf and show_thinking:
-                                    # Commit thinking panel, start fresh for text
-                                    live.update(Text(""))
-                                    live.stop()
-                                    console.print(
+                        async for event_type, data in stream_events(
+                            response,
+                            label=f"send_and_stream | model={self.model} | {BASE_URL}",
+                        ):
+                            if event_type == "think":
+                                thinking_buf += data
+                                if self.tui_queue:
+                                    await self.tui_queue.put({"type": "think_token", "text": data})
+                                elif show_thinking:
+                                    live.update(
                                         Panel(
                                             Text(thinking_buf, style="dim italic"),
-                                            title=think_title.replace("...", ""),
+                                            title=think_title,
                                             border_style=think_border,
                                         )
                                     )
-                                    live.start()
-                                    thinking_buf = ""
 
-                                text_buf += data
-                                assistant_content += data
-                                live.update(Markdown(text_buf))
+                            elif event_type == "text":
+                                if self.tui_queue:
+                                    text_buf += data
+                                    assistant_content += data
+                                    await self.tui_queue.put({"type": "text_token", "text": data})
+                                else:
+                                    if thinking_buf and show_thinking:
+                                        # Commit thinking panel, start fresh for text
+                                        live.update(Text(""))
+                                        live.stop()
+                                        console.print(
+                                            Panel(
+                                                Text(thinking_buf, style="dim italic"),
+                                                title=think_title.replace("...", ""),
+                                                border_style=think_border,
+                                            )
+                                        )
+                                        live.start()
+                                        thinking_buf = ""
 
-                        elif event_type == "tool_calls":
-                            tool_calls_received = data
-                            if not self.tui_queue:
-                                live.update(Text(""))
+                                    text_buf += data
+                                    assistant_content += data
+                                    live.update(Markdown(text_buf))
 
-                        elif event_type == "usage":
-                            usage_data = data
+                            elif event_type == "tool_calls":
+                                tool_calls_received = data
+                                if not self.tui_queue:
+                                    live.update(Text(""))
 
-                        elif event_type == "stop":
-                            if self.tui_queue:
-                                await self.tui_queue.put({"type": "text_done", "text": text_buf})
-                            else:
-                                live.update(Markdown(text_buf) if text_buf else Text(""))
+                            elif event_type == "usage":
+                                usage_data = data
 
-            # Update token tracking
-            if usage_data:
-                self.tokens_used       = usage_data.get("total_tokens", 0)
-                self.tokens_prompt     = usage_data.get("prompt_tokens", 0)
-                self.tokens_completion = usage_data.get("completion_tokens", 0)
-            else:
-                self.tokens_used = sum(
-                    len(m.get("content") or "") for m in self.messages
-                ) // CHARS_PER_TOKEN
+                            elif event_type == "stop":
+                                if self.tui_queue:
+                                    await self.tui_queue.put({"type": "text_done", "text": text_buf})
+                                else:
+                                    live.update(Markdown(text_buf) if text_buf else Text(""))
 
-            # Auto-compact if approaching context limit
-            if not self._compacting and self.tokens_used >= int(self.ctx_window * self.compact_threshold):
-                await self._compact_history()
-
-            # Fallback: model emitted tool calls as text (e.g. 30B with custom template)
-            if not tool_calls_received and assistant_content:
-                _parsed = _try_parse_text_tool_calls(assistant_content)
-                if _parsed:
-                    tool_calls_received = _parsed
-                    assistant_content = ""  # don't echo raw text back into message history
-
-            # Auto-announce if model produced no text before first tool call
-            if tool_calls_received and not text_buf.strip():
-                if self.tui_queue:
-                    tool_names = ", ".join(tc["function"]["name"] for tc in tool_calls_received)
-                    await self.tui_queue.put({"type": "system", "text": f"→ {tool_names}…"})
+                # Update token tracking
+                if usage_data:
+                    self.tokens_used       = usage_data.get("total_tokens", 0)
+                    self.tokens_prompt     = usage_data.get("prompt_tokens", 0)
+                    self.tokens_completion = usage_data.get("completion_tokens", 0)
                 else:
-                    console.print(f"[dim]{_tool_announce(tool_calls_received)}[/dim]")
+                    self.tokens_used = sum(
+                        len(m.get("content") or "") for m in self.messages
+                    ) // CHARS_PER_TOKEN
 
-            # Append assistant message
-            if tool_calls_received:
-                self.messages.append({
-                    "role": "assistant",
-                    "content": assistant_content or None,
-                    "tool_calls": tool_calls_received,
-                })
-                # Execute tool calls: read-only ops in parallel, write/exec sequentially.
-                # Write ops (bash, write_file, edit) must be sequential so interactive
-                # gates (approval prompts, plan gates) fire in order and can't be raced.
-                _READ_ONLY_TOOLS = {"read_file", "list_dir", "glob", "grep", "ripgrep",
-                                    "web_search", "web_fetch", "speak"}
+                # Auto-compact if approaching context limit
+                if not self._compacting and self.tokens_used >= int(self.ctx_window * self.compact_threshold):
+                    await self._compact_history()
 
-                async def _run_one(tc):
-                    return tc["id"], await self._call_tool(
-                        tc["function"]["name"],
-                        tc["function"]["arguments"],
-                        tc["id"],
-                    )
+                # Fallback: model emitted tool calls as text (e.g. 30B with custom template)
+                if not tool_calls_received and assistant_content:
+                    _parsed = _try_parse_text_tool_calls(assistant_content)
+                    if _parsed:
+                        tool_calls_received = _parsed
+                        assistant_content = ""  # don't echo raw text back into message history
 
-                # Split into runs: read-only in parallel, agents in a domain-checked batch,
-                # write ops sequentially.  Stop immediately if any gate rejects a call.
-                _batch: list = []        # pending read-only calls
-                _agent_batch: list = []  # pending spawn_agent calls
-                _gate_rejected = False
-
-                async def _emit_tool_done(tc_name: str, tc_id: str, result: str) -> None:
+                # Auto-announce if model produced no text before first tool call
+                if tool_calls_received and not text_buf.strip():
                     if self.tui_queue:
-                        is_err = result.startswith(("[error", "[unknown", "[blocked", "[cancelled", _GATE_REJECTED_PREFIX))
-                        await self.tui_queue.put({"type": "tool_done", "id": tc_id, "name": tc_name, "result": result, "is_error": is_err})
-
-                async def _flush_agent_batch(batch: list) -> None:
-                    """Run spawn_agent calls, grouping by target model, parallelising within each group when domain-safe.
-
-                    Model switching is done once per group (not per agent). Live slot count is
-                    queried after each switch so the capacity reflects the actual loaded model.
-                    A try/finally guarantees the original model is always restored, even on
-                    exception or asyncio cancellation.
-                    """
-                    batch_args = []
-                    for _tc in batch:
-                        try:
-                            _a = json.loads(_tc["function"]["arguments"]) if isinstance(_tc["function"]["arguments"], str) else _tc["function"]["arguments"]
-                        except Exception:
-                            _a = {}
-                        batch_args.append(_a)
-
-                    # Snapshot current model and valid profile names once
-                    _original_model = await _find_active_profile()
-                    _commands = _load_commands()
-
-                    # Group agents by resolved target model; original-model group runs first
-                    _groups: dict = {}
-                    for _tc, _args in zip(batch, batch_args):
-                        _m = _args.get("model")
-                        _tgt = _m if (_m and _m in _commands) else _original_model
-                        _groups.setdefault(_tgt, []).append((_tc, _args))
-                    _ordered = sorted(_groups.items(), key=lambda kv: kv[0] != _original_model)
-
-                    # Background eligibility: all agents target the current model + a free slot exists
-                    _bg_eligible = (
-                        _ism.total_slots() - _ism.in_use() >= 1
-                        and len(_groups) == 1
-                        and list(_groups.keys())[0] == _original_model
-                    )
-                    if _bg_eligible and _original_model is not None:
-                        # Only check profile model when we know the active model;
-                        # if _original_model is None we can't compare, so allow bg.
-                        _all_profiles = [_load_agent_profile(_a.get("system_prompt", "")) for _a in batch_args]
-                        for _ba, _bp in zip(batch_args, _all_profiles):
-                            _pm = _ba.get("model") or _bp.get("model")
-                            if _pm and _pm != _original_model:
-                                _bg_eligible = False
-                                break
-
-                    if _bg_eligible:
-                        # Dispatch as background asyncio Tasks — return placeholders immediately.
-                        # Each task acquires its own ISM slot on start, releases on finish.
-                        for _i, (_tc, _args) in enumerate(zip(batch, batch_args)):
-                            _lbl = f"Agent {_i + 1}" if len(batch) > 1 else ""
-                            _placeholder = "[background: agent dispatched — result pending]"
-                            self.messages.append({"role": "tool", "tool_call_id": _tc["id"], "content": _placeholder})
-                            await _emit_tool_done("spawn_agent", _tc["id"], _placeholder)
-                            _task = asyncio.create_task(
-                                self._run_background_agent(_tc, _args, _lbl, _original_model)
-                            )
-                            # Remove from list when the task is truly done (asyncio marks it done
-                            # only after the coroutine fully returns — not during finally block).
-                            _task.add_done_callback(
-                                lambda t: self._bg_agent_tasks.remove(t)
-                                if t in self._bg_agent_tasks else None
-                            )
-                            self._bg_agent_tasks.append(_task)
-                            self._pending_bg_tool_calls.append(_tc)
-                        return  # no model switch occurred; no try/finally restore needed
-
-                    _current_running = _original_model
-                    _attempted_switch = False
-                    _label_offset = 0
-                    _pair_results: list = []
-
-                    try:
-                        for _target_model, _group in _ordered:
-                            # Switch model if needed (only when original is known)
-                            if _target_model and _target_model != _current_running and _original_model:
-                                _attempted_switch = True
-                                _ok = await _switch_server(_target_model)
-                                if not _ok:
-                                    for _tc, _args in _group:
-                                        _pair_results.append((_tc["id"], f"[error: server failed to start model '{_target_model}' — agent skipped]"))
-                                    _label_offset += len(_group)
-                                    continue
-                                _current_running = _target_model
-                                await _ism.refresh_from_server()   # update slot count for new model
-
-                            # Slot count for parallelism decision
-                            _slots = _ism.total_slots()
-
-                            # Domain conflict check
-                            _profiles = [_load_agent_profile(_a.get("system_prompt", "")) for _, _a in _group]
-                            _run_parallel = _slots >= 2 and len(_group) > 1 and _all_can_parallel(_profiles)
-                            _hint = _target_model  # suppresses per-agent switch/restore
-
-                            if _run_parallel:
-                                _labels = [f"Agent {_label_offset + i + 1}" for i in range(len(_group))]
-                                async def _run_one_parallel(_tc, _args, _label, _h=_hint):
-                                    _res = await self._tool_spawn_agent(
-                                        _args.get("system_prompt", ""),
-                                        _args.get("task", ""),
-                                        _args.get("tools"),
-                                        _args.get("think_level"),
-                                        min(_args.get("max_iterations", 10), 30),
-                                        _args.get("model"),
-                                        agent_label=_label,
-                                        current_model_hint=_h,
-                                    )
-                                    return _tc["id"], _res
-                                _group_results = list(await asyncio.gather(*[
-                                    _run_one_parallel(_tc, _args, _lbl)
-                                    for (_tc, _args), _lbl in zip(_group, _labels)
-                                ]))
-                                _pair_results.extend(_group_results)
-                            else:
-                                for _i, (_tc, _args) in enumerate(_group):
-                                    _lbl = f"Agent {_label_offset + _i + 1}" if len(batch) > 1 else ""
-                                    _res = await self._tool_spawn_agent(
-                                        _args.get("system_prompt", ""),
-                                        _args.get("task", ""),
-                                        _args.get("tools"),
-                                        _args.get("think_level"),
-                                        min(_args.get("max_iterations", 10), 30),
-                                        _args.get("model"),
-                                        agent_label=_lbl,
-                                        current_model_hint=_hint,
-                                    )
-                                    _pair_results.append((_tc["id"], _res))
-
-                            _label_offset += len(_group)
-
-                    finally:
-                        # Always restore original model if any switch was attempted.
-                        # Fires on normal exit, exception, and asyncio cancellation.
-                        if _attempted_switch and _original_model:
-                            await _switch_server(_original_model)
-
-                    for (_tc_id, _result), _tc in zip(_pair_results, batch):
-                        self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
-                        await _emit_tool_done("spawn_agent", _tc_id, _result)
-
-                # If any state-changing tool ran in this iteration, the world has changed —
-                # reset loop-detection counts so a legitimate re-run isn't blocked.
-                # BUT preserve counts for file ops themselves so read→edit→read loops
-                # don't escape detection by resetting on each edit.
-                _STATE_CHANGING = {"edit", "write_file"}
-                if any(tc["function"]["name"] in _STATE_CHANGING for tc in tool_calls_received):
-                    _FILE_OPS = {"read_file", "edit", "write_file"}
-                    _call_counts = {k: v for k, v in _call_counts.items() if k[0] in _FILE_OPS}
-
-                for tc in tool_calls_received:
-                    if _gate_rejected:
-                        break
-
-                    # Loop detection: block repeated identical calls this turn
-                    _tc_name = tc["function"]["name"]
-                    _tc_args = tc["function"]["arguments"]
-                    _canon   = (_tc_name, _tc_args)
-                    _call_counts[_canon] = _call_counts.get(_canon, 0) + 1
-                    _limit   = _LOOP_LIMITS.get(_tc_name, _DEFAULT_LOOP_LIMIT)
-                    if _call_counts[_canon] > _limit:
-                        _loop_advice = {
-                            "bash": (
-                                "The environment has not changed since the last run — repeating "
-                                "the same command will produce the same result. "
-                                "Write a script that handles the problem differently, "
-                                "or use write_file/edit to change the inputs before re-running."
-                            ),
-                            "web_search": (
-                                "A search with these exact terms has already been executed. "
-                                "Reformulate with different keywords, broaden or narrow the query, "
-                                "or synthesize your final answer from the results already retrieved."
-                            ),
-                            "web_fetch": (
-                                "This URL has already been fetched this turn. "
-                                "The content will not have changed. Use what you already retrieved."
-                            ),
-                        }
-                        _advice = _loop_advice.get(
-                            _tc_name,
-                            "Try a different approach or formulate your final answer from what you already have.",
-                        )
-                        _warn = (
-                            f"[loop-detected] {_tc_name} has been called with these exact "
-                            f"arguments {_call_counts[_canon]} time(s) this turn. {_advice}"
-                        )
-                        self.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": _warn})
-                        await _emit_tool_done(_tc_name, tc["id"], _warn)
-                        continue
-
-                    if _tc_name in _READ_ONLY_TOOLS:
-                        _batch.append(tc)
-                    elif _tc_name == "spawn_agent":
-                        _agent_batch.append(tc)
+                        tool_names = ", ".join(tc["function"]["name"] for tc in tool_calls_received)
+                        await self.tui_queue.put({"type": "system", "text": f"→ {tool_names}…"})
                     else:
-                        # Write op: flush pending reads and agents first
-                        if _batch:
-                            _results = await asyncio.gather(*[_run_one(t) for t in _batch])
-                            for _bt, (_tc_id, _result) in zip(_batch, _results):
-                                self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
-                                await _emit_tool_done(_bt["function"]["name"], _tc_id, _result)
-                            _batch = []
-                        if _agent_batch:
-                            await _flush_agent_batch(_agent_batch)
-                            _agent_batch = []
-                        # Then run the write op sequentially (with file write locking)
-                        try:
-                            _wl_args = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else (tc["function"]["arguments"] or {})
-                        except Exception:
-                            _wl_args = {}
-                        _wl_path = _extract_write_path(_tc_name, _wl_args)
-                        _wl_abs = os.path.abspath(_wl_path) if _wl_path else None
-                        if _wl_abs and _wl_abs in self._write_locks:
-                            _tc_id = tc["id"]
-                            _result = f"[error: '{os.path.basename(_wl_abs)}' is currently locked for writing by {self._write_locks[_wl_abs]} — retry after it finishes]"
-                            self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
-                            await _emit_tool_done(_tc_name, _tc_id, _result)
-                        else:
-                            if _wl_abs:
-                                self._write_locks[_wl_abs] = "Eli"
-                            try:
-                                _tc_id, _result = await _run_one(tc)
-                                self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
-                                await _emit_tool_done(tc["function"]["name"], _tc_id, _result)
-                            finally:
-                                if _wl_abs:
-                                    self._write_locks.pop(_wl_abs, None)
-                        if _result.startswith(_GATE_REJECTED_PREFIX):
-                            _gate_rejected = True
-                # Flush any remaining reads and agents (only if not rejected)
-                if _batch and not _gate_rejected:
-                    _results = await asyncio.gather(*[_run_one(t) for t in _batch])
-                    for _bt, (_tc_id, _result) in zip(_batch, _results):
-                        self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
-                        await _emit_tool_done(_bt["function"]["name"], _tc_id, _result)
-                if _agent_batch and not _gate_rejected:
-                    await _flush_agent_batch(_agent_batch)
-                # Loop: send tool results back to model
-                continue
-            else:
-                if assistant_content:
-                    self.messages.append({"role": "assistant", "content": assistant_content})
-                break
+                        console.print(f"[dim]{_tool_announce(tool_calls_received)}[/dim]")
 
-        if self.tui_queue:
-            await self.tui_queue.put({"type": "usage", "tokens": self.tokens_used, "ctx": self.ctx_window})
-            await self.tui_queue.put({"type": "done"})
-        elif self.tokens_used:
-            pct   = self.tokens_used / self.ctx_window
-            style = "yellow" if pct > 0.6 else "dim"
-            label = f"~{self.tokens_used / 1000:.1f}k / {self.ctx_window / 1000:.0f}k tokens"
-            console.print(Rule(f"[{style}]{label}[/{style}]", style="dim"))
-        else:
-            console.print(Rule(style="dim"))
-        self._autosave()
+                # Append assistant message
+                if tool_calls_received:
+                    self.messages.append({
+                        "role": "assistant",
+                        "content": assistant_content or None,
+                        "tool_calls": tool_calls_received,
+                    })
+                    # Execute tool calls: read-only ops in parallel, write/exec sequentially.
+                    # Write ops (bash, write_file, edit) must be sequential so interactive
+                    # gates (approval prompts, plan gates) fire in order and can't be raced.
+                    _READ_ONLY_TOOLS = {"read_file", "list_dir", "glob", "grep", "ripgrep",
+                                        "web_search", "web_fetch", "speak"}
+
+                    async def _run_one(tc):
+                        return tc["id"], await self._call_tool(
+                            tc["function"]["name"],
+                            tc["function"]["arguments"],
+                            tc["id"],
+                        )
+
+                    # Split into runs: read-only in parallel, agents in a domain-checked batch,
+                    # write ops sequentially.  Stop immediately if any gate rejects a call.
+                    _batch: list = []        # pending read-only calls
+                    _agent_batch: list = []  # pending spawn_agent calls
+                    _gate_rejected = False
+
+                    async def _emit_tool_done(tc_name: str, tc_id: str, result: str) -> None:
+                        if self.tui_queue:
+                            is_err = result.startswith(("[error", "[unknown", "[blocked", "[cancelled", _GATE_REJECTED_PREFIX))
+                            await self.tui_queue.put({"type": "tool_done", "id": tc_id, "name": tc_name, "result": result, "is_error": is_err})
+
+                    # If any state-changing tool ran in this iteration, the world has changed —
+                    # reset loop-detection counts so a legitimate re-run isn't blocked.
+                    # BUT preserve counts for file ops themselves so read→edit→read loops
+                    # don't escape detection by resetting on each edit.
+                    _STATE_CHANGING = {"edit", "write_file"}
+                    if any(tc["function"]["name"] in _STATE_CHANGING for tc in tool_calls_received):
+                        _FILE_OPS = {"read_file", "edit", "write_file"}
+                        _call_counts = {k: v for k, v in _call_counts.items() if k[0] in _FILE_OPS}
+
+                    for tc in tool_calls_received:
+                        if _gate_rejected:
+                            break
+
+                        # Loop detection: block repeated identical calls this turn
+                        _tc_name = tc["function"]["name"]
+                        _tc_args = tc["function"]["arguments"]
+                        _canon   = (_tc_name, _tc_args)
+                        _call_counts[_canon] = _call_counts.get(_canon, 0) + 1
+                        _limit   = _LOOP_LIMITS.get(_tc_name, _DEFAULT_LOOP_LIMIT)
+                        if _call_counts[_canon] > _limit:
+                            _loop_advice = {
+                                "bash": (
+                                    "The environment has not changed since the last run — repeating "
+                                    "the same command will produce the same result. "
+                                    "Write a script that handles the problem differently, "
+                                    "or use write_file/edit to change the inputs before re-running."
+                                ),
+                                "web_search": (
+                                    "A search with these exact terms has already been executed. "
+                                    "Reformulate with different keywords, broaden or narrow the query, "
+                                    "or synthesize your final answer from the results already retrieved."
+                                ),
+                                "web_fetch": (
+                                    "This URL has already been fetched this turn. "
+                                    "The content will not have changed. Use what you already retrieved."
+                                ),
+                            }
+                            _advice = _loop_advice.get(
+                                _tc_name,
+                                "Try a different approach or formulate your final answer from what you already have.",
+                            )
+                            _warn = (
+                                f"[loop-detected] {_tc_name} has been called with these exact "
+                                f"arguments {_call_counts[_canon]} time(s) this turn. {_advice}"
+                            )
+                            self.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": _warn})
+                            await _emit_tool_done(_tc_name, tc["id"], _warn)
+                            continue
+
+                        if _tc_name in _READ_ONLY_TOOLS:
+                            _batch.append(tc)
+                        elif _tc_name == "spawn_agent":
+                            _agent_batch.append(tc)
+                        else:
+                            # Write op: flush pending reads and agents first
+                            if _batch:
+                                _results = await asyncio.gather(*[_run_one(t) for t in _batch])
+                                for _bt, (_tc_id, _result) in zip(_batch, _results):
+                                    self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
+                                    await _emit_tool_done(_bt["function"]["name"], _tc_id, _result)
+                                _batch = []
+                            if _agent_batch:
+                                await self._flush_agent_batch(_agent_batch, _emit_tool_done)
+                                _agent_batch = []
+                            # Then run the write op sequentially (with file write locking)
+                            try:
+                                _wl_args = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else (tc["function"]["arguments"] or {})
+                            except Exception:
+                                _wl_args = {}
+                            _wl_path = _extract_write_path(_tc_name, _wl_args)
+                            _wl_abs = os.path.abspath(_wl_path) if _wl_path else None
+                            if _wl_abs and _wl_abs in self._write_locks:
+                                _tc_id = tc["id"]
+                                _result = f"[error: '{os.path.basename(_wl_abs)}' is currently locked for writing by {self._write_locks[_wl_abs]} — retry after it finishes]"
+                                self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
+                                await _emit_tool_done(_tc_name, _tc_id, _result)
+                            else:
+                                if _wl_abs:
+                                    self._write_locks[_wl_abs] = "Eli"
+                                try:
+                                    _tc_id, _result = await _run_one(tc)
+                                    self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
+                                    await _emit_tool_done(tc["function"]["name"], _tc_id, _result)
+                                finally:
+                                    if _wl_abs:
+                                        self._write_locks.pop(_wl_abs, None)
+                            if _result.startswith(_GATE_REJECTED_PREFIX):
+                                _gate_rejected = True
+                    # Flush any remaining reads and agents (only if not rejected)
+                    if _batch and not _gate_rejected:
+                        _results = await asyncio.gather(*[_run_one(t) for t in _batch])
+                        for _bt, (_tc_id, _result) in zip(_batch, _results):
+                            self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})
+                            await _emit_tool_done(_bt["function"]["name"], _tc_id, _result)
+                    if _agent_batch and not _gate_rejected:
+                        await self._flush_agent_batch(_agent_batch, _emit_tool_done)
+                    # Loop: send tool results back to model
+                    continue
+                else:
+                    if assistant_content:
+                        self.messages.append({"role": "assistant", "content": assistant_content})
+                    break
+
+            if self.tui_queue:
+                await self.tui_queue.put({"type": "usage", "tokens": self.tokens_used, "ctx": self.ctx_window})
+                await self.tui_queue.put({"type": "done"})
+            elif self.tokens_used:
+                pct   = self.tokens_used / self.ctx_window
+                style = "yellow" if pct > 0.6 else "dim"
+                label = f"~{self.tokens_used / 1000:.1f}k / {self.ctx_window / 1000:.0f}k tokens"
+                console.print(Rule(f"[{style}]{label}[/{style}]", style="dim"))
+            else:
+                console.print(Rule(style="dim"))
+            self._autosave()
 
     @staticmethod
     def _compact_args(name: str, args: dict) -> str:
@@ -3101,798 +1510,6 @@ class ChatSession:
         except Exception as e:
             return f"[tool error: {e}]"
 
-    async def _tool_spawn_agent(
-        self,
-        system_prompt: str,
-        task: str,
-        tools: list[str] | None = None,
-        think_level: str | None = None,
-        max_iterations: int = 10,
-        model: str | None = None,
-        agent_label: str = "",
-        current_model_hint: str | None = None,
-        _is_background: bool = False,
-    ) -> str:
-        """Run an isolated sub-agent loop and return its final text response.
-
-        agent_label: display label for the Agent tab (e.g. "Agent 1"). Empty = unlabeled.
-        current_model_hint: pre-fetched active profile name; skips _find_active_profile() call.
-        """
-        # Increment depth immediately before any await so parallel gather is safe
-        self._subagent_depth += 1
-
-        # Resolve profile name → system prompt, and auto-extract recommended model
-        if system_prompt and " " not in system_prompt.strip():
-            profile = _load_agent_profile(system_prompt)
-            system_prompt = profile["prompt"]
-            if not model:
-                model = profile.get("model")
-        # If not found, use the string as-is (may be a short raw prompt)
-
-        # Build tool list — always exclude spawn_agent from sub-agents
-        sub_tools = [t for t in TOOLS if t["function"]["name"] != "spawn_agent"]
-        if tools:
-            sub_tools = [t for t in sub_tools if t["function"]["name"] in tools]
-
-        think = think_level or self.think_level
-        max_iter = min(max_iterations, 50)
-
-        # ── Model switch ──────────────────────────────────────────────────────
-        restore_profile: str | None = None
-        if model:
-            commands = _load_commands()
-            if model not in commands:
-                available = "  ·  ".join(commands) or "(none)"
-                if not self.tui_queue:
-                    console.print(f"[dim yellow]⚠ unknown model '{model}' — using current model. Available: {available}[/dim yellow]")
-                model = None
-            if model:
-                # Use hint from parallel batch if provided (avoids redundant API call)
-                active = current_model_hint if current_model_hint is not None else await _find_active_profile()
-                if active == model:
-                    restore_profile = None  # Already on right model
-                    if not self.tui_queue:
-                        console.print(f"[dim]  Model already loaded: {model}[/dim]")
-                else:
-                    restore_profile = active
-                    if not self.tui_queue:
-                        console.print(Panel(
-                            f"[yellow]Switching server to:[/yellow] {model}\n"
-                            f"[dim]Will restore '{restore_profile or 'original'}' after agent finishes.[/dim]",
-                            title="[yellow]Model Switch[/yellow]",
-                            border_style="yellow",
-                        ))
-                    ready = await _switch_server(model)
-                    if not ready:
-                        self._subagent_depth -= 1
-                        return f"[error: server failed to start model '{model}' — agent aborted]"
-
-        import datetime as _dt
-        _today = _dt.date.today().strftime("%Y-%m-%d")
-        _ctx = (
-            f"\n\n[Session Context]\n"
-            f"Today's date: {_today}\n"
-            f"Current working directory: {self.cwd}\n"
-            f"All relative file paths resolve against this directory."
-        )
-        messages: list[dict] = [
-            {"role": "system", "content": system_prompt + _ctx},
-            {"role": "user", "content": task},
-        ]
-
-        _label_prefix = f"[{agent_label}] " if agent_label else ""
-        if self.tui_queue:
-            await self.tui_queue.put({"type": "system", "text": f"{_label_prefix}Agent: {task[:200]}{'…' if len(task) > 200 else ''}", "agent_label": agent_label})
-        elif self.compact_mode:
-            quote = random.choice(COMPACT_QUOTES)
-            console.print(f"[dim cyan]  ◌ {quote}[/dim cyan]")
-        else:
-            title_suffix = f" [{agent_label}]" if agent_label else ""
-            console.print(Panel(
-                f"[bold cyan]Task:[/bold cyan] {task[:300]}{'...' if len(task) > 300 else ''}",
-                title=f"[cyan]Sub-Agent Spawned{title_suffix}[/cyan]",
-                border_style="cyan",
-            ))
-
-        # Acquire inference slot — inline agents use no timeout; background agents use 15 min.
-        _slot_label = (f"{'Background' if _is_background else 'In-Line'} Agent"
-                       + (f" [{agent_label}]" if agent_label else ""))
-        _slot = await _ism.acquire(_slot_label, timeout_secs=900.0 if _is_background else None)
-        if _is_background:
-            _slot.task = asyncio.current_task()
-        if self.tui_queue:
-            await self.tui_queue.put({"type": "system",
-                "text": f"{_slot_label} using Slot {_slot.index + 1}"})
-
-        final_text = ""
-        _hit_max_iter = True  # cleared when agent breaks naturally
-        try:
-            for _iter in range(max_iter):
-                temperature = 0.3 if think == "deep" else 0.6
-                think_kwargs: dict = {}
-                if think == "off":
-                    think_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-                else:
-                    think_kwargs["chat_template_kwargs"] = {"enable_thinking": True}
-
-                payload = {
-                    "model": self.model,
-                    "messages": messages,
-                    "tools": sub_tools,
-                    "tool_choice": "auto",
-                    "stream": True,
-                    "stream_options": {"include_usage": True},
-                    "temperature": temperature,
-                    **think_kwargs,
-                }
-
-                thinking_buf = ""
-                text_buf = ""
-                tool_calls_received = []
-                assistant_content = ""
-
-                async with self.client.stream(
-                    "POST",
-                    f"{BASE_URL}/v1/chat/completions",
-                    json=payload,
-                    headers={"Accept": "text/event-stream"},
-                ) as response:
-                    response.raise_for_status()
-                    _live_ctx = _NullLive() if (self.tui_queue or self.compact_mode) else Live(console=console, refresh_per_second=8)
-                    with _live_ctx as live:
-                        show_thinking = think != "off" and not self.compact_mode
-
-                        async for event_type, data in stream_events(
-                            response,
-                            label=f"spawn_agent[iter] | model={model or self.model} | {BASE_URL}",
-                        ):
-                            if event_type == "think":
-                                thinking_buf += data
-                                if self.tui_queue:
-                                    await self.tui_queue.put({"type": "think_token", "text": data})
-                                elif show_thinking:
-                                    live.update(Panel(
-                                        Text(thinking_buf, style="dim italic"),
-                                        title="[dim cyan]Agent Thinking...[/dim cyan]",
-                                        border_style="dim cyan",
-                                    ))
-                            elif event_type == "text":
-                                if self.tui_queue:
-                                    text_buf += data
-                                    assistant_content += data
-                                    final_text = assistant_content
-                                    await self.tui_queue.put({"type": "text_token", "text": data, "source": "agent", "agent_label": agent_label})
-                                else:
-                                    if thinking_buf and show_thinking:
-                                        live.update(Text(""))
-                                        live.stop()
-                                        console.print(Panel(
-                                            Text(thinking_buf, style="dim italic"),
-                                            title="[dim cyan]Agent Thinking[/dim cyan]",
-                                            border_style="dim cyan",
-                                        ))
-                                        live.start()
-                                        thinking_buf = ""
-                                    text_buf += data
-                                    assistant_content += data
-                                    final_text = assistant_content
-                                    live.update(Panel(
-                                        Markdown(text_buf),
-                                        title="[cyan]Agent[/cyan]",
-                                        border_style="cyan",
-                                    ))
-                            elif event_type == "tool_calls":
-                                tool_calls_received = data
-                                if not self.tui_queue:
-                                    live.update(Text(""))
-                            elif event_type == "stop":
-                                if self.tui_queue:
-                                    await self.tui_queue.put({"type": "text_done", "text": text_buf, "source": "agent", "agent_label": agent_label})
-                                elif text_buf:
-                                    live.update(Panel(
-                                        Markdown(text_buf),
-                                        title="[cyan]Agent[/cyan]",
-                                        border_style="cyan",
-                                    ))
-                                else:
-                                    live.update(Text(""))
-
-                if assistant_content:          # keep last meaningful text; don't overwrite with ""
-                    final_text = assistant_content
-
-                # Fallback: model emitted tool calls as text
-                if not tool_calls_received and assistant_content:
-                    _parsed = _try_parse_text_tool_calls(assistant_content)
-                    if _parsed:
-                        tool_calls_received = _parsed
-                        assistant_content = ""
-
-                # Auto-announce if model produced no text before first tool call
-                if tool_calls_received and not text_buf.strip():
-                    if self.tui_queue:
-                        tool_names = ", ".join(tc["function"]["name"] for tc in tool_calls_received)
-                        await self.tui_queue.put({"type": "system", "text": f"  → {tool_names}…"})
-                    else:
-                        console.print(f"[dim]  {_tool_announce(tool_calls_received)}[/dim]")
-
-                if tool_calls_received:
-                    messages.append({
-                        "role": "assistant",
-                        "content": assistant_content or None,
-                        "tool_calls": tool_calls_received,
-                    })
-
-                    async def _run_agent_tool(tc):
-                        tc_name = tc["function"]["name"]
-                        tc_args_str = tc["function"]["arguments"]
-                        try:
-                            tc_args = json.loads(tc_args_str) if tc_args_str.strip() else {}
-                        except json.JSONDecodeError as _je:
-                            _err = f"[error: malformed tool arguments — JSON parse failed: {_je}. Raw: {tc_args_str[:200]}]"
-                            if self.tui_queue:
-                                await self.tui_queue.put({"type": "tool_done", "id": tc["id"], "name": tc_name, "result": _err, "is_error": True})
-                            return tc["id"], _err
-                        if self.tui_queue:
-                            await self.tui_queue.put({"type": "tool_start", "id": tc["id"], "name": tc_name, "args": tc_args_str})
-                        elif self.compact_mode:
-                            console.print(f"[dim]    ◌ {tc_name}{markup_escape(self._compact_args(tc_name, tc_args))}[/dim]")
-                        else:
-                            args_display = json.dumps(tc_args, indent=2) if tc_args else "(no args)"
-                            console.print(Panel(
-                                f"[bold]{tc_name}[/bold]\n[dim]{args_display}[/dim]",
-                                title="[cyan]Agent Tool Call[/cyan]",
-                                border_style="cyan",
-                            ))
-                        # Hard block — bare python/pip (venv rule, no override)
-                        if tc_name == "bash":
-                            cmd = tc_args.get("command", "")
-                            if _is_bare_python(cmd):
-                                if not self.tui_queue:
-                                    console.print(Panel(
-                                        f"[red]Bare python/pip call blocked.[/red] Sub-agents must use the project venv.\n"
-                                        f"[dim]{cmd}[/dim]",
-                                        title="[red]Venv Rule Violation[/red]",
-                                        border_style="red",
-                                    ))
-                                tc_result = (
-                                    "[blocked: bare python/pip — all Python must run inside the project venv. "
-                                    "If no venv exists yet, create one first: python -m venv .venv "
-                                    "Then use: .venv\\Scripts\\python.exe  or  .venv\\Scripts\\pip.exe install <pkg>]"
-                                )
-                                if not self.tui_queue:
-                                    console.print(Panel(tc_result, title="[dim cyan]Agent Tool Result[/dim cyan]", border_style="red"))
-                                return tc["id"], tc_result
-
-                        # Apply same approval rules as top-level _call_tool
-                        _sa_ask, _sa_title, _sa_msg, _sa_style = _build_approval_check(
-                            tc_name, tc_args, self.approval_level,
-                            prefix="Sub-Agent — ", session_rules=self.session_rules
-                        )
-                        if _sa_ask:
-                            import json as _json
-                            _sa_args_str = _json.dumps(tc_args, ensure_ascii=False)
-                            _sa_approved, _sa_notes = await self._approval_prompt(
-                                _sa_title, _sa_msg, _sa_style,
-                                tool_name=tc_name, tool_args_str=_sa_args_str,
-                            )
-                            if not _sa_approved:
-                                _reason = f" User says: {_sa_notes}." if _sa_notes else ""
-                                tc_result = f"[cancelled by user]{_reason}"
-                                if not self.tui_queue:
-                                    console.print(Panel(
-                                        tc_result,
-                                        title="[dim cyan]Agent Tool Result[/dim cyan]",
-                                        border_style="cyan",
-                                    ))
-                                return tc["id"], tc_result
-                            if _sa_notes.startswith("session_allow:"):
-                                self.session_rules.append(_sa_notes[len("session_allow:"):])
-                            elif _sa_notes:
-                                self._approval_notes = _sa_notes
-                        # File write lock check for structured write tools
-                        _ag_wl_path = _extract_write_path(tc_name, tc_args)
-                        _ag_wl_abs = os.path.abspath(_ag_wl_path) if _ag_wl_path else None
-                        if _ag_wl_abs and _ag_wl_abs in self._write_locks:
-                            tc_result = f"[error: '{os.path.basename(_ag_wl_abs)}' is currently locked for writing by {self._write_locks[_ag_wl_abs]} — retry after it finishes]"
-                        else:
-                            if _ag_wl_abs:
-                                self._write_locks[_ag_wl_abs] = agent_label or "agent"
-                            try:
-                                tc_result = await self._dispatch_tool(tc_name, tc_args)
-                            finally:
-                                if _ag_wl_abs:
-                                    self._write_locks.pop(_ag_wl_abs, None)
-                        if self._approval_notes:
-                            tc_result += f"\n[Note from user: {self._approval_notes}]"
-                            self._approval_notes = ""
-                        if self.tui_queue:
-                            is_err = tc_result.startswith(("[error", "[unknown", "[blocked", "[cancelled"))
-                            await self.tui_queue.put({"type": "tool_done", "id": tc["id"], "name": tc_name, "result": tc_result, "is_error": is_err})
-                        elif self.compact_mode:
-                            console.print(f"[dim]      → {markup_escape(self._compact_result(tc_result))}[/dim]")
-                        else:
-                            border = "cyan" if not tc_result.startswith("[error") and not tc_result.startswith("[unknown") and not tc_result.startswith("[blocked") else "red"
-                            console.print(Panel(
-                                markup_escape(tc_result[:2000]) + ("..." if len(tc_result) > 2000 else ""),
-                                title="[dim cyan]Agent Tool Result[/dim cyan]",
-                                border_style=border,
-                            ))
-                        return tc["id"], tc_result
-
-                    _FETCH_SUMMARIZE_THRESHOLD = 2_000  # chars — below this, summarizing isn't worth it
-                    _FETCH_INPUT_CAP = 40_000           # chars fed to the summarizer (hard ceiling)
-
-                    async def _summarize_fetch(raw: str) -> str:
-                        """Distil a long web_fetch result down to task-relevant facts only."""
-                        prompt = (
-                            "Extract ONLY the facts, figures, dates, names, and quotes from the "
-                            "following web page content that are directly relevant to this research task:\n\n"
-                            f"Task: {task[:400]}\n\n"
-                            "Return a dense, factual summary — no fluff, no navigation, no ads. "
-                            "Keep important quotes verbatim. If nothing is relevant, say so in one sentence.\n\n"
-                            f"Content:\n{raw[:_FETCH_INPUT_CAP]}"
-                        )
-                        try:
-                            r = await self.client.post(
-                                f"{BASE_URL}/v1/chat/completions",
-                                json={
-                                    "model": self.model,
-                                    "messages": [
-                                        {"role": "system", "content": "You are a precise research extraction assistant. Be concise and factual."},
-                                        {"role": "user", "content": prompt},
-                                    ],
-                                    "stream": False,
-                                    "temperature": 0.1,
-                                    "chat_template_kwargs": {"enable_thinking": False},
-                                },
-                                timeout=60,
-                            )
-                            r.raise_for_status()
-                            summary = r.json()["choices"][0]["message"]["content"].strip()
-                            if summary:
-                                if not self.tui_queue:
-                                    console.print(f"[dim]  ↳ web fetch distilled: {len(raw):,} → {len(summary):,} chars[/dim]")
-                                return summary
-                        except Exception as e:
-                            if not self.tui_queue:
-                                console.print(f"[dim yellow]  ↳ fetch summarize failed ({e}), using truncation[/dim yellow]")
-                        return raw[:_FETCH_INPUT_CAP] + "\n[...truncated]"
-
-                    for tc in tool_calls_received:
-                        tc_id, tc_result_val = await _run_agent_tool(tc)
-                        tc_name = tc["function"]["name"]
-                        if tc_name == "web_fetch" and len(tc_result_val) > _FETCH_SUMMARIZE_THRESHOLD:
-                            tc_result_val = await _summarize_fetch(tc_result_val)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc_id,
-                            "content": tc_result_val,
-                        })
-                else:
-                    _hit_max_iter = False
-                    if assistant_content:
-                        messages.append({"role": "assistant", "content": assistant_content})
-                    break
-        finally:
-            self._subagent_depth -= 1
-            if self.tui_queue:
-                await self.tui_queue.put({"type": "system",
-                    "text": f"Releasing Slot {_slot.index + 1} ({_slot_label})"})
-            await _slot.release()
-
-            # Graceful summarise — always attempt when:
-            #   (a) agent produced no text output at all, or
-            #   (b) hit max iterations while still in a tool-call loop
-            #   (c) agent concluded naturally but wrote < 200 chars (likely a bare "done" message)
-            # This covers both model-switch and same-model agents.
-            _last_role = messages[-1]["role"] if messages else "user"
-            _thin_conclusion = bool(final_text) and len(final_text.strip()) < 200
-            _needs_summary = (not final_text) or _thin_conclusion or (_hit_max_iter and _last_role == "tool")
-            if _needs_summary and len(messages) > 2:
-                _stop_reason = (
-                    "You have reached the maximum number of tool-use iterations."
-                    if _hit_max_iter
-                    else "You are being stopped due to a model switch."
-                )
-                try:
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"{_stop_reason} "
-                            "Write a comprehensive research report covering everything you found. "
-                            "Structure it with clear sections: Key Findings, Details & Evidence, "
-                            "Sources, and Conclusions. Include all specific facts, figures, dates, "
-                            "names, and quotes that are relevant. Do not omit important findings — "
-                            "the caller will use this report as their primary record of the research."
-                        ),
-                    })
-                    if not self.tui_queue:
-                        console.print("[dim cyan]  Agent reached iteration limit — requesting summary...[/dim cyan]")
-                    # Send system + user task + all assistant messages + last tool results.
-                    # We want all the agent's reasoning visible, but tool results are large
-                    # so we keep only the last 20 messages to stay within context.
-                    _summary_msgs = messages[:2] + messages[-20:]
-                    async with self.client.stream(
-                        "POST",
-                        f"{BASE_URL}/v1/chat/completions",
-                        json={"model": self.model, "messages": _summary_msgs,
-                              "stream": True, "temperature": 0.3},
-                        headers={"Accept": "text/event-stream"},
-                    ) as resp:
-                        async for ev_type, ev_data in stream_events(
-                            resp, label=f"agent-summary | {BASE_URL}"
-                        ):
-                            if ev_type == "text":
-                                final_text += ev_data
-                                if self.tui_queue:
-                                    await self.tui_queue.put({"type": "text_token", "text": ev_data, "source": "agent", "agent_label": agent_label})
-                except Exception:
-                    pass  # best-effort only
-
-            if model and restore_profile:
-                if not self.tui_queue:
-                    console.print(Panel(
-                        f"[dim]Restoring server: {restore_profile}[/dim]",
-                        title="[yellow]Model Restore[/yellow]",
-                        border_style="yellow",
-                    ))
-                await _switch_server(restore_profile)
-
-        if self.compact_mode and not self.tui_queue and final_text:
-            console.print(Panel(Markdown(final_text), title="[cyan]Agent Report[/cyan]", border_style="cyan"))
-        return final_text or "[sub-agent returned no text]"
-
-    async def _tool_analyze_image(self, images: list[str], prompt: str | None = None) -> str:
-        """Send one or more images to the vision model. Handles local model switching if needed."""
-        import base64
-        if not images:
-            return "[error: no images provided]"
-        DEFAULT_PROMPT = "Describe this image in detail: content, composition, any text or code visible."
-        prompt = prompt or DEFAULT_PROMPT
-
-        meta = _load_commands_meta()
-        vision_external = meta.get("vision_external", False)
-        # External: vision runs on a separate machine — use vision_url directly.
-        # Local: vision model shares port 1234 (switched in/out by Server Manager).
-        vision_url = meta.get("vision_url", "http://localhost:1236") if vision_external else BASE_URL
-
-        # Find the vision profile name (first profile with vision: true in _meta)
-        vision_profile: str | None = None
-        for pname, pdata in meta.get("profiles", {}).items():
-            if pdata.get("vision"):
-                vision_profile = pname
-                break
-
-        # Decide whether to switch models
-        need_switch = (not vision_external) and (vision_profile is not None)
-        restore_profile: str | None = None
-
-        async def _call_one(path_str: str) -> str:
-            path = Path(self._resolve_path(path_str))
-            if not path.exists():
-                return f"[error: image not found: {path}]"
-            ext = path.suffix.lower().lstrip(".")
-            mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                    "png": "image/png", "webp": "image/webp"}.get(ext, "image/jpeg")
-            try:
-                b64 = base64.b64encode(path.read_bytes()).decode()
-            except Exception as e:
-                return f"[error: could not read image: {e}]"
-            payload = {
-                "model": "auto",
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                        {"type": "text", "text": prompt},
-                    ],
-                }],
-                "max_tokens": 1024,
-                "temperature": 0.3,
-            }
-            try:
-                async with httpx.AsyncClient(timeout=120.0) as c:
-                    r = await c.post(f"{vision_url}/v1/chat/completions", json=payload)
-                    r.raise_for_status()
-                    return r.json()["choices"][0]["message"]["content"]
-            except Exception as e:
-                return f"[error: vision API call failed: {e}]"
-
-        if need_switch:
-            restore_profile = await _find_active_profile()
-            if restore_profile == vision_profile:
-                need_switch = False  # already on vision model
-            else:
-                console.print(Panel(
-                    f"Switching to vision model: [bold]{vision_profile}[/bold]\n"
-                    f"Will restore [dim]{restore_profile or 'previous model'}[/dim] after.",
-                    border_style="magenta",
-                ))
-                ok = await _switch_server(vision_profile)
-                if not ok:
-                    return f"[error: failed to switch to vision model '{vision_profile}']"
-
-        results = []
-        total = len(images)
-        try:
-            for i, img_path in enumerate(images):
-                if total > 1:
-                    console.print(f"[magenta][Vision {i+1}/{total}][/magenta] {img_path}")
-                result = await _call_one(img_path)
-                results.append(result)
-        finally:
-            if need_switch and restore_profile:
-                console.print(f"[magenta]Vision done. Restoring [bold]{restore_profile}[/bold]...[/magenta]")
-                await _switch_server(restore_profile)
-
-        if total == 1:
-            return results[0]
-        return "\n\n".join(
-            f"[Image {i+1}: {Path(p).name}]\n{r}"
-            for i, (p, r) in enumerate(zip(images, results))
-        )
-
-    async def _tool_queue_agents(self, agent_specs: list[dict], label: str = "") -> str:
-        """Run a list of agents sequentially, store results, return consolidated summary."""
-        if not agent_specs:
-            return "[error: queue_agents called with empty agents list]"
-
-        # Validate models upfront — strip unknown ones rather than aborting
-        commands = _load_commands()
-        for spec in agent_specs:
-            m = spec.get("model")
-            if m and m not in commands:
-                available = "  ·  ".join(commands) or "(none)"
-                console.print(f"[dim yellow]  ⚠ unknown model '{m}' — using current model. Available: {available}[/dim yellow]")
-                spec["model"] = None
-
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        slug = label.lower().replace(" ", "-")[:32] if label else "run"
-        queue_dir = SESSIONS_DIR / f"queue_{ts}_{slug}"
-        queue_dir.mkdir(parents=True, exist_ok=True)
-
-        restore_profile = await _find_active_profile()
-        current_model = restore_profile
-        total = len(agent_specs)
-        results = []
-
-        console.print(Panel(
-            f"[bold cyan]Queue:[/bold cyan] {total} agent(s)  ·  label: {label or '(none)'}\n"
-            f"[dim]Results → {queue_dir}[/dim]",
-            title="[cyan]Agent Queue Started[/cyan]",
-            border_style="cyan",
-        ))
-
-        loop = asyncio.get_event_loop()
-
-        for idx, spec in enumerate(agent_specs):
-            agent_num = idx + 1
-            target_model = spec.get("model")
-            timeout_s = max(30, int(spec.get("timeout_seconds", 300)))
-            max_iter = min(int(spec.get("max_iterations", 10)), 50)
-            think = spec.get("think_level") or self.think_level
-            tools_wl = spec.get("tools")
-            task = spec.get("task", "")
-            sp = spec.get("system_prompt", "")
-
-            # Resolve profile → system prompt, auto-extract recommended model
-            if sp and " " not in sp.strip():
-                profile_path = Path(__file__).parent / "agents" / f"{sp}.md"
-                if profile_path.exists():
-                    sp = profile_path.read_text(encoding="utf-8")
-                    if not target_model:
-                        _m = _re.search(r'\*\*Recommended model:\*\*\s*`([^`]+)`', sp)
-                        if _m:
-                            target_model = _m.group(1).strip()
-
-            # Switch model only when needed
-            if target_model and target_model != current_model:
-                if not self.tui_queue:
-                    console.print(f"[dim yellow]  Switching to: {target_model}[/dim yellow]")
-                switched = await _switch_server(target_model)
-                if not switched:
-                    results.append({
-                        "index": idx, "system_prompt": spec.get("system_prompt", ""),
-                        "task": task, "model": target_model,
-                        "timeout_seconds": timeout_s, "status": "error",
-                        "result": f"[error: failed to switch to model '{target_model}']",
-                        "duration_seconds": 0.0,
-                    })
-                    if not self.tui_queue:
-                        console.print(f"[red]  Agent {agent_num}/{total} skipped — model switch failed[/red]")
-                    continue
-                current_model = target_model
-
-            # Build tool list
-            sub_tools = [t for t in TOOLS if t["function"]["name"] not in ("spawn_agent", "queue_agents", "analyze_image")]
-            if tools_wl:
-                sub_tools = [t for t in sub_tools if t["function"]["name"] in tools_wl]
-
-            messages: list[dict] = [
-                {"role": "system", "content": sp},
-                {"role": "user",   "content": task},
-            ]
-
-            if not self.tui_queue:
-                console.print(Panel(
-                    f"[bold]Task:[/bold] {task[:200]}{'...' if len(task) > 200 else ''}\n"
-                    f"[dim]Model: {target_model or current_model or 'current'}  ·  "
-                    f"Timeout: {timeout_s}s  ·  Max iter: {max_iter}[/dim]",
-                    title=f"[cyan]Queue Agent {agent_num}/{total}[/cyan]",
-                    border_style="cyan",
-                ))
-
-            start_t = loop.time()
-            agent_status = "completed"
-            final_text = ""
-            self._subagent_depth += 1
-            try:
-                deadline = loop.time() + timeout_s
-                for _iter in range(max_iter):
-                    # Check deadline before starting new iteration
-                    if loop.time() >= deadline:
-                        agent_status = "timeout"
-                        if messages and messages[-1]["role"] != "user":
-                            messages.append({
-                                "role": "user",
-                                "content": "Time limit reached. Summarise your findings concisely now.",
-                            })
-                            try:
-                                async with self.client.stream(
-                                    "POST", f"{BASE_URL}/v1/chat/completions",
-                                    json={"model": self.model, "messages": messages,
-                                          "stream": True, "temperature": 0.3},
-                                    headers={"Accept": "text/event-stream"},
-                                ) as resp:
-                                    async for ev_type, ev_data in stream_events(
-                                        resp, label=f"queue_agents-summary | {BASE_URL}"
-                                    ):
-                                        if ev_type == "text":
-                                            final_text += ev_data
-                            except Exception:
-                                pass
-                        break
-
-                    think_kwargs: dict = {}
-                    if think == "off":
-                        think_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-                    else:
-                        think_kwargs["chat_template_kwargs"] = {"enable_thinking": True}
-
-                    payload = {
-                        "model": self.model, "messages": messages,
-                        "tools": sub_tools, "tool_choice": "auto",
-                        "stream": True, "stream_options": {"include_usage": True},
-                        "temperature": 0.3 if think == "deep" else 0.6,
-                        **think_kwargs,
-                    }
-
-                    text_buf = ""
-                    assistant_content = ""
-                    tool_calls_received = []
-
-                    async with self.client.stream(
-                        "POST", f"{BASE_URL}/v1/chat/completions",
-                        json=payload, headers={"Accept": "text/event-stream"},
-                    ) as response:
-                        response.raise_for_status()
-                        _live = _NullLive() if (self.tui_queue or self.compact_mode) else Live(console=console, refresh_per_second=8)
-                        with _live as live:
-                            async for ev_type, ev_data in stream_events(
-                                response, label=f"queue_agents[iter] | model={current_model} | {BASE_URL}"
-                            ):
-                                if ev_type == "text":
-                                    text_buf += ev_data
-                                    assistant_content += ev_data
-                                    final_text = assistant_content
-                                    live.update(Panel(
-                                        Markdown(text_buf),
-                                        title=f"[cyan]Agent {agent_num}[/cyan]",
-                                        border_style="cyan",
-                                    ))
-                                elif ev_type == "tool_calls":
-                                    tool_calls_received = ev_data
-                                    live.update(Text(""))
-                                elif ev_type == "stop":
-                                    if not text_buf:
-                                        live.update(Text(""))
-
-                    # Fallback: model emitted tool calls as text
-                    if not tool_calls_received and assistant_content:
-                        _parsed = _try_parse_text_tool_calls(assistant_content)
-                        if _parsed:
-                            tool_calls_received = _parsed
-                            assistant_content = ""
-
-                    if tool_calls_received:
-                        messages.append({
-                            "role": "assistant",
-                            "content": assistant_content or None,
-                            "tool_calls": tool_calls_received,
-                        })
-                        async def _run_q_tool(tc):
-                            tc_name = tc["function"]["name"]
-                            try:
-                                tc_args = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"].strip() else {}
-                            except json.JSONDecodeError:
-                                tc_args = {}
-                            if self.compact_mode:
-                                console.print(f"[dim]    ◌ {tc_name}{markup_escape(self._compact_args(tc_name, tc_args))}[/dim]")
-                            tc_result = await self._dispatch_tool(tc_name, tc_args)
-                            if self.compact_mode:
-                                console.print(f"[dim]      → {markup_escape(self._compact_result(tc_result))}[/dim]")
-                            return tc["id"], tc_result
-                        for tc in tool_calls_received:
-                            tc_id, tc_result_val = await _run_q_tool(tc)
-                            messages.append({"role": "tool", "tool_call_id": tc_id, "content": tc_result_val})
-                    else:
-                        if assistant_content:
-                            messages.append({"role": "assistant", "content": assistant_content})
-                        break
-
-            except Exception as e:
-                agent_status = "error"
-                final_text = final_text or f"[error during agent execution: {e}]"
-            finally:
-                self._subagent_depth -= 1
-
-            duration = round(loop.time() - start_t, 1)
-            status_icon = {"completed": "✓", "timeout": "⏱", "error": "✗"}.get(agent_status, "?")
-            if not self.tui_queue:
-                console.print(Panel(
-                    Markdown(final_text[:500] + ("..." if len(final_text) > 500 else "")) if final_text else "[dim](no output)[/dim]",
-                    title=f"[cyan]Agent {agent_num}/{total}  {status_icon} {agent_status}  ({duration}s)[/cyan]",
-                    border_style="cyan" if agent_status == "completed" else "yellow" if agent_status == "timeout" else "red",
-                ))
-
-            results.append({
-                "index": idx,
-                "system_prompt": spec.get("system_prompt", ""),
-                "task": task,
-                "model": target_model or current_model or "",
-                "timeout_seconds": timeout_s,
-                "status": agent_status,
-                "result": final_text or "[no output]",
-                "duration_seconds": duration,
-            })
-
-        # Restore original model if we moved away from it
-        if current_model != restore_profile and restore_profile:
-            if not self.tui_queue:
-                console.print(Panel(
-                    f"[dim]Restoring: {restore_profile}[/dim]",
-                    title="[yellow]Model Restore[/yellow]",
-                    border_style="yellow",
-                ))
-            await _switch_server(restore_profile)
-
-        # Write results to disk
-        output = {
-            "label": label,
-            "started": ts,
-            "completed_at": datetime.now().isoformat(),
-            "agent_count": total,
-            "results": results,
-        }
-        results_path = queue_dir / "results.json"
-        results_path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
-
-        # Build return summary
-        counts = {"completed": 0, "timeout": 0, "error": 0}
-        for r in results:
-            counts[r["status"]] = counts.get(r["status"], 0) + 1
-        summary_lines = [
-            f"Queue complete: {total} agent(s) — "
-            f"{counts['completed']} completed, {counts['timeout']} timeout, {counts['error']} error(s)",
-            f"Results saved: {results_path}",
-            "",
-        ]
-        for r in results:
-            icon = {"completed": "✓", "timeout": "⏱", "error": "✗"}.get(r["status"], "?")
-            snippet = r["result"][:200].replace("\n", " ")
-            summary_lines.append(f"{icon} Agent {r['index']+1}: {snippet}{'...' if len(r['result']) > 200 else ''}")
-        return "\n".join(summary_lines)
-
     async def _call_tool(self, name: str, arguments_str: str, call_id: str) -> str:
         try:
             args = json.loads(arguments_str) if arguments_str.strip() else {}
@@ -4046,912 +1663,6 @@ class ChatSession:
             )
         return result
 
-# ── Voice conversation loop ────────────────────────────────────────────────────
-
-async def _voice_model_call(
-    history: list,
-    client: httpx.AsyncClient,
-    session: "ChatSession | None" = None,
-    use_tools: bool = False,
-) -> str:
-    """Send voice history to the model and return the full reply text. Returns '' on failure.
-
-    When use_tools=True and session is provided, the model may call tools.  The
-    tool loop runs silently (results shown in terminal but not spoken).  The final
-    text reply is streamed to the terminal and returned for TTS.
-    """
-
-    # ── Tool loop (non-streaming so we can inspect tool_calls) ─────────────────
-    if use_tools and session is not None:
-        working_history = list(history)
-        tools_used = False
-        for _round in range(6):   # cap tool-calling rounds to prevent infinite loops
-            payload_nt = {
-                "model": "auto",
-                "messages": working_history,
-                "stream": False,
-                "temperature": 0.85,
-                "max_tokens": 600,
-                "tools": TOOLS,
-                "chat_template_kwargs": {"enable_thinking": False},
-            }
-            try:
-                r = await client.post(f"{BASE_URL}/v1/chat/completions", json=payload_nt)
-                r.raise_for_status()
-            except httpx.ConnectError:
-                console.print("[red]LLM server went away.[/red]")
-                return ""
-            except httpx.HTTPError as e:
-                console.print(f"[red]Server error: {e}[/red]")
-                return ""
-
-            choice = r.json()["choices"][0]
-            msg    = choice["message"]
-            finish = choice.get("finish_reason", "")
-
-            if finish == "tool_calls" or msg.get("tool_calls"):
-                # Execute every tool call and append results to working history
-                tools_used = True
-                working_history.append({"role": "assistant", **{k: v for k, v in msg.items() if k != "role"}})
-                for tc in msg.get("tool_calls", []):
-                    tc_id   = tc["id"]
-                    tc_name = tc["function"]["name"]
-                    try:
-                        tc_args = json.loads(tc["function"]["arguments"])
-                    except Exception:
-                        tc_args = {}
-                    console.print(f"[dim]  ◌ {tc_name}({tc_args})[/dim]")
-                    tc_result = await session._dispatch_tool(tc_name, tc_args)
-                    console.print(f"[dim]    → {tc_result[:200]}[/dim]")
-                    working_history.append({
-                        "role": "tool",
-                        "tool_call_id": tc_id,
-                        "content": tc_result,
-                    })
-                continue   # go around for the model to process results
-
-            # Model returned text directly (no tool calls this round).
-            text_reply = (msg.get("content") or "").strip()
-
-            if not tools_used:
-                # No tools were called at all — return the direct reply as-is.
-                # A summary call here would produce a past-tense recap of a live reply.
-                if text_reply:
-                    console.print()
-                    console.print(text_reply, markup=False)
-                    console.print()
-                    return text_reply
-                return ""
-
-            # Tools were used — the 600-token reply may be long or structured.
-            # Make one tight follow-up call: no tools, 180 tokens, spoken-summary prompt.
-            if text_reply:
-                working_history.append({"role": "assistant", "content": text_reply})
-
-            working_history.append({
-                "role": "user",
-                "content": (
-                    "[Internal instruction — not from the human] "
-                    "Summarise what you just found or did in one to three short spoken sentences. "
-                    "No lists, no markdown. Speak directly to the person."
-                ),
-            })
-            try:
-                r2 = await client.post(f"{BASE_URL}/v1/chat/completions", json={
-                    "model": "auto",
-                    "messages": working_history,
-                    "stream": False,
-                    "temperature": 0.85,
-                    "max_tokens": 180,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                })
-                r2.raise_for_status()
-                text_content = (r2.json()["choices"][0]["message"].get("content") or "").strip()
-            except Exception:
-                text_content = text_reply
-
-            if text_content:
-                console.print()
-                console.print(text_content, markup=False)
-                console.print()
-                return text_content
-
-            return ""
-
-        return ""   # ran out of tool rounds without a text reply
-
-    # ── Simple streaming (no tools) ────────────────────────────────────────────
-    payload = {
-        "model": "auto",
-        "messages": history,
-        "stream": True,
-        "temperature": 0.85,
-        "max_tokens": 180,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
-    reply_parts: list[str] = []
-    console.print()
-    try:
-        async with client.stream(
-            "POST",
-            f"{BASE_URL}/v1/chat/completions",
-            json=payload,
-            headers={"Accept": "text/event-stream"},
-        ) as response:
-            response.raise_for_status()
-            async for event_type, data in stream_events(
-                response, label=f"simple-stream | {BASE_URL}"
-            ):
-                if event_type == "text":
-                    reply_parts.append(data)
-                    console.print(data, end="", markup=False)
-    except httpx.ConnectError:
-        console.print("\n[red]LLM server went away — is llama-server still running?[/red]")
-        return ""
-    except httpx.RemoteProtocolError:
-        console.print("\n[red]LLM server closed the connection mid-stream.[/red]")
-        return ""
-    except httpx.HTTPError as e:
-        console.print(f"\n[red]Server error: {e}[/red]")
-        return ""
-    console.print()
-    return "".join(reply_parts).strip()
-
-
-async def _voice_record_ptt(ptt_event_start: asyncio.Event, ptt_event_stop: asyncio.Event) -> bytes:
-    """Record audio while PTT is held. Returns raw int16 PCM bytes."""
-    import numpy as np
-    import sounddevice as sd
-
-    await ptt_event_start.wait()
-    ptt_event_start.clear()
-    console.print("[bold red]● REC[/bold red]", end="\r")
-
-    chunks: list[bytes] = []
-    loop = asyncio.get_event_loop()
-    chunk_done = asyncio.Event()
-    current_chunk: list = [None]
-
-    def callback(indata, frames, time_info, status):
-        current_chunk[0] = indata.copy()
-        loop.call_soon_threadsafe(chunk_done.set)
-
-    block_size = int(VOICE_SAMPLE_RATE * 0.05)  # 50ms chunks
-    with sd.InputStream(
-        samplerate=VOICE_SAMPLE_RATE,
-        channels=1,
-        dtype="int16",
-        blocksize=block_size,
-        callback=callback,
-    ):
-        while not ptt_event_stop.is_set():
-            chunk_done.clear()
-            await asyncio.wait_for(chunk_done.wait(), timeout=0.2)
-            if current_chunk[0] is not None:
-                chunks.append(current_chunk[0].tobytes())
-
-    return b"".join(chunks)
-
-
-async def _voice_record_auto(quit_event: asyncio.Event) -> bytes | None:
-    """Record audio using WebRTC VAD + RMS gate. Returns PCM bytes or None if quit."""
-    import numpy as np
-    import sounddevice as sd
-    import webrtcvad
-
-    vad = webrtcvad.Vad(2)
-    frame_ms = 20
-    frame_samples = int(VOICE_SAMPLE_RATE * frame_ms / 1000)
-    silence_frames_needed = int(VOICE_SILENCE_TIMEOUT * 1000 / frame_ms)
-    min_speech_frames = int(VOICE_MIN_SPEECH_MS / frame_ms)
-
-    speech_chunks: list[bytes] = []
-    silence_count = 0
-    in_speech = False
-    onset_count = 0   # consecutive loud+speech frames; must reach VOICE_ONSET_FRAMES
-
-    loop = asyncio.get_event_loop()
-    q: asyncio.Queue = asyncio.Queue()
-
-    def callback(indata, frames, time_info, status):
-        loop.call_soon_threadsafe(q.put_nowait, indata.copy().tobytes())
-
-    with sd.InputStream(
-        samplerate=VOICE_SAMPLE_RATE,
-        channels=1,
-        dtype="int16",
-        blocksize=frame_samples,
-        callback=callback,
-    ):
-        while not quit_event.is_set():
-            try:
-                frame = await asyncio.wait_for(q.get(), timeout=0.1)
-            except asyncio.TimeoutError:
-                continue
-
-            # RMS gate — ignore frames below volume threshold regardless of VAD
-            audio_np = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
-            rms = float(np.sqrt(np.mean(audio_np ** 2)))
-            is_speech = rms >= VOICE_RMS_THRESHOLD and vad.is_speech(frame, VOICE_SAMPLE_RATE)
-
-            if is_speech:
-                onset_count += 1
-                if not in_speech:
-                    if onset_count >= VOICE_ONSET_FRAMES:
-                        # Confirmed speech onset
-                        in_speech = True
-                        console.print("[bold red]● REC[/bold red]", end="\r")
-                else:
-                    speech_chunks.append(frame)
-                    silence_count = 0
-            else:
-                onset_count = 0
-                if in_speech:
-                    speech_chunks.append(frame)
-                    silence_count += 1
-                    if silence_count >= silence_frames_needed:
-                        if len(speech_chunks) >= min_speech_frames:
-                            return b"".join(speech_chunks)
-                        else:
-                            speech_chunks.clear()
-                            in_speech = False
-                            silence_count = 0
-                            console.print("[dim]  (too short, discarded)[/dim]")
-    return None
-
-
-async def _voice_transcribe(audio_bytes: bytes) -> str:
-    """POST raw PCM to /transcribe and return transcript."""
-    import requests as _requests
-    console.print("[dim]⏳ transcribing...[/dim]", end="\r")
-    resp = _requests.post(
-        f"{TTS_URL}/transcribe",
-        data=audio_bytes,
-        params={"sample_rate": VOICE_SAMPLE_RATE},
-        headers={"Content-Type": "application/octet-stream"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json().get("text", "").strip()
-
-
-async def _voice_speak(text: str) -> None:
-    """Send text to TTS server for playback (blocking)."""
-    import requests as _requests
-    _requests.post(
-        f"{TTS_URL}/play",
-        json={"text": text},
-        timeout=60,
-    )
-
-
-async def _voice_conversation_loop(session: ChatSession, mode: str = "ptt", use_tools: bool = False) -> None:
-    """Blocking voice conversation loop. Exit: Escape (ptt/auto) or q+Enter (CLI).
-    TUI-aware: when session.tui_queue is set, emits events instead of console.print.
-    """
-    _tq = session.tui_queue  # None in CLI, asyncio.Queue in TUI
-
-    async def _sys(text: str) -> None:
-        """Emit a status line — TUI system event or console.print."""
-        if _tq:
-            await _tq.put({"type": "system", "text": text})
-        else:
-            console.print(f"[dim]{text}[/dim]")
-
-    async def _voice_msg(role: str, text: str) -> None:
-        """Emit a transcript/reply line as a chat bubble or console line."""
-        if _tq:
-            # Reuse text_done so the drain loop renders it as a message widget
-            src = "eli" if role == "assistant" else "eli"
-            prefix = "You said" if role == "user" else "Eli"
-            await _tq.put({"type": "system", "text": f"[{prefix}] {text}"})
-        else:
-            label = "[bold green]You:[/bold green]" if role == "user" else "[bold cyan]Eli:[/bold cyan]"
-            console.print(f"{label} {text}")
-
-    try:
-        import sounddevice  # noqa: F401 — check it's available
-    except ImportError:
-        if _tq:
-            await _tq.put({"type": "system", "text": "sounddevice not installed — voice unavailable"})
-        else:
-            console.print("[red]sounddevice not installed. Run: .venv\\Scripts\\pip install sounddevice[/red]")
-        return
-
-    # Load persona from agents/voice.md; fall back to inline constant
-    voice_agent_file = Path(__file__).parent / "agents" / "voice.md"
-    voice_prompt = (
-        voice_agent_file.read_text(encoding="utf-8")
-        if voice_agent_file.exists()
-        else VOICE_SYSTEM_PROMPT
-    )
-    history = [{"role": "system", "content": voice_prompt}]
-
-    from pynput import keyboard as _kb
-
-    quit_event = asyncio.Event()
-    loop = asyncio.get_event_loop()
-
-    if mode == "ptt":
-        # Resolve the PTT key
-        try:
-            ptt_key = getattr(_kb.Key, PTT_KEY)
-        except AttributeError:
-            ptt_key = _kb.KeyCode.from_char(PTT_KEY)
-
-        ptt_start = asyncio.Event()
-        ptt_stop  = asyncio.Event()
-
-        def on_press(key):
-            if key == ptt_key:
-                loop.call_soon_threadsafe(ptt_start.set)
-                loop.call_soon_threadsafe(ptt_stop.clear)
-            elif key == _kb.Key.esc:
-                loop.call_soon_threadsafe(quit_event.set)
-
-        def on_release(key):
-            if key == ptt_key:
-                loop.call_soon_threadsafe(ptt_stop.set)
-
-        listener = _kb.Listener(on_press=on_press, on_release=on_release)
-        listener.start()
-
-        tools_note = "tools: on" if use_tools else "tools: off"
-        await _sys(f"Voice PTT — hold {PTT_KEY} to speak, release to send. ESC to exit. {tools_note}")
-
-        try:
-            while not quit_event.is_set():
-                while not ptt_start.is_set() and not quit_event.is_set():
-                    await asyncio.sleep(0.05)
-
-                if quit_event.is_set():
-                    break
-
-                audio = await _voice_record_ptt(ptt_start, ptt_stop)
-                if not audio:
-                    continue
-
-                transcript = await _voice_transcribe(audio)
-                if not transcript:
-                    await _sys("(nothing heard)")
-                    continue
-
-                await _voice_msg("user", transcript)
-                history.append({"role": "user", "content": transcript})
-
-                reply = await _voice_model_call(history, session.client, session=session, use_tools=use_tools)
-                if not reply:
-                    continue
-                history.append({"role": "assistant", "content": reply})
-
-                await _voice_msg("assistant", reply)
-                await _voice_speak(reply)
-                await asyncio.sleep(VOICE_POST_TTS_DELAY)
-
-        except KeyboardInterrupt:
-            pass
-        finally:
-            listener.stop()
-
-    else:  # auto VAD mode
-        try:
-            import webrtcvad  # noqa: F401
-        except ImportError:
-            if _tq:
-                await _tq.put({"type": "system", "text": "webrtcvad not installed — auto voice unavailable"})
-            else:
-                console.print("[red]webrtcvad not installed. Run: .venv\\Scripts\\pip install webrtcvad[/red]")
-            return
-
-        def on_press_auto(key):
-            if key == _kb.Key.esc:
-                loop.call_soon_threadsafe(quit_event.set)
-
-        listener = _kb.Listener(on_press=on_press_auto)
-        listener.start()
-
-        tools_note = "tools: on" if use_tools else "tools: off"
-        await _sys(f"Voice AUTO — speak naturally, pause to send. ESC to exit. {tools_note}")
-
-        try:
-            while not quit_event.is_set():
-                audio = await _voice_record_auto(quit_event)
-                if not audio or quit_event.is_set():
-                    break
-
-                transcript = await _voice_transcribe(audio)
-                if not transcript:
-                    await _sys("(nothing heard)")
-                    continue
-
-                await _voice_msg("user", transcript)
-                history.append({"role": "user", "content": transcript})
-
-                reply = await _voice_model_call(history, session.client, session=session, use_tools=use_tools)
-                if not reply:
-                    continue
-                history.append({"role": "assistant", "content": reply})
-
-                await _voice_msg("assistant", reply)
-                await _voice_speak(reply)
-                await asyncio.sleep(VOICE_POST_TTS_DELAY)
-
-        except KeyboardInterrupt:
-            pass
-        finally:
-            listener.stop()
-
-    await _sys("Voice mode ended")
-
-
-# ── Slash command handler ─────────────────────────────────────────────────────
-async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
-    """Returns True if command was handled (skip sending to model)."""
-    parts = cmd.strip().split()
-    name = parts[0].lower()
-
-    if name == "/help":
-        console.print(
-            Panel(
-                "\n".join([
-                    "[bold]/clear[/bold]                 Reset message history",
-                    "[bold]/tools[/bold]                 List available tools",
-                    "[bold]/think \\[off|on|deep\\][/bold]   Set thinking level (or cycle)",
-                    "[bold]/save \\[path\\][/bold]           Save conversation to JSON",
-                    "[bold]/compact[/bold]               Summarise older messages to free context",
-                    "[bold]/debug \\[path|off\\][/bold]     Capture raw SSE stream to file (default: debug_stream_TIMESTAMP.log)",
-                    "[bold]/status[/bold]                Show token usage and context window info",
-                    "[bold]/sessions[/bold]              List saved sessions",
-                    "[bold]/resume \\[name\\][/bold]         Load a saved session (replaces current)",
-                    "[bold]/approval \\[mode\\][/bold]       Set approval tier: auto|ask-writes|ask-all|yolo",
-                    "[bold]/cd \\[path\\][/bold]             Set working directory for bash commands",
-                    "[bold]/pwd[/bold]                   Show current working directory",
-                    "[bold]/model \\[id\\][/bold]             Switch model or list available models",
-                    "[bold]/role \\[name\\][/bold]            Adopt an agent persona in the current session",
-                    "[bold]/config[/bold]                Show loaded eli.toml project config",
-                    "[bold]/skills[/bold]                List available skills",
-                    "[bold]/skill <name> \\[args\\][/bold]   Invoke a skill explicitly",
-                    "[bold]/queue-results \\[label\\][/bold]  List recent agent queue runs, or show one by label",
-                    "[bold]/voice \\[ptt|auto\\] \\[tools\\][/bold]  Start voice sparring mode (tools flag enables tool use)",
-                    "[bold]/help[/bold]                  Show this message",
-                    "",
-                    "[bold]Shift+Tab[/bold]              Cycle mode: normal → plan → normal",
-                    "[dim]  normal  tools are executed automatically[/dim]",
-                    "[dim]  plan    model describes its plan, no tools run[/dim]",
-                    "[bold]Ctrl+O[/bold]                 Toggle compact mode (collapse thinking/tools)",
-                    "",
-                    "[dim]Enter  Submit  |  Alt+Enter  Newline  |  Ctrl+D  Exit  |  Ctrl+C  Interrupt[/dim]",
-                ]),
-                title="Commands",
-                border_style="cyan",
-            )
-        )
-        return True
-
-    elif name == "/clear":
-        # Cancel background agent tasks and release all ISM slots
-        for _t in list(session._bg_agent_tasks):
-            if not _t.done():
-                _t.cancel()
-        session._bg_agent_tasks.clear()
-        session._pending_bg_results.clear()
-        session._pending_bg_tool_calls.clear()
-        await _ism.force_release_all()
-        _initial, _ = _build_initial_messages()
-        session.messages = _initial
-        session._n_fixed = len(_initial)
-        session.tokens_used = session.tokens_prompt = session.tokens_completion = 0
-        await session._refresh_project_config()
-        console.print(Rule("[dim]History cleared[/dim]", style="dim"))
-        if session.tui_queue:
-            await session.tui_queue.put({"type": "clear_chat"})
-        return True
-
-    elif name == "/tools":
-        lines = []
-        for t in TOOLS:
-            fn = t["function"]
-            params = list(fn["parameters"]["properties"].keys())
-            lines.append(f"[bold cyan]{fn['name']}[/bold cyan]({', '.join(params)})  —  {fn['description']}")
-        console.print(Panel("\n".join(lines), title="Available Tools", border_style="cyan"))
-        return True
-
-    elif name == "/think":
-        LEVELS = ("off", "on", "deep")
-        if len(parts) > 1 and parts[1].lower() in LEVELS:
-            session.think_level = parts[1].lower()
-        else:
-            # cycle: off → on → deep → off
-            idx = LEVELS.index(session.think_level)
-            session.think_level = LEVELS[(idx + 1) % len(LEVELS)]
-        labels = {"off": "[dim]off — thinking disabled[/dim]",
-                  "on":  "[cyan]on — normal thinking[/cyan]",
-                  "deep": "[yellow]deep — thorough reasoning, temp 0.3[/yellow]"}
-        console.print(f"Think level: {labels[session.think_level]}")
-        _save_state(think_level=session.think_level)
-        return True
-
-    elif name == "/debug":
-        import chat as _chat_mod
-        if len(parts) > 1 and parts[1].lower() in ("off", "0", "false"):
-            _chat_mod._debug_close()
-            console.print("[dim]Debug stream capture: off[/dim]")
-        elif _chat_mod._debug_file:
-            console.print(f"[dim]Debug stream capture already active → {_chat_mod._debug_path}[/dim]")
-            console.print("[dim]Use /debug off to stop.[/dim]")
-        else:
-            path_arg = parts[1] if len(parts) > 1 else "1"
-            resolved = _chat_mod._debug_open(path_arg)
-            console.print(f"[yellow]Debug stream capture: on → {resolved}[/yellow]")
-        return True
-
-    elif name == "/compact":
-        await session._compact_history(manual=True)
-        return True
-
-    elif name == "/status":
-        pct = session.tokens_used / session.ctx_window * 100 if session.ctx_window else 0
-        bar_width = 30
-        filled = int(bar_width * pct / 100)
-        bar = "█" * filled + "░" * (bar_width - filled)
-        bar_style = "yellow" if pct > 60 else "green"
-        think_label = {"off": "off", "on": "on", "deep": "deep (temp 0.3)"}[session.think_level]
-        console.print(Panel("\n".join([
-            f"[bold]Context window:[/bold]  {session.ctx_window:,} tokens",
-            f"[bold]Tokens used:[/bold]     {session.tokens_used:,}  (~{pct:.0f}%)",
-            f"[bold]Usage bar:[/bold]       [{bar_style}]{bar}[/{bar_style}]",
-            f"[bold]Messages:[/bold]        {len(session.messages) - session._n_fixed} (+ {session._n_fixed} fixed system)",
-            f"[bold]Think level:[/bold]     {think_label}",
-            f"[bold]Compact at:[/bold]      {int(session.ctx_window * CTX_COMPACT_THRESH):,} "
-            f"tokens ({CTX_COMPACT_THRESH * 100:.0f}%)",
-        ]), title="[cyan]Session Status[/cyan]", border_style="cyan"))
-        return True
-
-    elif name == "/save":
-        path = parts[1] if len(parts) > 1 else f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(session.messages, f, indent=2, ensure_ascii=False)
-            console.print(f"[green]Saved to {path}[/green]")
-        except Exception as e:
-            console.print(f"[red]Save failed: {e}[/red]")
-        return True
-
-    elif name == "/sessions":
-        _all = [p for p in SESSIONS_DIR.glob("*.json") if p.name != "state.json"] if SESSIONS_DIR.exists() else []
-        if not _all:
-            console.print("[dim]No saved sessions.[/dim]")
-            if session.tui_queue:
-                await session.tui_queue.put({"type": "system", "text": "No saved sessions."})
-            return True
-        all_sessions = sorted(_all, reverse=True)
-        if session.tui_queue:
-            rows = []
-            for s in all_sessions:
-                try:
-                    data = json.loads(s.read_text(encoding="utf-8"))
-                    tok = data.get("token_estimate", 0)
-                    saved_at = data.get("saved_at", "")[:16].replace("T", " ")
-                    rows.append(f"{s.stem}  —  {saved_at}  (~{tok:,} tokens)")
-                except Exception:
-                    rows.append(f"{s.stem}  —  (unreadable)")
-            await session.tui_queue.put({"type": "system", "text": "Saved sessions:\n" + "\n".join(rows)})
-        else:
-            lines = []
-            for s in all_sessions:
-                try:
-                    data = json.loads(s.read_text(encoding="utf-8"))
-                    tok = data.get("token_estimate", 0)
-                    saved_at = data.get("saved_at", "")[:16].replace("T", " ")
-                    lines.append(f"[cyan]{s.stem}[/cyan]  [dim]{saved_at}  ~{tok:,} tokens[/dim]")
-                except Exception:
-                    lines.append(f"[cyan]{s.stem}[/cyan]  [dim](unreadable)[/dim]")
-            console.print(Panel("\n".join(lines), title="Saved Sessions", border_style="cyan"))
-        return True
-
-    elif name == "/resume":
-        resume_name = parts[1] if len(parts) > 1 else None
-        saved_msgs, sess_path, saved_cwd = _load_session(resume_name)
-        if not saved_msgs:
-            hint = resume_name or "latest"
-            console.print(f"[yellow]No session found matching '{hint}'[/yellow]")
-            return True
-        _initial, _ = _build_initial_messages()
-        session.messages = _initial + saved_msgs
-        session._n_fixed = len(_initial)
-        session._session_path = sess_path
-        session.tokens_used = session.tokens_prompt = session.tokens_completion = 0
-        if saved_cwd and Path(saved_cwd).is_dir():
-            session.cwd = Path(saved_cwd)
-            await session._refresh_project_config()
-            if session.tui_queue:
-                await session.tui_queue.put({"type": "cwd_changed", "cwd": str(session.cwd)})
-        if session.tui_queue:
-            await session.tui_queue.put({"type": "session_resume_html", "json_path": str(sess_path)})
-        console.print(Rule(f"[cyan]Session loaded: {sess_path.name}[/cyan]", style="cyan"))
-        return True
-
-    elif name == "/approval":
-        VALID = ("auto", "ask-writes", "ask-all", "yolo")
-        if len(parts) > 1 and parts[1].lower() in VALID:
-            session.approval_level = parts[1].lower()
-        labels = {
-            "auto":       "[green]auto — installs and dangerous commands ask[/green]",
-            "ask-writes": "[yellow]ask-writes — all writes and bash ask[/yellow]",
-            "ask-all":    "[yellow]ask-all — every tool call asks[/yellow]",
-            "yolo":       "[red]yolo — nothing asks (use with care)[/red]",
-        }
-        console.print(f"Approval: {labels[session.approval_level]}")
-        if len(parts) <= 1:
-            console.print(f"  Usage: /approval [{' | '.join(VALID)}]")
-        else:
-            _save_state(approval_level=session.approval_level)
-        return True
-
-    elif name == "/cd":
-        if len(parts) < 2:
-            console.print(f"[dim]Current directory: {session.cwd}[/dim]")
-            return True
-        new_path = Path(" ".join(parts[1:])).expanduser()
-        if not new_path.is_absolute():
-            new_path = session.cwd / new_path
-        new_path = new_path.resolve()
-        if not new_path.is_dir():
-            console.print(f"[red]Not a directory: {new_path}[/red]")
-            return True
-        session.cwd = new_path
-        console.print(f"[green]Working directory: {session.cwd}[/green]")
-        await session._refresh_project_config()
-        if session.tui_queue:
-            await session.tui_queue.put({"type": "cwd_changed", "cwd": str(session.cwd)})
-        return True
-
-    elif name == "/pwd":
-        console.print(f"[dim]{session.cwd}[/dim]")
-        return True
-
-    elif name == "/skills":
-        skills = _load_skills()
-        if not skills:
-            console.print("[dim]No skills found in skills/[/dim]")
-            return True
-        lines = []
-        for sname, skill in sorted(skills.items()):
-            tag = " [cyan][agent][/cyan]" if skill.get("spawn_agent") else ""
-            desc = skill.get("description", "(no description)")
-            raw_triggers = skill.get("triggers", [])
-            if isinstance(raw_triggers, str):
-                raw_triggers = [t.strip() for t in raw_triggers.split(",") if t.strip()]
-            trigger_str = f"  [dim]· triggers: {', '.join(raw_triggers)}[/dim]" if raw_triggers else ""
-            lines.append(f"[bold cyan]/{sname}[/bold cyan]{tag}  —  {desc}{trigger_str}")
-        console.print(Panel("\n".join(lines), title="Skills", border_style="cyan"))
-        return True
-
-    elif name == "/skill":
-        if len(parts) < 2:
-            console.print("[yellow]Usage: /skill <name> [args][/yellow]")
-            return True
-        skill_name = parts[1].lower()
-        skill_args = " ".join(parts[2:]) if len(parts) > 2 else ""
-        found = await _invoke_skill(skill_name, skill_args, session)
-        if not found:
-            console.print(f"[yellow]Unknown skill: {skill_name} (try /skills)[/yellow]")
-        return True
-
-    elif name == "/model":
-        # Fetch available profiles and currently loaded model from Server Manager
-        profiles_data = await _control("GET", "/api/profiles")
-        status_data   = await _control("GET", "/api/status")
-        profiles: list[str] = profiles_data if isinstance(profiles_data, list) else list(_load_commands().keys())
-        loaded: str | None  = status_data.get("model") if isinstance(status_data, dict) else None
-
-        if len(parts) > 1:
-            target = " ".join(parts[1:])
-            # Accept unambiguous prefix matches
-            matches = [p for p in profiles if p.lower().startswith(target.lower())]
-            if not matches:
-                matches = [p for p in profiles if target.lower() in p.lower()]
-            if len(matches) == 1:
-                target = matches[0]
-            elif len(matches) > 1:
-                console.print(f"[yellow]Ambiguous — did you mean:[/yellow]")
-                for m in matches:
-                    console.print(f"  {m}")
-                return True
-            elif target not in profiles:
-                console.print(f"[yellow]Unknown profile: {target}[/yellow]")
-                console.print(f"[dim]Available: {', '.join(profiles)}[/dim]")
-                return True
-
-            if target == loaded:
-                console.print(f"[dim]{target} is already loaded.[/dim]")
-                return True
-
-            console.print(f"[cyan]Switching to {target}…[/cyan]")
-            ok = await _switch_server(target)
-            if ok:
-                session.model = "auto"
-                _save_state(model=session.model)
-            return True
-
-        # No argument — list all profiles
-        lines = []
-        for p in profiles:
-            marker = "  [green]● loaded[/green]" if p == loaded else ""
-            lines.append(f"[bold cyan]{p}[/bold cyan]{marker}")
-        if not loaded:
-            lines.append("\n[dim]Server Manager not reachable — profile list from commands.json[/dim]")
-        lines.append(f"\n[dim]Usage: /model <name>   (prefix match supported)[/dim]")
-        console.print(Panel("\n".join(lines), title="Models", border_style="cyan"))
-        return True
-
-    elif name == "/role":
-        agents_dir = Path(__file__).parent / "agents"
-        if len(parts) < 2:
-            profiles = sorted(p.stem for p in agents_dir.glob("*.md")) if agents_dir.exists() else []
-            if profiles:
-                lines = ["[bold cyan]eli[/bold cyan]  [dim](default — revert to Eli)[/dim]"]
-                lines += [f"[bold magenta]{p}[/bold magenta]" for p in profiles]
-                lines.append("\n[dim]Usage: /role <name>  — adopt this persona in the current session[/dim]")
-                console.print(Panel("\n".join(lines), title="Agent Profiles", border_style="magenta"))
-            else:
-                console.print("[dim]No agent profiles found in agents/[/dim]")
-            return True
-        role_name = parts[1].lower().replace("-", "_")
-
-        # "eli" reverts to the base system prompt
-        if role_name == "eli":
-            session.messages.append({
-                "role": "system",
-                "content": (
-                    "[Role Revert — Eli]\n\n"
-                    "Discard any previous role overrides. You are Eli again, operating under "
-                    "your original system instructions. Conversation context is preserved."
-                ),
-            })
-            session.role = "eli"
-            _save_state(role="eli")
-            console.print(Panel(
-                "Reverted to [bold cyan]Eli[/bold cyan].\n"
-                "[dim]Conversation context preserved.[/dim]",
-                border_style="cyan",
-            ))
-            return True
-
-        agent_file = agents_dir / f"{role_name}.md"
-        if not agent_file.exists():
-            agent_file = agents_dir / f"{parts[1].lower()}.md"
-        if not agent_file.exists():
-            console.print(f"[yellow]No profile found: agents/{role_name}.md — try /role with no args to list[/yellow]")
-            return True
-        profile = agent_file.read_text(encoding="utf-8")
-        session.messages.append({
-            "role": "system",
-            "content": (
-                f"[Role Override — {role_name}]\n\n"
-                f"The user has asked you to adopt the following agent persona for the remainder of "
-                f"this conversation. Read and embody it fully. Your tools and capabilities remain "
-                f"unchanged. Continue the current conversation context.\n\n{profile}"
-            ),
-        })
-        session.role = role_name
-        _save_state(role=role_name)
-        console.print(Panel(
-            f"Persona loaded: [bold magenta]{role_name}[/bold magenta]\n"
-            f"[dim]Profile injected as system message. Conversation context preserved.[/dim]",
-            border_style="magenta",
-        ))
-        return True
-
-    elif name == "/config":
-        config = session._project_config
-        if not config:
-            console.print("[dim]No eli.toml found in current directory tree.[/dim]")
-        else:
-            console.print(Panel(
-                _format_project_config(config),
-                title="[cyan]Project Config (eli.toml)[/cyan]",
-                border_style="cyan",
-            ))
-        return True
-
-    elif name == "/queue-results":
-        if not SESSIONS_DIR.exists():
-            console.print("[dim]No queue runs found.[/dim]")
-            return True
-        queue_dirs = sorted(
-            [d for d in SESSIONS_DIR.iterdir() if d.is_dir() and d.name.startswith("queue_")],
-            reverse=True,
-        )
-        if not queue_dirs:
-            console.print("[dim]No queue runs found.[/dim]")
-            return True
-        label_filter = " ".join(parts[1:]).lower() if len(parts) > 1 else ""
-        if label_filter:
-            # Show full details for matching run
-            matches = [d for d in queue_dirs if label_filter in d.name.lower()]
-            if not matches:
-                console.print(f"[yellow]No queue run matching '{label_filter}'[/yellow]")
-                return True
-            qdir = matches[0]
-            results_file = qdir / "results.json"
-            if not results_file.exists():
-                console.print(f"[yellow]results.json missing in {qdir.name}[/yellow]")
-                return True
-            try:
-                data = json.loads(results_file.read_text(encoding="utf-8"))
-                results = data.get("results", [])
-                label = data.get("label", "")
-                total_dur = data.get("total_duration_seconds", 0)
-                lines = []
-                if label:
-                    lines.append(f"[bold]Label:[/bold] {label}")
-                lines.append(f"[bold]Agents:[/bold] {len(results)}   [bold]Total:[/bold] {total_dur:.0f}s")
-                lines.append("")
-                for r in results:
-                    status_col = {"completed": "green", "timeout": "yellow", "error": "red"}.get(r.get("status", ""), "white")
-                    lines.append(
-                        f"[{status_col}]{r.get('status','?').upper()}[/{status_col}]  "
-                        f"[bold]{r.get('index',0)+1}. {r.get('label', r.get('system_prompt',''))}[/bold]  "
-                        f"[dim]{r.get('model','')[:40]}  {r.get('duration_seconds',0):.0f}s[/dim]"
-                    )
-                    result_text = (r.get("result") or "").strip()
-                    if result_text:
-                        # show first 400 chars
-                        preview = result_text[:400] + ("…" if len(result_text) > 400 else "")
-                        lines.append(f"  [dim]{preview}[/dim]")
-                    lines.append("")
-                console.print(Panel("\n".join(lines), title=f"[cyan]Queue: {qdir.name}[/cyan]", border_style="cyan"))
-            except Exception as e:
-                console.print(f"[red]Failed to read {results_file}: {e}[/red]")
-        else:
-            # List last 5 queue runs
-            lines = []
-            for qdir in queue_dirs[:5]:
-                results_file = qdir / "results.json"
-                try:
-                    data = json.loads(results_file.read_text(encoding="utf-8"))
-                    results = data.get("results", [])
-                    label = data.get("label", "")
-                    total_dur = data.get("total_duration_seconds", 0)
-                    statuses = [r.get("status", "?") for r in results]
-                    err_count = statuses.count("error")
-                    timeout_count = statuses.count("timeout")
-                    status_str = (
-                        f"[red]{err_count} error{'s' if err_count!=1 else ''}[/red]  " if err_count else ""
-                    ) + (
-                        f"[yellow]{timeout_count} timeout{'s' if timeout_count!=1 else ''}[/yellow]  " if timeout_count else ""
-                    ) + (
-                        f"[green]{statuses.count('completed')} completed[/green]" if statuses.count("completed") else ""
-                    )
-                    label_str = f"  [dim]{label}[/dim]" if label else ""
-                    lines.append(
-                        f"[bold cyan]{qdir.name}[/bold cyan]{label_str}\n"
-                        f"  {len(results)} agents  {total_dur:.0f}s  {status_str}"
-                    )
-                except Exception:
-                    lines.append(f"[bold cyan]{qdir.name}[/bold cyan]  [dim](unreadable)[/dim]")
-            lines.append("\n[dim]Usage: /queue-results <label>  — show full results for a run[/dim]")
-            console.print(Panel("\n".join(lines), title="Recent Queue Runs", border_style="cyan"))
-        return True
-
-    elif name == "/voice":
-        # Accept: /voice [ptt|auto] [tools]  (order of ptt/auto and tools is flexible)
-        flags = [p.lower() for p in parts[1:]]
-        voice_mode  = next((f for f in flags if f in ("ptt", "auto")), VOICE_DEFAULT_MODE)
-        use_tools   = "tools" in flags
-        await _voice_conversation_loop(session, mode=voice_mode, use_tools=use_tools)
-        return True
-
-    # Unknown /command — try skill lookup before giving up
-    skill_name = name[1:]  # strip leading /
-    skill_args = " ".join(parts[1:]) if len(parts) > 1 else ""
-    found = await _invoke_skill(skill_name, skill_args, session)
-    if found:
-        return True
-    console.print(f"[yellow]Unknown command: {name} (try /help or /skills)[/yellow]")
-    return True
-
 MODES = ["normal", "plan"]
 
 PROMPT_STYLE = Style.from_dict({
@@ -4965,6 +1676,7 @@ PROMPT_STYLE = Style.from_dict({
 
 # ── main ──────────────────────────────────────────────────────────────────────
 async def main():
+    from commands import handle_slash_command
     import argparse as _argparse
     parser = _argparse.ArgumentParser(description="Chat with Eli (Qwen3 local agent)", add_help=True)
     parser.add_argument("--resume", nargs="?", const="", metavar="NAME",

@@ -11,20 +11,10 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class SlotHandle:
-    """Represents a single acquired inference slot.
-
-    Use as an async context manager for automatic release:
-
-        async with await ism.acquire("Eli") as slot:
-            ...
-
-    Or hold the handle and call release() manually.
-    """
-
     index: int
     label: str
-    acquired_at: float  # time.monotonic()
-    timeout_secs: float | None  # None = no timeout (Eli); 900 = agents
+    acquired_at: float
+    timeout_secs: float | None
     _manager: "SlotManager"
     _released: bool = field(default=False, init=False)
     task: asyncio.Task | None = field(default=None, init=False)
@@ -36,7 +26,6 @@ class SlotHandle:
         await self.release()
 
     async def release(self) -> None:
-        """Release this slot. Idempotent — safe to call multiple times."""
         if self._released:
             return
         log.debug(
@@ -47,7 +36,6 @@ class SlotHandle:
         await self._manager._do_release(self)
 
     def is_expired(self) -> bool:
-        """True if the slot has exceeded its timeout."""
         if self.timeout_secs is None:
             return False
         return (time.monotonic() - self.acquired_at) > self.timeout_secs
@@ -57,12 +45,6 @@ class SlotHandle:
 
 
 class _NullContext:
-    """Async context manager that does nothing.
-
-    Used when a background agent passes its already-acquired SlotHandle into
-    _tool_spawn_agent — the inner call skips its own acquire.
-    """
-
     def __init__(self, handle: SlotHandle):
         self._handle = handle
 
@@ -74,13 +56,6 @@ class _NullContext:
 
 
 class SlotManager:
-    """
-    Asyncio-safe inference slot manager.
-
-    Thread-safety: all public coroutines must be called from the same asyncio
-    event loop. Observer callbacks are called synchronously from within that loop.
-    """
-
     def __init__(
         self,
         base_url: str = "http://localhost:1234",
@@ -102,14 +77,7 @@ class SlotManager:
         self._initialized = False
         self._shutdown = False
 
-    # ── Initialization ───────────────────────────────────────────────────────
-
     async def initialize(self) -> None:
-        """Query /slots and start the periodic refresh task.
-
-        Safe to call multiple times — subsequent calls refresh the count and
-        restart the refresh task if it died.
-        """
         if self._shutdown:
             log.debug("SlotManager: initialize() skipped — already shut down")
             return
@@ -124,13 +92,7 @@ class SlotManager:
         self._initialized = True
         log.debug("SlotManager: initialized, total=%d", self._total)
 
-    # ── Server query ─────────────────────────────────────────────────────────
-
     async def refresh_from_server(self) -> None:
-        """GET /slots, update _total, prune capacity if it shrank.
-
-        Non-raising: on failure keeps last-known total.
-        """
         try:
             async with httpx.AsyncClient() as c:
                 r = await c.get(f"{self._base_url}/slots", timeout=5.0)
@@ -154,7 +116,6 @@ class SlotManager:
             )
 
     async def _periodic_refresh(self) -> None:
-        """Background task: poll /slots every refresh_interval seconds."""
         try:
             while True:
                 await asyncio.sleep(self._refresh_interval)
@@ -162,30 +123,65 @@ class SlotManager:
                 await self._evict_expired()
         except asyncio.CancelledError:
             log.debug("SlotManager._periodic_refresh(): task cancelled")
-            pass
-
-    # ── Acquire ──────────────────────────────────────────────────────────────
 
     async def acquire(
         self,
         label: str,
         timeout_secs: float | None = None,
+        preempt_agents: bool = False,
+        bypass_capacity: bool = False,
     ) -> SlotHandle:
-        """Block until a free slot is available, then return a SlotHandle.
+        """Acquire an inference slot.
 
-        The handle MUST be used as an async context manager or release() called
-        manually. Failing to release leaks the slot permanently.
-
-        Args:
-            label: Human-readable owner label ("Eli", "Agent: researcher").
-            timeout_secs: Agent eviction timeout. None = no timeout (use for Eli).
+        bypass_capacity: skip the capacity wait entirely.  Use for Eli so it
+        can always respond even when background agents hold all named slots.
+        The LLM server serialises concurrent HTTP requests internally, so Eli
+        will at most wait behind the agent's *current* generation step rather
+        than its entire run.
         """
         if self._shutdown:
-            log.debug("SlotManager: acquire() skipped — already shut down")
             raise RuntimeError("SlotManager has been shut down")
 
+        preempted_handles: list[SlotHandle] = []
+
         async with self._condition:
-            await self._condition.wait_for(lambda: len(self._slots) < self._total)
+            if preempt_agents and len(self._slots) >= self._total:
+                agent_indices = [
+                    idx for idx, h in self._slots.items()
+                    if h.label.startswith("Agent")
+                ]
+
+                if agent_indices:
+                    log.info(
+                        "SlotManager: preempting %d agent slot(s) for '%s'",
+                        len(agent_indices),
+                        label,
+                    )
+
+                    for idx in agent_indices:
+                        handle = self._slots.get(idx)
+                        if handle is None:
+                            continue
+
+                        if handle.task:
+                            handle.task.cancel()
+
+                        preempted_handles.append(handle)
+
+                    for handle in preempted_handles:
+                        self._slots.pop(handle.index, None)
+                        handle._released = True
+
+                    self._condition.notify_all()
+
+            if bypass_capacity:
+                if len(self._slots) >= self._total:
+                    log.debug(
+                        "SlotManager: '%s' bypassing capacity (%d/%d in use)",
+                        label, len(self._slots), self._total,
+                    )
+            else:
+                await self._condition.wait_for(lambda: len(self._slots) < self._total)
 
             index = self._next_free_index()
             handle = SlotHandle(
@@ -205,33 +201,31 @@ class SlotManager:
                 len(self._slots),
                 self._total,
             )
+
             self._condition.notify_all()
+
+        # Notify observers and await cancelled tasks outside the lock.
+        if preempted_handles:
+            self._notify_observers()
+        for h in preempted_handles:
+            if h.task is not None:
+                try:
+                    await h.task
+                except asyncio.CancelledError:
+                    pass
 
         self._notify_observers()
         return handle
 
     def _next_free_index(self) -> int:
-        """Return the lowest index not currently occupied. Caller holds lock."""
         used = set(self._slots.keys())
         i = 0
         while i in used:
             i += 1
         return i
 
-    # ── Release & eviction ───────────────────────────────────────────────────
-
     async def _do_release(self, handle: SlotHandle) -> None:
-        """Internal release called by SlotHandle.release().
-
-        This is the *only* good path to release a slot; eviction and force-release
-        all go through this.
-        """
         if handle._released:
-            log.debug(
-                "SlotManager._do_release(): slot %d '%s' already released",
-                handle.index,
-                handle.label,
-            )
             return
 
         async with self._condition:
@@ -242,19 +236,14 @@ class SlotManager:
             handle._released = True
             self._condition.notify_all()
 
-        age = handle.age_secs()
         log.debug(
-            "SlotManager: RELEASED slot %d '%s' (who=code, reason=normal, held=%.1fs) — %d/%d in use",
+            "SlotManager: RELEASED slot %d '%s'",
             handle.index,
             handle.label,
-            age,
-            len(self._slots),
-            self._total,
         )
         self._notify_observers()
 
     async def _safe_cancel_task(self, task: asyncio.Task) -> None:
-        """Cancel a task and wait for it to finish, catching CancelledError."""
         if task.done():
             return
         task.cancel()
@@ -264,40 +253,24 @@ class SlotManager:
             pass
 
     async def _evict_expired(self) -> None:
-        """Cancel and release all handles that have exceeded their timeout."""
         expired: list[SlotHandle] = []
         async with self._condition:
             for handle in list(self._slots.values()):
                 if handle.is_expired():
-                    expired.append(handle)
+                    if handle.task is None or handle.task.done():
+                        expired.append(handle)
+                    else:
+                        log.debug(
+                            "SlotManager: slot %d '%s' expired but task still running, skipping",
+                            handle.index, handle.label,
+                        )
 
         for handle in expired:
-            log.info(
-                "SlotManager: evicting '%s' (slot %d, held %.0fs > %.0fs timeout)",
-                handle.label,
-                handle.index,
-                handle.age_secs(),
-                handle.timeout_secs,
-            )
             if handle.task is not None:
                 await self._safe_cancel_task(handle.task)
-
-            log.debug(
-                "SlotManager: RELEASED slot %d '%s' (who=mgr, reason=eviction, timeout=%s, held=%.1fs)",
-                handle.index,
-                handle.label,
-                handle.timeout_secs,
-                handle.age_secs(),
-            )
             await self._do_release(handle)
 
-    # ── Force-release all ────────────────────────────────────────────────────
-
     async def force_release_all(self) -> None:
-        """Release all slots and cancel all associated tasks.
-
-        Called by /clear. Idempotent.
-        """
         all_handles: list[SlotHandle] = []
         async with self._condition:
             for handle in list(self._slots.values()):
@@ -308,26 +281,13 @@ class SlotManager:
             self._slots.clear()
             self._condition.notify_all()
 
-        # Wait for tasks to finish cancellation in the background.
         for handle in all_handles:
             if handle.task is not None:
                 await self._safe_cancel_task(handle.task)
 
-        if all_handles:
-            log.info("SlotManager: force-released %d slot(s)", len(all_handles))
-            for handle in all_handles:
-                log.debug(
-                    "SlotManager: RELEASED slot %d '%s' (who=mgr, reason=force_clear, held=%.1fs)",
-                    handle.index,
-                    handle.label,
-                    handle.age_secs(),
-                )
-            self._notify_observers()
-
-    # ── Observers ────────────────────────────────────────────────────────────
+        self._notify_observers()
 
     def on_change(self, callback: Callable[[], None]) -> None:
-        """Register a zero-argument observer, called on any slot state change."""
         self._change_callbacks.append(callback)
 
     def _notify_observers(self) -> None:
@@ -337,12 +297,8 @@ class SlotManager:
             except Exception as exc:
                 log.warning("SlotManager observer raised: %s", exc)
 
-    # ── Shutdown ─────────────────────────────────────────────────────────────
-
     async def shutdown(self) -> None:
-        """Cancel the periodic refresh task. Does not release active slots."""
         if self._shutdown:
-            log.debug("SlotManager.shutdown(): already shut down")
             return
         self._shutdown = True
 
@@ -354,10 +310,6 @@ class SlotManager:
                 pass
         self._refresh_task = None
 
-        log.debug("SlotManager: shut down")
-
-    # ── Read-only accessors ──────────────────────────────────────────────────
-
     def total_slots(self) -> int:
         return self._total
 
@@ -368,7 +320,6 @@ class SlotManager:
         return self._initialized
 
     def slot_snapshot(self) -> list[dict]:
-        """Snapshot of current slot occupancy for UI display."""
         return [
             {
                 "index": h.index,

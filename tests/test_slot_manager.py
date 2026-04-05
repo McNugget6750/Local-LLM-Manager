@@ -336,10 +336,13 @@ async def test_tc13_periodic_refresh_called():
     await ism.shutdown()
 
 
-# ── TC-14: eviction cancels task and releases slot ────────────────────────────
+# ── TC-14: eviction skips running tasks; only reclaims zombie slots ───────────
 
 @pytest.mark.asyncio
-async def test_tc14_eviction_cancels_task():
+async def test_tc14_eviction_skips_running_tasks():
+    """_evict_expired must NOT cancel a task that is still running.
+    A still-running agent with an expired timeout is legitimate (long task);
+    it will release its own slot via the finally block when done."""
     ism = await _init_ism(2)
 
     async def long_agent():
@@ -355,10 +358,17 @@ async def test_tc14_eviction_cancels_task():
     await asyncio.sleep(0.05)   # let it expire
     await ism._evict_expired()
 
-    assert ism.in_use() == 0
-    await asyncio.sleep(0.01)
-    assert agent_task.cancelled() or agent_task.done()
+    # Slot should NOT be released — task is still running
+    assert ism.in_use() == 1, "Running task must not be evicted even after timeout"
+    assert not agent_task.cancelled(), "Running task must not be cancelled by eviction"
 
+    # Cleanup: cancel the task manually so the test doesn't leak
+    agent_task.cancel()
+    try:
+        await agent_task
+    except asyncio.CancelledError:
+        pass
+    await h.release()
     await ism.shutdown()
 
 
@@ -401,4 +411,31 @@ async def test_tc17_null_context():
 
     await outer.release()
     assert ism.in_use() == 0
+    await ism.shutdown()
+
+
+# ── TC-18: Eli bypasses capacity and does not block or kill background agents ─
+
+@pytest.mark.asyncio
+async def test_tc18_eli_bypasses_capacity():
+    """With bypass_capacity=True Eli acquires immediately even when all slots
+    are occupied by background agents.  The background agent is NOT cancelled."""
+    ism = await _init_ism(1)
+
+    bg_handle = await ism.acquire("Background Agent [task1]", timeout_secs=2700.0)
+    assert ism.in_use() == 1
+
+    # Eli bypasses the capacity limit and acquires over-quota
+    eli_handle = await ism.acquire("Eli", timeout_secs=None, bypass_capacity=True)
+
+    assert ism.in_use() == 2, "Both Eli and bg agent should hold slots simultaneously"
+    assert not bg_handle._released, "Background agent must NOT be cancelled"
+    assert not eli_handle._released
+
+    await eli_handle.release()
+    assert ism.in_use() == 1
+
+    await bg_handle.release()
+    assert ism.in_use() == 0
+
     await ism.shutdown()
