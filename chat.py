@@ -1145,13 +1145,9 @@ class ChatSession(AgentsMixin):
                         tool_calls_received = _parsed
                         assistant_content = ""  # don't echo raw text back into message history
 
-                # Auto-announce if model produced no text before first tool call
-                if tool_calls_received and not text_buf.strip():
-                    if self.tui_queue:
-                        tool_names = ", ".join(tc["function"]["name"] for tc in tool_calls_received)
-                        await self.tui_queue.put({"type": "system", "text": f"→ {tool_names}…"})
-                    else:
-                        console.print(f"[dim]{_tool_announce(tool_calls_received)}[/dim]")
+                # Auto-announce if model produced no text before first tool call (TUI only)
+                if tool_calls_received and not text_buf.strip() and not self.tui_queue:
+                    console.print(f"[dim]{_tool_announce(tool_calls_received)}[/dim]")
 
                 # Append assistant message
                 if tool_calls_received:
