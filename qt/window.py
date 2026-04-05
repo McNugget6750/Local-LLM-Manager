@@ -416,6 +416,9 @@ class MainWindow(QMainWindow):
         self._agent_buf: str = ""
         self._current_agent_label: str = ""  # label of last agent that wrote to the tab
         self._file_touch_history: list[str] = []   # abs paths touched by tool calls, most recent first
+        self._input_history: list[str] = []        # sent messages, newest first
+        self._input_history_idx: int = -1          # -1 = not browsing history
+        self._input_history_draft: str = ""        # saved draft while browsing
         self._plan_mode: bool = False
         self._busy: bool = False
         self._message_queue: list[tuple[str, bool]] = []  # (submit_text, plan_mode)
@@ -1142,7 +1145,7 @@ class MainWindow(QMainWindow):
                     self._send_message()
                 return True
 
-            # Arrow keys navigate completer
+            # Arrow keys navigate completer or input history
             if self._completer.isVisible():
                 if key == Qt.Key.Key_Up:
                     self._completer.move_selection(-1)
@@ -1152,6 +1155,33 @@ class MainWindow(QMainWindow):
                     return True
                 if key == Qt.Key.Key_Escape:
                     self._completer.hide()
+                    return True
+
+            if key == Qt.Key.Key_Up and self._input_history:
+                cursor = self._input.textCursor()
+                on_first_line = cursor.blockNumber() == 0
+                if on_first_line:
+                    if self._input_history_idx == -1:
+                        self._input_history_draft = self._input.toPlainText()
+                    next_idx = self._input_history_idx + 1
+                    if next_idx < len(self._input_history):
+                        self._input_history_idx = next_idx
+                        self._input.setPlainText(self._input_history[next_idx])
+                        self._input.moveCursor(self._input.textCursor().MoveOperation.End)
+                    return True
+
+            if key == Qt.Key.Key_Down and self._input_history_idx >= 0:
+                cursor = self._input.textCursor()
+                on_last_line = cursor.blockNumber() == self._input.document().blockCount() - 1
+                if on_last_line:
+                    next_idx = self._input_history_idx - 1
+                    if next_idx < 0:
+                        self._input_history_idx = -1
+                        self._input.setPlainText(self._input_history_draft)
+                    else:
+                        self._input_history_idx = next_idx
+                        self._input.setPlainText(self._input_history[next_idx])
+                    self._input.moveCursor(self._input.textCursor().MoveOperation.End)
                     return True
 
         # Keep document text width in sync with viewport — required for width:100% tables
@@ -1314,6 +1344,10 @@ class MainWindow(QMainWindow):
         if not text:
             return
         self._input.clear()
+        self._input_history_idx = -1
+        self._input_history_draft = ""
+        if not self._input_history or self._input_history[0] != text:
+            self._input_history.insert(0, text)
         if text.startswith("/"):
             self._adapter.submit_slash(text)
             return
