@@ -9,9 +9,12 @@ so it never touches the asyncio work queue.
 """
 
 import asyncio
+import logging
 import threading
 import sys
 import pathlib
+
+log = logging.getLogger(__name__)
 
 # Allow `from chat import ChatSession` regardless of working directory
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
@@ -318,6 +321,7 @@ class QtChatAdapter(QThread):
     text_done       = Signal(str)
     usage           = Signal(int, int)             # tokens_used, ctx_window
     system_msg      = Signal(str)
+    system_html     = Signal(str)   # pre-formatted HTML from slash command output
     error_msg       = Signal(str)
     done            = Signal()
     stream_started  = Signal()                     # fires at start of each turn
@@ -390,7 +394,7 @@ class QtChatAdapter(QThread):
                 if session._startup_files:
                     self.system_msg.emit("Context loaded:\n" + "\n".join(session._startup_files))
                 # ISM observer — fires on any slot acquire/release and drives the panel
-                from chat import _ism
+                from agents import _ism
                 _ism.on_change(lambda: self.slots_updated.emit(_ism.total_slots(), _ism.in_use()))
                 # Emit initial state now — initialize() already ran, observer wasn't connected yet
                 self.slots_updated.emit(_ism.total_slots(), _ism.in_use())
@@ -416,6 +420,8 @@ class QtChatAdapter(QThread):
     async def _run_turn(self, session: ChatSession, text: str, plan_mode: bool) -> None:
         # Cancel persistent bg drain if running between turns
         if self._bg_drain_task and not self._bg_drain_task.done():
+            n_bg = len(session._bg_agent_tasks)
+            log.debug("_run_turn: cancelling bg drain (%d background agent(s) still running)", n_bg)
             self._bg_drain_task.cancel()
             try:
                 await self._bg_drain_task
@@ -440,8 +446,6 @@ class QtChatAdapter(QThread):
             self.done.emit()
             return
 
-        from chat import _ism
-        _eli_slot = await _ism.acquire("Eli", timeout_secs=None)
         try:
             self._stream_task = asyncio.create_task(
                 session.send_and_stream(text, plan_mode=plan_mode)
@@ -465,7 +469,6 @@ class QtChatAdapter(QThread):
             self.error_msg.emit(str(exc))
             self.done.emit()
         finally:
-            await _eli_slot.release()
             self._stream_task = None
             self._cancel_requested = False
 
@@ -479,7 +482,7 @@ class QtChatAdapter(QThread):
         """
         import io, re
         import chat as _chat_mod
-        from chat import handle_slash_command
+        from commands import handle_slash_command
         from rich.console import Console
 
         self.stream_started.emit()
@@ -570,6 +573,8 @@ class QtChatAdapter(QThread):
                 )
                 await self._pending_future
                 self._pending_future = None
+            elif etype == "system_html":
+                self.system_html.emit(event["html"])
             elif etype == "text_done":
                 if event.get("source") != "agent":   # sub-agent text shown via tool_done result
                     self.text_done.emit(event["text"])
@@ -643,6 +648,17 @@ class QtChatAdapter(QThread):
                     self._pending_future = None
         except asyncio.CancelledError:
             _cancelled = True
+            # If we were awaiting an approval future when cancelled, resolve it so
+            # the background agent doesn't hang waiting for an answer that never comes.
+            if self._pending_future is not None and not self._pending_future.done():
+                log.warning(
+                    "_drain_bg_agents: cancelled while awaiting approval future — "
+                    "auto-resolving as denied so background agent can unblock"
+                )
+                self._pending_future.set_result((False, "cancelled"))
+            else:
+                log.debug("_drain_bg_agents: cancelled (no pending approval future)")
+            self._pending_future = None
             raise
         finally:
             if not _cancelled and _completed:

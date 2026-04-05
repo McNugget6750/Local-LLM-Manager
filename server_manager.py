@@ -125,23 +125,51 @@ def _save_models(models):
         json.dump(models, f, indent=2)
 
 
+def _detect_engine(cmd: list) -> str:
+    """Return the engine tag for a command list.
+
+    Tags:
+      "llama" — Windows llama-server / ik_llama.cpp binary
+      "wsl"   — anything launched via wsl.exe (vLLM, etc.)
+    """
+    if not cmd:
+        return "llama"
+    exe = os.path.basename(cmd[0]).lower().replace(".exe", "")
+    if exe == "wsl":
+        return "wsl"
+    return "llama"
+
+
 def _cmd_to_str(cmd: list) -> str:
+    def _q(s):
+        # Quote args that contain spaces (e.g. bash -c "..." for WSL commands).
+        # Safe for llama entries too — their args never contain spaces.
+        return f'"{s}"' if " " in s and not (s.startswith('"') and s.endswith('"')) else s
     parts = []
     i = 0
     while i < len(cmd):
         arg = cmd[i]
         if arg.startswith("-") and i + 1 < len(cmd) and not cmd[i + 1].startswith("-"):
-            parts.append(f"{arg} {cmd[i+1]}")
+            parts.append(f"{arg} {_q(cmd[i+1])}")
             i += 2
         else:
-            parts.append(arg)
+            parts.append(_q(arg))
             i += 1
     return " \\\n  ".join(parts)
 
 
 def _str_to_cmd(s: str) -> list:
     cleaned = s.replace("\\\n", " ").replace("\\\r\n", " ")
-    return shlex.split(cleaned, posix=False)
+    tokens = shlex.split(cleaned, posix=False)
+    # Strip outer quotes that _cmd_to_str adds for args containing spaces.
+    # Has no effect on unquoted llama-server args.
+    result = []
+    for t in tokens:
+        if len(t) >= 2 and ((t[0] == '"' and t[-1] == '"') or (t[0] == "'" and t[-1] == "'")):
+            result.append(t[1:-1])
+        else:
+            result.append(t)
+    return result
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -159,6 +187,7 @@ class ServerManager(tk.Tk):
         self._log_q       = queue.Queue()
         self._running     = False
         self._external    = False
+        self._engine      = "llama"   # "llama" | "wsl" — set on each start
         self._hb_after    = None
         self._cd_after    = None
         self._hb_secs  = 0
@@ -615,7 +644,8 @@ class ServerManager(tk.Tk):
             self._log_put(f"Command parse error: {e}", "err")
             return
 
-        self._log_put(f"Starting {name}", "beat")
+        self._engine = _detect_engine(cmd)
+        self._log_put(f"Starting {name} [{self._engine}]", "beat")
         self._btn_start.config(state="disabled")
         self._combo.config(state="disabled")
         self._lbl_status.config(text="  Loading…")
@@ -651,16 +681,32 @@ class ServerManager(tk.Tk):
             except subprocess.TimeoutExpired:
                 self._proc.kill()
             self._proc = None
+            if self._engine == "wsl":
+                self._kill_wsl_server()
         else:
-            self._log_put("Killing external llama-server…", "warn")
-            subprocess.run(
-                ["powershell", "-Command",
-                 "Stop-Process -Name llama-server -Force -ErrorAction SilentlyContinue"],
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
+            if self._engine == "wsl":
+                self._kill_wsl_server()
+            else:
+                self._log_put("Killing external llama-server…", "warn")
+                subprocess.run(
+                    ["powershell", "-Command",
+                     "Stop-Process -Name llama-server -Force -ErrorAction SilentlyContinue"],
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
         self._stop_voice_server()
         self._reset_ui()
         self._log_put("Server stopped", "err")
+
+    def _kill_wsl_server(self):
+        """Kill any process listening on PORT inside WSL."""
+        self._log_put(f"Killing WSL server on port {PORT}…", "warn")
+        subprocess.run(
+            ["wsl", "bash", "-c",
+             f"kill $(lsof -t -i:{PORT} 2>/dev/null) 2>/dev/null; "
+             f"pkill -f 'api_server' 2>/dev/null; true"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            timeout=8,
+        )
 
     def _reset_ui(self):
         self._running  = False
@@ -790,7 +836,7 @@ class ServerManager(tk.Tk):
             line = line.rstrip()
             if not line:
                 continue
-            if self._try_parse_tps(line):
+            if self._engine == "llama" and self._try_parse_tps(line):
                 continue
             ll = line.lower()
             if "error" in ll or "failed" in ll:
@@ -941,6 +987,12 @@ class ServerManager(tk.Tk):
         if result["ok"]:
             self._external = True
             self._running  = True
+            # Infer engine from whichever profile is currently selected
+            try:
+                cmd = _str_to_cmd(self._cmd_text.get("1.0", "end").strip())
+                self._engine = _detect_engine(cmd)
+            except Exception:
+                self._engine = "llama"
             self._lbl_model.config(text=result["model"])
             self._lbl_dot.config(fg=GREEN)
             self._lbl_status.config(text="  Running (external)")

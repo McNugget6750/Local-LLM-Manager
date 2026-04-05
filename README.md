@@ -1,6 +1,7 @@
 # Local LLM Manager
 
-A local LLM chat GUI + server manager for [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (a high-performance fork of llama.cpp).
+A local LLM chat GUI + server manager supporting multiple inference backends:
+[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp), [llama.cpp](https://github.com/ggml-org/llama.cpp), and [vLLM](https://github.com/vllm-project/vllm) (via WSL).
 
 Includes **Eli** — a coding assistant persona with tool use, sub-agents, agent queues, vision analysis, voice I/O, plan mode, slash commands, and persistent session state.
 
@@ -8,18 +9,53 @@ Includes **Eli** — a coding assistant persona with tool use, sub-agents, agent
 
 ## What this is
 
-- **`server_manager.py`** — Tkinter GUI for launching and monitoring llama-server instances. Tracks t/s, VRAM, GPU load, RAM, and CPU in real time. Supports multiple named model profiles loaded from `commands.json`. Includes a loopback control API so Eli can switch models automatically. Manages the voice server lifecycle.
-- **`qt/main.py`** — Qt chat GUI (primary interface). Full-featured chat window with file explorer, code editor, agent output tab, token bar, slash command autocomplete, Knight Rider activity indicator, and session management. Launch via `qt/run.bat` or click **Open Chat** in the server manager.
+- **`server_manager.py`** — Tkinter GUI for launching and monitoring inference server instances. Tracks t/s, VRAM, GPU load, RAM, and CPU in real time. Supports multiple named model profiles from `commands.json` across different backends. Auto-detects the engine type from the launch command — llama.cpp binaries and WSL-hosted vLLM servers are handled transparently. Includes a loopback control API so Eli can switch models automatically. Manages the voice server lifecycle.
+- **`qt/main.py`** — Qt chat GUI (primary interface). Full-featured chat window with file explorer, code editor, agent output tab, token bar, slash command autocomplete, Knight Rider activity indicator, and session management. Slash command output (e.g. `/help`, `/role`) renders as formatted HTML panels in the chat view when the GUI is open. Launch via `qt/run.bat` or click **Open Chat** in the server manager.
 - **`chat.py`** — Terminal chat client (Eli). Same backend as the Qt GUI — use this if you prefer a terminal interface.
+
+---
+
+## Supported backends
+
+All backends expose an OpenAI-compatible `/v1` API on the configured port. The server manager auto-detects the engine from the launch command and handles start/stop correctly for each.
+
+| Backend | Engine tag | Use case |
+|---------|-----------|----------|
+| ik_llama.cpp / llama.cpp | `llama` | GGUF models, Windows-native, CPU+GPU offload |
+| vLLM (WSL) | `wsl` | HuggingFace safetensors, NVFP4/FP8 quants, Blackwell GPU |
+
+**llama.cpp entry** (`commands.json`):
+```json
+"My Model · Q6_K": [
+  "..\\llama.cpp\\build\\bin\\Release\\llama-server.exe",
+  "-m", "path\\to\\model.gguf",
+  "-ngl", "999", "-c", "32768",
+  "-ctk", "q8_0", "-ctv", "q8_0", "-fa", "on",
+  "--no-mmap", "--jinja",
+  "-b", "4096", "-ub", "4096", "-t", "16",
+  "--parallel", "2", "--port", "1234", "--host", "0.0.0.0"
+]
+```
+
+**vLLM (WSL) entry** (`commands.json`):
+```json
+"My Model · NVFP4 [vLLM]": [
+  "wsl", "--exec", "bash", "-c",
+  "/home/user/miniconda3/bin/conda run -n vllm-env python -m vllm.entrypoints.openai.api_server --model /mnt/c/path/to/model --quantization modelopt --dtype bfloat16 --max-model-len 8192 --max-num-seqs 2 --port 1234 --host 0.0.0.0"
+]
+```
 
 ---
 
 ## Requirements
 
 - Python 3.11+
-- [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) built — `llama-server.exe` on PATH or configured in `commands.json`
-- GGUF model files
+- At least one inference backend:
+  - [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) or [llama.cpp](https://github.com/ggml-org/llama.cpp) built — `llama-server.exe` configured in `commands.json`
+  - Or: WSL2 + Ubuntu + vLLM installed in a conda environment
+- GGUF or HuggingFace model files
 - Windows (server_manager.py uses Windows APIs for GPU/RAM stats)
+- NVIDIA GPU recommended; NVFP4 requires Blackwell (RTX 5000/6000 series, B100/B200)
 
 ---
 
@@ -35,7 +71,7 @@ python -m venv .venv
 
 :: Configure model profiles
 copy commands.example.json commands.json
-:: Edit commands.json — fill in your llama-server path and model paths
+:: Edit commands.json — fill in your backend binary path and model paths
 
 :: Optional: personalize Eli
 copy USER_PROFILE.example.md USER_PROFILE.md
@@ -60,7 +96,7 @@ run.bat
 
 Opens the GUI. Select a model profile, click **Start**. The GUI monitors t/s, VRAM, GPU, RAM, and CPU in real time. Add new model profiles with **+ Add Model** — they are saved to `commands.json`.
 
-Once a server is running, click **Open Chat** to launch the Qt chat GUI with `--continue` (resumes last session automatically). The voice server starts and stops alongside the llama-server.
+Once a server is running, click **Open Chat** to launch the Qt chat GUI with `--continue` (resumes last session automatically). The voice server starts and stops alongside the inference server.
 
 The server manager also exposes a loopback control API on port 1235. Eli uses this to switch models automatically when running agents on different model profiles — the GUI stays in sync with start/stop state throughout.
 
@@ -73,6 +109,8 @@ qt\run.bat --resume name # resume a specific named session
 ```
 
 Connects to `http://localhost:1234` by default. The file explorer on the left roots at the drive level — double-click a directory to set it as the working directory. The editor panel supports syntax highlighting, excerpts, and line references. The Agent tab streams sub-agent output separately.
+
+Slash command output (e.g. `/help`, `/role`, `/model`, `/status`) renders as styled HTML panels directly in the chat view when the GUI is open. In terminal-only mode the same output goes to the Rich console as before.
 
 ### Eli chat CLI (terminal)
 
@@ -96,13 +134,13 @@ Same backend as the Qt GUI. Use this if you prefer a terminal interface.
 | `/plan <feature>` | Implementation planning sub-agent |
 | `/code <task>` | Production code writing sub-agent |
 | `/queue-results [label]` | List recent agent queue runs or show one by label |
-| `/model` | List available model profiles |
+| `/model [name]` | List available model profiles or switch to one |
 | `/role <name>` | Adopt an agent persona (`/role eli` to revert) |
 | `/voice [ptt\|auto] [tools]` | Start voice conversation mode |
 | `/config` | Show loaded eli.toml config |
 | `/cd <path>` | Change working directory |
 | `/think [off\|on\|deep]` | Set thinking level |
-| `/approval [auto\|always\|never]` | Set tool approval level |
+| `/approval [auto\|ask-writes\|ask-all\|yolo]` | Set tool approval level |
 | `/compact` | Summarise older messages to free context |
 | `/status` | Show token usage and context window info |
 
@@ -181,35 +219,7 @@ Set `vision_external: true` if your vision model runs on a separate machine — 
 
 ### `commands.json` (gitignored)
 
-Model profiles for the server manager, plus optional metadata. Copy from `commands.example.json`:
-
-```json
-{
-  "_meta": {
-    "vision_url": "http://192.168.x.x:1234",
-    "vision_external": false,
-    "profiles": {
-      "My Model · Quantization": {
-        "description": "One-line description.",
-        "strengths": "What it excels at",
-        "weaknesses": "What to avoid",
-        "speed": "~?? t/s",
-        "vision": false
-      }
-    }
-  },
-  "My Model · Quantization": [
-    "path/to/llama-server.exe",
-    "-m", "path/to/model.gguf",
-    "-ngl", "999", "-c", "32768",
-    "-ctk", "q4_1", "-ctv", "q4_1",
-    "--no-mmap", "--jinja",
-    "-b", "4096", "-ub", "4096", "-t", "16",
-    "--parallel", "1",
-    "--port", "1234", "--host", "0.0.0.0"
-  ]
-}
-```
+Model profiles for the server manager, plus optional metadata. Copy from `commands.example.json`. Supports both llama.cpp (Windows binary) and vLLM (WSL) entries — the engine is auto-detected from the first token of the command.
 
 Profile metadata (description, strengths, weaknesses, speed) is injected into Eli's context at startup so he can make informed model-selection decisions.
 
@@ -243,8 +253,10 @@ Sub-agents are spawned by Eli for specialized tasks. Profiles live in `agents/`:
 
 | Profile | Purpose |
 |---------|---------|
+| `code-researcher` | Targeted code research and API lookup |
 | `code-review` | Review a file for correctness and safety issues |
 | `doc-writer` | Write docstrings or README sections |
+| `expert_coder` | Production code implementation |
 | `researcher` | Research a library, API, or technical question |
 | `test-writer` | Write unit tests |
 | `web_designer` | UI/UX and web design feedback |
@@ -287,3 +299,4 @@ context_files: [path/to/extra.md]
 
 - [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) — high-performance llama.cpp fork by ikawrakow
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) — upstream project
+- [vLLM](https://github.com/vllm-project/vllm) — GPU-accelerated inference for HuggingFace models

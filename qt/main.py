@@ -11,6 +11,8 @@ import logging
 
 logging.basicConfig(level=logging.WARNING)  # global default
 logging.getLogger("slot_manager").setLevel(logging.DEBUG)
+logging.getLogger("agents").setLevel(logging.DEBUG)
+logging.getLogger("qt.adapter").setLevel(logging.DEBUG)
 
 # Allow `from chat import ChatSession` and `from qt.adapter import QtChatAdapter`
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))

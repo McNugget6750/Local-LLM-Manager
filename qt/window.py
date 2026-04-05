@@ -1053,6 +1053,7 @@ class MainWindow(QMainWindow):
         self._adapter.approval_needed.connect(self._on_approval_needed)
         self._adapter.usage.connect(self._on_usage)
         self._adapter.system_msg.connect(self._on_system_msg)
+        self._adapter.system_html.connect(self._on_system_html)
         self._adapter.error_msg.connect(self._on_error_msg)
         self._adapter.done.connect(self._on_turn_done)
         self._adapter.clear_chat.connect(self._on_clear_chat)
@@ -1623,6 +1624,14 @@ class MainWindow(QMainWindow):
     def _on_system_msg(self, text: str):
         self._status_bar.showMessage(text.splitlines()[0] if text else "", 4000)
         html = _markdown_to_html(text)
+        self._compact_view.append(html)
+        self._full_view.append(html)
+        self._auto_scroll(self._compact_view)
+        self._auto_scroll(self._full_view)
+
+    @Slot(str)
+    def _on_system_html(self, html: str):
+        """Display pre-formatted HTML from slash command output in the chat views."""
         self._compact_view.append(html)
         self._full_view.append(html)
         self._auto_scroll(self._compact_view)
