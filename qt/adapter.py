@@ -9,9 +9,12 @@ so it never touches the asyncio work queue.
 """
 
 import asyncio
+import logging
 import threading
 import sys
 import pathlib
+
+log = logging.getLogger(__name__)
 
 # Allow `from chat import ChatSession` regardless of working directory
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
@@ -317,7 +320,9 @@ class QtChatAdapter(QThread):
     approval_needed = Signal(str, str, str, str)    # title, message, tool_name, args_str
     text_done       = Signal(str)
     usage           = Signal(int, int)             # tokens_used, ctx_window
+    agent_usage     = Signal(int, str, str, int, int)  # slot_index, tool_id, agent_label, tokens_used, ctx_window
     system_msg      = Signal(str)
+    system_html     = Signal(str)   # pre-formatted HTML from slash command output
     error_msg       = Signal(str)
     done            = Signal()
     stream_started  = Signal()                     # fires at start of each turn
@@ -331,10 +336,12 @@ class QtChatAdapter(QThread):
     voice_transcript    = Signal(str)
     voice_reply         = Signal(str)
     voice_server_status = Signal(bool)   # True = server reachable, False = local whisper
-    agent_text_token    = Signal(str)    # text from a spawned sub-agent
+    agent_text_token    = Signal(str, str)  # (token, agent_label) from a spawned sub-agent
     remote_message      = Signal(str)    # remote HTTP submission — show bubble in GUI
     open_in_editor      = Signal(str, int)          # path, line — model requests editor navigation
     highlight_in_editor = Signal(str, int, int, int, int)  # path, start_line, end_line, start_col, end_col
+    bg_agents_complete  = Signal(int)    # all background agents finished; count = number that ran
+    slots_updated       = Signal(int, int)  # total_slots, in_use
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -352,6 +359,9 @@ class QtChatAdapter(QThread):
 
         # Remote HTTP bridge — created in run() to avoid binding socket on main thread
         self._remote = None
+
+        # Background agent drain task
+        self._bg_drain_task: asyncio.Task | None = None
 
     # ── Worker thread (asyncio / chat) ───────────────────────────────────────
 
@@ -384,6 +394,11 @@ class QtChatAdapter(QThread):
                 session.input_compress_limit  = int(_state.get("input_compress_limit", 8000))
                 if session._startup_files:
                     self.system_msg.emit("Context loaded:\n" + "\n".join(session._startup_files))
+                # ISM observer — fires on any slot acquire/release and drives the panel
+                from agents import _ism
+                _ism.on_change(lambda: self.slots_updated.emit(_ism.total_slots(), _ism.in_use()))
+                # Emit initial state now — initialize() already ran, observer wasn't connected yet
+                self.slots_updated.emit(_ism.total_slots(), _ism.in_use())
                 while True:
                     item = await self._work_queue.get()
                     if item is None:
@@ -404,8 +419,22 @@ class QtChatAdapter(QThread):
     # ── Per-turn logic ───────────────────────────────────────────────────────
 
     async def _run_turn(self, session: ChatSession, text: str, plan_mode: bool) -> None:
-        while not session.tui_queue.empty():
-            session.tui_queue.get_nowait()
+        # Cancel persistent bg drain if running between turns
+        if self._bg_drain_task and not self._bg_drain_task.done():
+            n_bg = len(session._bg_agent_tasks)
+            log.debug("_run_turn: cancelling bg drain (%d background agent(s) still running)", n_bg)
+            self._bg_drain_task.cancel()
+            try:
+                await self._bg_drain_task
+            except asyncio.CancelledError:
+                pass
+        self._bg_drain_task = None
+
+        # Flush stale events only when no background agents are running
+        # (skip flush while bg agents are running — their tokens are still arriving)
+        if not session._bg_agent_tasks:
+            while not session.tui_queue.empty():
+                session.tui_queue.get_nowait()
 
         # Quick health probe before touching the session — avoids corrupting history
         # if the server is not up at all.
@@ -454,7 +483,7 @@ class QtChatAdapter(QThread):
         """
         import io, re
         import chat as _chat_mod
-        from chat import handle_slash_command
+        from commands import handle_slash_command
         from rich.console import Console
 
         self.stream_started.emit()
@@ -470,6 +499,8 @@ class QtChatAdapter(QThread):
         async def _run_and_signal():
             try:
                 await handle_slash_command(cmd, session)
+            except Exception as exc:
+                await session.tui_queue.put({"type": "error", "text": str(exc)})
             finally:
                 await session.tui_queue.put({"type": "done"})
 
@@ -519,7 +550,7 @@ class QtChatAdapter(QThread):
                 self.think_token.emit(event["text"])
             elif etype == "text_token":
                 if event.get("source") == "agent":
-                    self.agent_text_token.emit(event["text"])
+                    self.agent_text_token.emit(event["text"], event.get("agent_label", ""))
                 else:
                     self.text_token.emit(event["text"])
             elif etype == "tool_start":
@@ -545,14 +576,23 @@ class QtChatAdapter(QThread):
                 )
                 await self._pending_future
                 self._pending_future = None
+            elif etype == "system_html":
+                self.system_html.emit(event["html"])
             elif etype == "text_done":
                 if event.get("source") != "agent":   # sub-agent text shown via tool_done result
                     self.text_done.emit(event["text"])
             elif etype == "usage":
-                self.usage.emit(
-                    int(event.get("tokens", 0)),
-                    int(event.get("ctx", 0)),
-                )
+                tool_id_ev = event.get("tool_id", "")
+                if tool_id_ev:
+                    self.agent_usage.emit(
+                        int(event.get("slot_index", -1)),
+                        tool_id_ev,
+                        event.get("agent_label", ""),
+                        int(event.get("tokens", 0)),
+                        int(event.get("ctx", 0)),
+                    )
+                else:
+                    self.usage.emit(int(event.get("tokens", 0)), int(event.get("ctx", 0)))
             elif etype == "clear_chat":
                 self.clear_chat.emit()
             elif etype == "cwd_changed":
@@ -575,9 +615,90 @@ class QtChatAdapter(QThread):
                     int(event.get("start_col", -1)),
                     int(event.get("end_col", -1)),
                 )
+            elif etype == "bg_agents_complete":
+                self.bg_agents_complete.emit(event.get("count", 0))
             elif etype == "done":
                 self.done.emit()
+                if session._bg_agent_tasks:
+                    self._bg_drain_task = asyncio.create_task(
+                        self._drain_bg_agents(session)
+                    )
                 return
+
+    async def _drain_bg_agents(self, session: "ChatSession") -> None:
+        """Drain tui_queue between turns while background agents are still running."""
+        _completed = 0
+        _completed_labels: list[str] = []
+        _cancelled = False
+        try:
+            while session._bg_agent_tasks:
+                try:
+                    event = await asyncio.wait_for(session.tui_queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+                etype = event.get("type")
+                if etype == "text_token" and event.get("source") == "agent":
+                    self.agent_text_token.emit(event["text"], event.get("agent_label", ""))
+                elif etype == "tool_start":
+                    self.tool_start.emit(event.get("id", ""), event.get("name", ""), event.get("args", ""))
+                elif etype == "usage":
+                    tool_id_ev = event.get("tool_id", "")
+                    if tool_id_ev:
+                        self.agent_usage.emit(
+                            int(event.get("slot_index", -1)),
+                            tool_id_ev,
+                            event.get("agent_label", ""),
+                            int(event.get("tokens", 0)),
+                            int(event.get("ctx", 0)),
+                        )
+                    else:
+                        self.usage.emit(int(event.get("tokens", 0)), int(event.get("ctx", 0)))
+                elif etype == "tool_done":
+                    _completed += 1
+                    lbl = event.get("agent_label") or f"agent {_completed}"
+                    _completed_labels.append(lbl)
+                    self.tool_done.emit(event.get("id", ""), event.get("name", ""),
+                                        event.get("result", ""), bool(event.get("is_error", False)))
+                elif etype == "system":
+                    self.system_msg.emit(event.get("text", ""))
+                elif etype == "approval_request":
+                    self._pending_future = event["future"]
+                    self.approval_needed.emit(
+                        event.get("title", ""),
+                        event.get("message", ""),
+                        event.get("tool_name", ""),
+                        event.get("tool_args_str", ""),
+                    )
+                    await self._pending_future
+                    self._pending_future = None
+        except asyncio.CancelledError:
+            _cancelled = True
+            # If we were awaiting an approval future when cancelled, resolve it so
+            # the background agent doesn't hang waiting for an answer that never comes.
+            if self._pending_future is not None and not self._pending_future.done():
+                log.warning(
+                    "_drain_bg_agents: cancelled while awaiting approval future — "
+                    "auto-resolving as denied so background agent can unblock"
+                )
+                self._pending_future.set_result((False, "cancelled"))
+            else:
+                log.debug("_drain_bg_agents: cancelled (no pending approval future)")
+            self._pending_future = None
+            raise
+        finally:
+            if not _cancelled and _completed:
+                self.bg_agents_complete.emit(_completed)
+                label_list = ", ".join(f"'{l}'" for l in _completed_labels)
+                noun = "agent" if _completed == 1 else f"{_completed} agents"
+                notification = (
+                    f"[System: Background {noun} completed ({label_list}). "
+                    f"Results are now in context.\n"
+                    f"Check your current task list. If any items were explicitly waiting on "
+                    f"{'this agent' if _completed == 1 else 'these agents'}, proceed with those now. "
+                    f"If nothing was pending, no action is needed.]"
+                )
+                self._work_queue.put_nowait((notification, False))
+            self._bg_drain_task = None
 
     # ── Thread-safe public API (chat) ────────────────────────────────────────
 

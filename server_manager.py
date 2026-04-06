@@ -17,6 +17,7 @@ URL           = f"http://localhost:{PORT}"
 HB_INTERVAL   = 300    # full heartbeat every 5 min
 MAX_LOG_LINES = 8000   # trim log when it exceeds this many lines
 COMMANDS_FILE = os.path.join(os.path.dirname(__file__), "commands.json")
+UI_PREFS_FILE = os.path.join(os.path.dirname(__file__), "ui_prefs.json")
 
 MODELS_DEFAULT = {
     "My Model  ·  ?? t/s  ·  Notes": [
@@ -125,23 +126,63 @@ def _save_models(models):
         json.dump(models, f, indent=2)
 
 
+def _load_prefs() -> dict:
+    try:
+        with open(UI_PREFS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_prefs(prefs: dict) -> None:
+    with open(UI_PREFS_FILE, "w") as f:
+        json.dump(prefs, f, indent=2)
+
+
+def _detect_engine(cmd: list) -> str:
+    """Return the engine tag for a command list.
+
+    Tags:
+      "llama" — Windows llama-server / ik_llama.cpp binary
+      "wsl"   — anything launched via wsl.exe (vLLM, etc.)
+    """
+    if not cmd:
+        return "llama"
+    exe = os.path.basename(cmd[0]).lower().replace(".exe", "")
+    if exe == "wsl":
+        return "wsl"
+    return "llama"
+
+
 def _cmd_to_str(cmd: list) -> str:
+    def _q(s):
+        # Quote args that contain spaces (e.g. bash -c "..." for WSL commands).
+        # Safe for llama entries too — their args never contain spaces.
+        return f'"{s}"' if " " in s and not (s.startswith('"') and s.endswith('"')) else s
     parts = []
     i = 0
     while i < len(cmd):
         arg = cmd[i]
         if arg.startswith("-") and i + 1 < len(cmd) and not cmd[i + 1].startswith("-"):
-            parts.append(f"{arg} {cmd[i+1]}")
+            parts.append(f"{arg} {_q(cmd[i+1])}")
             i += 2
         else:
-            parts.append(arg)
+            parts.append(_q(arg))
             i += 1
     return " \\\n  ".join(parts)
 
 
 def _str_to_cmd(s: str) -> list:
     cleaned = s.replace("\\\n", " ").replace("\\\r\n", " ")
-    return shlex.split(cleaned, posix=False)
+    tokens = shlex.split(cleaned, posix=False)
+    # Strip outer quotes that _cmd_to_str adds for args containing spaces.
+    # Has no effect on unquoted llama-server args.
+    result = []
+    for t in tokens:
+        if len(t) >= 2 and ((t[0] == '"' and t[-1] == '"') or (t[0] == "'" and t[-1] == "'")):
+            result.append(t[1:-1])
+        else:
+            result.append(t)
+    return result
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -159,6 +200,7 @@ class ServerManager(tk.Tk):
         self._log_q       = queue.Queue()
         self._running     = False
         self._external    = False
+        self._engine      = "llama"   # "llama" | "wsl" — set on each start
         self._hb_after    = None
         self._cd_after    = None
         self._hb_secs  = 0
@@ -583,7 +625,7 @@ class ServerManager(tk.Tk):
                     continue
 
                 self._write_log(text, tag)
-                if "HTTP server listening" in text:
+                if "HTTP server listening" in text or "server is listening on" in text:
                     self._set_running()
                 elif "model loaded" in text:
                     self._log_put("Model loaded — waiting for HTTP…", "ok")
@@ -615,7 +657,8 @@ class ServerManager(tk.Tk):
             self._log_put(f"Command parse error: {e}", "err")
             return
 
-        self._log_put(f"Starting {name}", "beat")
+        self._engine = _detect_engine(cmd)
+        self._log_put(f"Starting {name} [{self._engine}]", "beat")
         self._btn_start.config(state="disabled")
         self._combo.config(state="disabled")
         self._lbl_status.config(text="  Loading…")
@@ -651,16 +694,32 @@ class ServerManager(tk.Tk):
             except subprocess.TimeoutExpired:
                 self._proc.kill()
             self._proc = None
+            if self._engine == "wsl":
+                self._kill_wsl_server()
         else:
-            self._log_put("Killing external llama-server…", "warn")
-            subprocess.run(
-                ["powershell", "-Command",
-                 "Stop-Process -Name llama-server -Force -ErrorAction SilentlyContinue"],
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
+            if self._engine == "wsl":
+                self._kill_wsl_server()
+            else:
+                self._log_put("Killing external llama-server…", "warn")
+                subprocess.run(
+                    ["powershell", "-Command",
+                     "Stop-Process -Name llama-server -Force -ErrorAction SilentlyContinue"],
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
         self._stop_voice_server()
         self._reset_ui()
         self._log_put("Server stopped", "err")
+
+    def _kill_wsl_server(self):
+        """Kill any process listening on PORT inside WSL."""
+        self._log_put(f"Killing WSL server on port {PORT}…", "warn")
+        subprocess.run(
+            ["wsl", "bash", "-c",
+             f"kill $(lsof -t -i:{PORT} 2>/dev/null) 2>/dev/null; "
+             f"pkill -f 'api_server' 2>/dev/null; true"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            timeout=8,
+        )
 
     def _reset_ui(self):
         self._running  = False
@@ -749,17 +808,21 @@ class ServerManager(tk.Tk):
         self._cmb_voice.set("")
 
     def _fetch_voices(self) -> None:
-        """Fetch voice list from TTS server and populate the combobox (runs on UI thread)."""
+        """Fetch voice list from TTS server, populate the combobox, restore saved preference."""
         import urllib.request, json as _json
         try:
             with urllib.request.urlopen("http://127.0.0.1:1236/voices", timeout=3) as r:
                 data = _json.loads(r.read())
-            voices  = data.get("voices", [])
-            current = data.get("current", "")
-            if voices:
-                self._cmb_voice["values"] = voices
-                self._cmb_voice.config(state="readonly")
-                self._cmb_voice.set(current if current in voices else voices[0])
+            voices = data.get("voices", [])
+            if not voices:
+                return
+            self._cmb_voice["values"] = voices
+            self._cmb_voice.config(state="readonly")
+            saved = _load_prefs().get("voice")
+            target = saved if saved in voices else voices[0]
+            self._cmb_voice.set(target)
+            # Always apply to server so it matches UI (server resets on restart)
+            threading.Thread(target=self._set_voice_bg, args=(target,), daemon=True).start()
         except Exception as e:
             self._log_put(f"[voice] Could not fetch voice list: {e}", "warn")
 
@@ -769,9 +832,9 @@ class ServerManager(tk.Tk):
         if not raw:
             return
         self._lbl_voice.config(text="switching…")
-        threading.Thread(target=self._set_voice_bg, args=(raw,), daemon=True).start()
+        threading.Thread(target=self._set_voice_bg, args=(raw, True), daemon=True).start()
 
-    def _set_voice_bg(self, voice_id: str) -> None:
+    def _set_voice_bg(self, voice_id: str, save: bool = False) -> None:
         """POST /voice to the TTS server (background thread)."""
         import urllib.request, urllib.parse, json as _json
         try:
@@ -779,6 +842,10 @@ class ServerManager(tk.Tk):
             req = urllib.request.Request(url, data=b"", method="POST")
             with urllib.request.urlopen(req, timeout=30) as r:
                 _json.loads(r.read())
+            if save:
+                prefs = _load_prefs()
+                prefs["voice"] = voice_id
+                _save_prefs(prefs)
             self._log_q.put((f"[voice] Switched to {voice_id}", "ok"))
             self.after(0, lambda: self._lbl_voice.config(text="running"))
         except Exception as e:
@@ -790,7 +857,7 @@ class ServerManager(tk.Tk):
             line = line.rstrip()
             if not line:
                 continue
-            if self._try_parse_tps(line):
+            if self._engine == "llama" and self._try_parse_tps(line):
                 continue
             ll = line.lower()
             if "error" in ll or "failed" in ll:
@@ -941,6 +1008,12 @@ class ServerManager(tk.Tk):
         if result["ok"]:
             self._external = True
             self._running  = True
+            # Infer engine from whichever profile is currently selected
+            try:
+                cmd = _str_to_cmd(self._cmd_text.get("1.0", "end").strip())
+                self._engine = _detect_engine(cmd)
+            except Exception:
+                self._engine = "llama"
             self._lbl_model.config(text=result["model"])
             self._lbl_dot.config(fg=GREEN)
             self._lbl_status.config(text="  Running (external)")

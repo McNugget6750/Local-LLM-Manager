@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, QTimer, QRect, QSize, Signal, Slot
 from PySide6.QtGui import (
     QAction, QColor, QTextCharFormat, QTextCursor, QKeySequence, QShortcut,
-    QPainter, QTextFormat, QLinearGradient, QBrush,
+    QPainter, QTextFormat, QLinearGradient, QBrush, QIcon,
 )
 
 import httpx
@@ -82,7 +82,7 @@ class _LineNumberArea(QWidget):
 class _KnightRiderBar(QWidget):
     """Bouncing red glow bar shown while the model is working."""
     _H      = 4
-    _SPOT_W = 60
+    _SPOT_W = 240
     _STEP   = 4
 
     def __init__(self, parent=None):
@@ -148,6 +148,7 @@ class _MarkedScrollBar(QScrollBar):
         super().__init__(Qt.Orientation.Vertical, parent)
         self._model_ratios:  list[float] = []
         self._change_ratios: list[float] = []
+        self._search_ratios: list[float] = []
 
     def set_model_marks(self, ratios: list[float]) -> None:
         self._model_ratios = ratios
@@ -157,9 +158,13 @@ class _MarkedScrollBar(QScrollBar):
         self._change_ratios = ratios
         self.update()
 
+    def set_search_marks(self, ratios: list[float]) -> None:
+        self._search_ratios = ratios
+        self.update()
+
     def paintEvent(self, event) -> None:
         super().paintEvent(event)          # native scrollbar renders first
-        if not self._model_ratios and not self._change_ratios:
+        if not self._model_ratios and not self._change_ratios and not self._search_ratios:
             return
         from PySide6.QtGui import QPainter, QColor
         painter = QPainter(self)
@@ -171,6 +176,124 @@ class _MarkedScrollBar(QScrollBar):
         for r in self._model_ratios:
             y = max(0, min(h - self._MARK_H, int(r * h)))
             painter.fillRect(0, y, w, self._MARK_H, QColor("#c8a000"))
+        for r in self._search_ratios:
+            y = max(0, min(h - self._MARK_H, int(r * h)))
+            painter.fillRect(0, y, w, self._MARK_H, QColor("#e05c00"))
+
+
+class _SlotPanel(QWidget):
+    """Row of colored squares: green=free, red=in-use."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._total = 1
+        self._in_use = 0
+        self.setFixedHeight(14)
+        self.setMinimumWidth(20)
+
+    def update_slots(self, total: int, in_use: int) -> None:
+        self._total = max(1, total)
+        self._in_use = max(0, min(in_use, self._total))
+        self.setFixedWidth(self._total * 12 - 2)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        for i in range(self._total):
+            color = QColor("#ef4444") if i < self._in_use else QColor("#22c55e")
+            p.fillRect(i * 12, 0, 10, 14, color)
+
+
+class _CtxBarsWidget(QWidget):
+    """Fixed pool of context bars: slot 0 = Eli, slots 1..N = agent slots.
+    Always visible; agent slots show zero when idle."""
+
+    _CHUNK_CSS = (
+        "QProgressBar {{ border: none; background: #1a1a1a; }}"
+        "QProgressBar::chunk {{ background: {color}; }}"
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._vl = QVBoxLayout(self)
+        self._vl.setContentsMargins(0, 0, 0, 0)
+        self._vl.setSpacing(2)
+        # Each entry: (bar, val_lbl, name_lbl, row_widget)
+        self._rows: list[tuple] = []
+        self._tool_id_to_slot: dict[str, int] = {}  # tool_id → slot_index (for remove_agent)
+        self._ensure_slots(1)   # always at least Eli
+
+    def _make_row(self, name: str) -> tuple:
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(4)
+        name_lbl = QLabel(name)
+        name_lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 9px;")
+        name_lbl.setFixedWidth(72)
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(5)
+        val = QLabel("— / —")
+        val.setStyleSheet(f"color: {TEXT_DIM}; font-size: 9px;")
+        rl.addWidget(name_lbl)
+        rl.addWidget(bar, stretch=1)
+        rl.addWidget(val)
+        self._vl.addWidget(row)
+        self.updateGeometry()
+        return bar, val, name_lbl, row
+
+    def _ensure_slots(self, n: int):
+        """Grow the pool to at least n rows (index 0 = Eli, 1..n-1 = agent slots)."""
+        while len(self._rows) < n:
+            idx = len(self._rows)
+            label = "Eli" if idx == 0 else f"Slot {idx}"
+            self._rows.append(self._make_row(label))
+
+    def _slot_name(self, idx: int) -> str:
+        return "Eli" if idx == 0 else f"Slot {idx}"
+
+    def _set_bar(self, bar, val_lbl, tokens: int, ctx: int):
+        if ctx <= 0:
+            bar.setValue(0)
+            bar.setStyleSheet(self._CHUNK_CSS.format(color="#7dff7d"))
+            val_lbl.setText("— / —")
+            return
+        pct = min(int(tokens / ctx * 100), 100)
+        color = "#ef4444" if pct >= 80 else "#fbbf24" if pct >= 60 else "#7dff7d"
+        bar.setValue(pct)
+        bar.setStyleSheet(self._CHUNK_CSS.format(color=color))
+        val_lbl.setText(f"{tokens // 1000:.1f}k / {ctx // 1000:.0f}k ({pct}%)")
+
+    def update_slot_count(self, total: int, _in_use: int):
+        """Called from slots_updated signal — ensures we have enough bars."""
+        self._ensure_slots(max(total, 1))
+
+    def update_eli(self, tokens: int, ctx: int):
+        bar, val, _, _ = self._rows[0]
+        self._set_bar(bar, val, tokens, ctx)
+
+    def update_slot(self, slot_index: int, tool_id: str, display_name: str, tokens: int, ctx: int):
+        """Update a bar directly by ISM slot index."""
+        if slot_index < 0:
+            return
+        self._ensure_slots(slot_index + 1)
+        if tool_id:
+            self._tool_id_to_slot[tool_id] = slot_index
+        bar, val, name_lbl, _ = self._rows[slot_index]
+        if display_name and slot_index > 0 and name_lbl.text() == self._slot_name(slot_index):
+            name_lbl.setText(display_name[:16])
+        self._set_bar(bar, val, tokens, ctx)
+
+    def remove_agent(self, tool_id: str):
+        slot_index = self._tool_id_to_slot.pop(tool_id, None)
+        if slot_index is not None and slot_index < len(self._rows):
+            bar, val, name_lbl, _ = self._rows[slot_index]
+            name_lbl.setText(self._slot_name(slot_index))
+            self._set_bar(bar, val, 0, 0)
 
 
 class CodeEditor(QPlainTextEdit):
@@ -382,7 +505,11 @@ class MainWindow(QMainWindow):
         self._cwd: str = HOME_DIR
         self._response_buf: str = ""
         self._agent_buf: str = ""
+        self._current_agent_label: str = ""  # label of last agent that wrote to the tab
         self._file_touch_history: list[str] = []   # abs paths touched by tool calls, most recent first
+        self._input_history: list[str] = []        # sent messages, newest first
+        self._input_history_idx: int = -1          # -1 = not browsing history
+        self._input_history_draft: str = ""        # saved draft while browsing
         self._plan_mode: bool = False
         self._busy: bool = False
         self._message_queue: list[tuple[str, bool]] = []  # (submit_text, plan_mode)
@@ -648,22 +775,13 @@ class MainWindow(QMainWindow):
         self._chat_tabs.addTab(self._agent_view, "Agent")
         layout.addWidget(self._chat_tabs, stretch=1)
 
-        # Token usage bar (above input)
-        ctx_row = QWidget()
-        ctx_row.setFixedHeight(18)
-        ctx_rl = QHBoxLayout(ctx_row)
-        ctx_rl.setContentsMargins(6, 2, 6, 0)
-        ctx_rl.setSpacing(6)
-        self._chat_ctx_bar = QProgressBar()
-        self._chat_ctx_bar.setRange(0, 100)
-        self._chat_ctx_bar.setValue(0)
-        self._chat_ctx_bar.setTextVisible(False)
-        self._chat_ctx_bar.setFixedHeight(6)
-        self._chat_ctx_label = QLabel("— / —")
-        self._chat_ctx_label.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px;")
-        ctx_rl.addWidget(self._chat_ctx_bar, stretch=1)
-        ctx_rl.addWidget(self._chat_ctx_label)
-        layout.addWidget(ctx_row)
+        # Per-slot context bars (above input) — Eli row always visible, agent rows added dynamically
+        self._ctx_bars = _CtxBarsWidget()
+        ctx_wrap = QWidget()
+        ctx_wl = QHBoxLayout(ctx_wrap)
+        ctx_wl.setContentsMargins(6, 2, 6, 2)
+        ctx_wl.addWidget(self._ctx_bars)
+        layout.addWidget(ctx_wrap)
 
         # Input area
         input_container = QWidget()
@@ -740,6 +858,34 @@ class MainWindow(QMainWindow):
         self._editor_label.setStyleSheet(f"color: {TEXT_DIM};")
         header_layout.addWidget(self._editor_label, stretch=1)
 
+        _qt_dir = str(Path(__file__).parent).replace("\\", "/")
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText("Search…")
+        self._search_input.setClearButtonEnabled(True)
+        self._search_input.setFixedWidth(180)
+        self._search_input.setStyleSheet(
+            "QLineEdit { background: #1a1a2e; color: #cccccc; border: 1px solid #444;"
+            " border-radius: 3px; padding: 2px 4px; }"
+            "QLineEdit:focus { border-color: #e05c00; }"
+        )
+        header_layout.addWidget(self._search_input)
+
+        self._search_prev_btn = QPushButton()
+        self._search_prev_btn.setIcon(QIcon(f"{_qt_dir}/arrow_up.svg"))
+        self._search_prev_btn.setFixedSize(22, 22)
+        self._search_prev_btn.setToolTip("Previous match (Shift+Enter)")
+        header_layout.addWidget(self._search_prev_btn)
+
+        self._search_next_btn = QPushButton()
+        self._search_next_btn.setIcon(QIcon(f"{_qt_dir}/arrow_down.svg"))
+        self._search_next_btn.setFixedSize(22, 22)
+        self._search_next_btn.setToolTip("Next match (Enter)")
+        header_layout.addWidget(self._search_next_btn)
+
+        self._search_count_label = QLabel("")
+        self._search_count_label.setStyleSheet(f"color: {TEXT_DIM}; min-width: 44px;")
+        header_layout.addWidget(self._search_count_label)
+
         self._new_btn = QPushButton("New")
         self._new_btn.setFixedWidth(50)
         self._new_btn.clicked.connect(self._new_file)
@@ -766,6 +912,9 @@ class MainWindow(QMainWindow):
         self._change_sels: list = []
         self._excerpt_sels: list = []     # ExtraSelections for the red excerpt highlight
         self._highlight_sels: list = []   # ExtraSelections for model-requested yellow highlights
+        self._search_sels: list = []      # ExtraSelections for search matches
+        self._search_cursors: list = []   # QTextCursors for each search match
+        self._search_idx: int = -1        # index of current (highlighted) match
         self._pending_excerpt: str = ""   # silent excerpt prepended on send (Ctrl+drag)
         self._editor.excerpt_changed.connect(self._on_excerpt_changed)
         self._editor.excerpt_cleared.connect(self._clear_excerpt)
@@ -813,6 +962,17 @@ class MainWindow(QMainWindow):
         connect_btn.clicked.connect(self._on_server_connect)
         url_rl.addWidget(connect_btn)
         srv_l.addWidget(url_row)
+        slot_row = QWidget()
+        slot_rl = QHBoxLayout(slot_row)
+        slot_rl.setContentsMargins(0, 0, 0, 0)
+        slot_rl.setSpacing(6)
+        slot_lbl = QLabel("Inference Slots:")
+        slot_lbl.setStyleSheet("color: #888888;")
+        self._slot_panel = _SlotPanel()
+        slot_rl.addWidget(slot_lbl)
+        slot_rl.addWidget(self._slot_panel)
+        slot_rl.addStretch()
+        srv_l.addWidget(slot_row)
         layout.addWidget(srv)
 
         # ── CONTEXT ───────────────────────────────────────────────────────────
@@ -977,7 +1137,9 @@ class MainWindow(QMainWindow):
         self._adapter.tool_done.connect(self._on_tool_done_signal)
         self._adapter.approval_needed.connect(self._on_approval_needed)
         self._adapter.usage.connect(self._on_usage)
+        self._adapter.agent_usage.connect(self._on_agent_usage)
         self._adapter.system_msg.connect(self._on_system_msg)
+        self._adapter.system_html.connect(self._on_system_html)
         self._adapter.error_msg.connect(self._on_error_msg)
         self._adapter.done.connect(self._on_turn_done)
         self._adapter.clear_chat.connect(self._on_clear_chat)
@@ -1006,9 +1168,22 @@ class MainWindow(QMainWindow):
         # Remote HTTP bridge
         self._adapter.remote_message.connect(self._on_remote_message)
 
+        # Background agents
+        self._adapter.slots_updated.connect(self._slot_panel.update_slots)
+        self._adapter.slots_updated.connect(self._ctx_bars.update_slot_count)
+        self._adapter.bg_agents_complete.connect(self._on_bg_agents_complete)
+
         # Editor navigation and highlights from model
         self._adapter.open_in_editor.connect(self._on_open_in_editor)
         self._adapter.highlight_in_editor.connect(self._on_highlight_in_editor)
+
+        # Editor search bar
+        self._search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        self._search_shortcut.activated.connect(self._focus_search)
+        self._search_input.textChanged.connect(self._update_search)
+        self._search_prev_btn.clicked.connect(self._search_prev)
+        self._search_next_btn.clicked.connect(self._search_next)
+        self._search_input.installEventFilter(self)
 
     # ── Event filter ─────────────────────────────────────────────────────────
 
@@ -1020,6 +1195,19 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, obj, event):
         from PySide6.QtCore import QEvent
+        if hasattr(self, "_search_input") and obj is self._search_input and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key == Qt.Key.Key_Escape:
+                self._search_input.clear()
+                self._editor.setFocus()
+                return True
+            if key == Qt.Key.Key_Return:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self._search_prev()
+                else:
+                    self._search_next()
+                return True
+
         if hasattr(self, "_input") and obj is self._input and event.type() == QEvent.Type.KeyPress:
             key = event.key()
             mods = event.modifiers()
@@ -1041,7 +1229,7 @@ class MainWindow(QMainWindow):
                     self._send_message()
                 return True
 
-            # Arrow keys navigate completer
+            # Arrow keys navigate completer or input history
             if self._completer.isVisible():
                 if key == Qt.Key.Key_Up:
                     self._completer.move_selection(-1)
@@ -1051,6 +1239,33 @@ class MainWindow(QMainWindow):
                     return True
                 if key == Qt.Key.Key_Escape:
                     self._completer.hide()
+                    return True
+
+            if key == Qt.Key.Key_Up and self._input_history:
+                cursor = self._input.textCursor()
+                on_first_line = cursor.blockNumber() == 0
+                if on_first_line:
+                    if self._input_history_idx == -1:
+                        self._input_history_draft = self._input.toPlainText()
+                    next_idx = self._input_history_idx + 1
+                    if next_idx < len(self._input_history):
+                        self._input_history_idx = next_idx
+                        self._input.setPlainText(self._input_history[next_idx])
+                        self._input.moveCursor(self._input.textCursor().MoveOperation.End)
+                    return True
+
+            if key == Qt.Key.Key_Down and self._input_history_idx >= 0:
+                cursor = self._input.textCursor()
+                on_last_line = cursor.blockNumber() == self._input.document().blockCount() - 1
+                if on_last_line:
+                    next_idx = self._input_history_idx - 1
+                    if next_idx < 0:
+                        self._input_history_idx = -1
+                        self._input.setPlainText(self._input_history_draft)
+                    else:
+                        self._input_history_idx = next_idx
+                        self._input.setPlainText(self._input_history[next_idx])
+                    self._input.moveCursor(self._input.textCursor().MoveOperation.End)
                     return True
 
         # Keep document text width in sync with viewport — required for width:100% tables
@@ -1076,6 +1291,92 @@ class MainWindow(QMainWindow):
                 return True
 
         return super().eventFilter(obj, event)
+
+    # ── Editor search ─────────────────────────────────────────────────────────
+
+    def _apply_all_sels(self) -> None:
+        """Merge all ExtraSelection lists and apply them to the editor."""
+        self._editor.setExtraSelections(
+            self._change_sels + self._excerpt_sels + self._highlight_sels + self._search_sels
+        )
+
+    def _build_search_sels(self) -> None:
+        """Rebuild _search_sels from _search_cursors, highlighting _search_idx differently."""
+        fmt_all = QTextCharFormat()
+        fmt_all.setBackground(QColor("#7a3000"))   # dim orange — all matches
+        fmt_cur = QTextCharFormat()
+        fmt_cur.setBackground(QColor("#e05c00"))   # bright orange — current match
+
+        sels = []
+        for i, cur in enumerate(self._search_cursors):
+            sel = QTextEdit.ExtraSelection()
+            sel.cursor = cur
+            sel.format = fmt_cur if i == self._search_idx else fmt_all
+            sels.append(sel)
+        self._search_sels = sels
+
+    def _update_search(self, text: str) -> None:
+        """Find all occurrences of text in the editor, build highlights and scrollbar marks."""
+        doc = self._editor.document()
+        self._search_cursors = []
+        self._search_idx = -1
+
+        if text:
+            cursor = doc.find(text)
+            while not cursor.isNull():
+                self._search_cursors.append(QTextCursor(cursor))
+                cursor = doc.find(text, cursor)
+            if self._search_cursors:
+                self._search_idx = 0
+
+        self._build_search_sels()
+        self._apply_all_sels()
+        self._update_search_scrollbar()
+        self._update_search_count()
+        if self._search_idx >= 0:
+            self._scroll_to_current_match()
+
+    def _search_next(self) -> None:
+        if not self._search_cursors:
+            return
+        self._search_idx = (self._search_idx + 1) % len(self._search_cursors)
+        self._build_search_sels()
+        self._apply_all_sels()
+        self._scroll_to_current_match()
+        self._update_search_count()
+
+    def _search_prev(self) -> None:
+        if not self._search_cursors:
+            return
+        self._search_idx = (self._search_idx - 1) % len(self._search_cursors)
+        self._build_search_sels()
+        self._apply_all_sels()
+        self._scroll_to_current_match()
+        self._update_search_count()
+
+    def _scroll_to_current_match(self) -> None:
+        if 0 <= self._search_idx < len(self._search_cursors):
+            self._editor.setTextCursor(self._search_cursors[self._search_idx])
+            self._editor.ensureCursorVisible()
+
+    def _update_search_scrollbar(self) -> None:
+        total = max(self._editor.document().blockCount(), 1)
+        ratios = sorted({cur.blockNumber() / total for cur in self._search_cursors})
+        self._editor._marker_bar.set_search_marks(ratios)
+
+    def _update_search_count(self) -> None:
+        n = len(self._search_cursors)
+        text = self._search_input.text()
+        if not text:
+            self._search_count_label.setText("")
+        elif n == 0:
+            self._search_count_label.setText("0/0")
+        else:
+            self._search_count_label.setText(f"{self._search_idx + 1}/{n}")
+
+    def _focus_search(self) -> None:
+        self._search_input.setFocus()
+        self._search_input.selectAll()
 
     def _resolve_file_path(self, raw: str) -> tuple[str, int]:
         """Resolve a raw path token (from a chat link) to (absolute_path, line). Returns ('', 1) if not found."""
@@ -1127,6 +1428,10 @@ class MainWindow(QMainWindow):
         if not text:
             return
         self._input.clear()
+        self._input_history_idx = -1
+        self._input_history_draft = ""
+        if not self._input_history or self._input_history[0] != text:
+            self._input_history.insert(0, text)
         if text.startswith("/"):
             self._adapter.submit_slash(text)
             return
@@ -1149,6 +1454,7 @@ class MainWindow(QMainWindow):
         )
         self._response_buf = ""
         self._agent_buf = ""
+        self._current_agent_label = ""
         self._full_view.append("")
         self._adapter.submit(submit_text, self._plan_mode)
 
@@ -1165,7 +1471,11 @@ class MainWindow(QMainWindow):
         self._response_buf += token
 
     @Slot(str)
-    def _on_agent_text_token(self, token: str):
+    def _on_agent_text_token(self, token: str, label: str = ""):
+        if label and label != self._current_agent_label:
+            self._current_agent_label = label
+            sep = f'<p style="color:#555;font-size:10px;margin:4px 0;">── {label} ──</p>'
+            self._agent_view.append(sep)
         self._agent_buf += token
         _insert_plain(self._agent_view, token)
         self._auto_scroll(self._agent_view)
@@ -1209,7 +1519,8 @@ class MainWindow(QMainWindow):
         # Pick color — agents get a palette slot, others get a fixed category color
         if name in ("spawn_agent", "queue_agents"):
             color = _AGENT_PALETTE[self._agent_counter % len(_AGENT_PALETTE)]
-            self._active_agents[tool_id] = color
+            _ag_display = a.get("system_prompt", "") or f"Agent {self._agent_counter + 1}"
+            self._active_agents[tool_id] = (color, tool_id)
             self._agent_counter += 1
             self._agent_nesting += 1
             self._current_agent_color = color
@@ -1217,6 +1528,7 @@ class MainWindow(QMainWindow):
             # Clear agent view and highlight Agent tab in amber
             self._agent_view.clear()
             self._agent_buf = ""
+            self._current_agent_label = ""
             self._chat_tabs.tabBar().setTabTextColor(1, QColor("#fbbf24"))
 
             # Special framing: yellow stripe, dark yellow bg, magenta bold label + full task text
@@ -1261,11 +1573,18 @@ class MainWindow(QMainWindow):
     def _on_tool_done_signal(self, tool_id: str, name: str, result: str, is_error: bool):
         if name in ("write_file", "edit") and not is_error:
             self._clear_model_highlight()
-        agent_color = self._active_agents.pop(tool_id, None)
+        _agent_entry = self._active_agents.pop(tool_id, None)
+        agent_color = (_agent_entry[0] if isinstance(_agent_entry, tuple) else _agent_entry)
         is_agent_tool = name in ("spawn_agent", "queue_agents")
 
         if is_agent_tool:
             self._agent_nesting = max(0, self._agent_nesting - 1)
+            if result.startswith("[background:"):
+                # Placeholder tool_done — agent is still running in background.
+                # Keep the context bar slot alive so usage events can update it.
+                # The real tool_done from _run_background_agent will call remove_agent.
+                return
+            self._ctx_bars.remove_agent(tool_id)
             color = agent_color or "#22d3ee"
             indent = ""
             bg = AGENT_BG
@@ -1330,6 +1649,7 @@ class MainWindow(QMainWindow):
                 f'</td></tr></table>'
             )
             self._agent_buf = ""
+            self._current_agent_label = ""
             self._chat_tabs.tabBar().setTabTextColor(1, QColor())
 
         self._full_view.verticalScrollBar().setValue(self._full_view.verticalScrollBar().maximum())
@@ -1417,19 +1737,28 @@ class MainWindow(QMainWindow):
             self._ctx_label.setText(f"{tokens // 1000:.1f}k / {ctx // 1000:.0f}k tokens ({pct}%)")
             self._ctx_bar.setStyleSheet(chunk_css)
             self._ctx_warn.setVisible(pct >= 75)
-            self._chat_ctx_bar.setValue(pct)
-            self._chat_ctx_bar.setStyleSheet(chunk_css)
-            self._chat_ctx_label.setText(f"{tokens // 1000:.1f}k / {ctx // 1000:.0f}k ({pct}%)")
+            self._ctx_bars.update_eli(tokens, ctx)
         else:
             self._ctx_bar.setValue(0)
             self._ctx_label.setText("— / — tokens")
-            self._chat_ctx_bar.setValue(0)
-            self._chat_ctx_label.setText("— / —")
+            self._ctx_bars.update_eli(0, 0)
+
+    @Slot(str, str, int, int)
+    def _on_agent_usage(self, slot_index: int, tool_id: str, label: str, tokens: int, ctx: int):
+        self._ctx_bars.update_slot(slot_index, tool_id, label or "Agent", tokens, ctx)
 
     @Slot(str)
     def _on_system_msg(self, text: str):
         self._status_bar.showMessage(text.splitlines()[0] if text else "", 4000)
         html = _markdown_to_html(text)
+        self._compact_view.append(html)
+        self._full_view.append(html)
+        self._auto_scroll(self._compact_view)
+        self._auto_scroll(self._full_view)
+
+    @Slot(str)
+    def _on_system_html(self, html: str):
+        """Display pre-formatted HTML from slash command output in the chat views."""
         self._compact_view.append(html)
         self._full_view.append(html)
         self._auto_scroll(self._compact_view)
@@ -1506,6 +1835,7 @@ class MainWindow(QMainWindow):
             self._queue_label.setVisible(n > 0)
             self._response_buf = ""
             self._agent_buf = ""
+            self._current_agent_label = ""
             self._full_view.append("")
             self._adapter.submit(submit_text, plan_mode)
             # stay busy — _set_input_enabled(False) was already called
@@ -1602,6 +1932,9 @@ class MainWindow(QMainWindow):
         self._editor_label.setText(os.path.basename(path))
         self._save_btn.setEnabled(True)
         self._close_btn.setEnabled(True)
+        # Re-run any active search against the new document
+        if hasattr(self, "_search_input"):
+            self._update_search(self._search_input.text())
 
     @Slot()
     def _new_file(self):
@@ -1784,6 +2117,7 @@ class MainWindow(QMainWindow):
         self._stop_btn.setEnabled(True)
         self._agent_header_pending = True
         self._agent_buf = ""
+        self._current_agent_label = ""
         self._clear_change_highlights()
 
     @Slot()
@@ -1895,15 +2229,16 @@ class MainWindow(QMainWindow):
         self._editor.setTextCursor(clear_cur)
 
         # Merge with any existing change highlights
-        self._editor.setExtraSelections(self._change_sels + sels)
         self._excerpt_sels = sels
+        self._apply_all_sels()
 
     def _clear_excerpt(self):
         """Remove the pending excerpt and its red highlight."""
         self._pending_excerpt = ""
         self._excerpt_sels = []
+
         self._editor._has_excerpt = False
-        self._editor.setExtraSelections(self._change_sels)
+        self._apply_all_sels()
 
     def _insert_excerpt(self):
         """Legacy /excerpt handler — now just activates excerpt from current selection."""
@@ -2026,7 +2361,7 @@ class MainWindow(QMainWindow):
             sels.append(sel)
 
         self._change_sels = sels
-        self._editor.setExtraSelections(sels)
+        self._apply_all_sels()
 
         total = max(self._editor.document().blockCount(), 1)
         ratios = sorted({sel.cursor.blockNumber() / total for sel in sels})
@@ -2041,7 +2376,7 @@ class MainWindow(QMainWindow):
 
     def _clear_change_highlights(self) -> None:
         self._change_sels = []
-        self._editor.setExtraSelections([])
+        self._apply_all_sels()
         self._editor._marker_bar.set_change_marks([])
         if hasattr(self, "_highlight_timer"):
             self._highlight_timer.stop()
@@ -2087,6 +2422,7 @@ class MainWindow(QMainWindow):
         self._append_remote(text)
         self._response_buf = ""
         self._agent_buf    = ""
+        self._current_agent_label = ""
         self._full_view.append("")
 
     def _append_remote(self, text: str):
@@ -2102,6 +2438,22 @@ class MainWindow(QMainWindow):
             f'</td></tr></table>'
         )
         self._full_view.document().setTextWidth(self._full_view.viewport().width())
+        self._full_view.append(html)
+        self._auto_scroll(self._full_view)
+
+    @Slot(int)
+    def _on_bg_agents_complete(self, count: int) -> None:
+        noun = "agent" if count == 1 else "agents"
+        html = (
+            '<table width="100%" style="border-spacing:0;border-collapse:collapse;'
+            'table-layout:fixed;margin:3px 0;">'
+            '<tr>'
+            '<td width="3" style="background:#22d3ee;padding:0;vertical-align:top;"></td>'
+            '<td style="background:#071820;padding:4px 10px;">'
+            f'<span style="color:#22d3ee;font-weight:bold;">&#10003; {count} background {noun} complete</span>'
+            ' <span style="color:#666666;">— results included in your next message to Eli</span>'
+            '</td></tr></table>'
+        )
         self._full_view.append(html)
         self._auto_scroll(self._full_view)
 
@@ -2134,7 +2486,7 @@ class MainWindow(QMainWindow):
         """Remove any model-requested yellow highlights from the editor."""
         if self._highlight_sels:
             self._highlight_sels = []
-            self._editor.setExtraSelections(self._change_sels + self._excerpt_sels)
+            self._apply_all_sels()
             self._editor._marker_bar.set_model_marks([])
 
     @Slot(str, int, int, int, int)
@@ -2179,7 +2531,7 @@ class MainWindow(QMainWindow):
                 sels.append(char_sel)
 
         self._highlight_sels += sels
-        self._editor.setExtraSelections(self._change_sels + self._excerpt_sels + self._highlight_sels)
+        self._apply_all_sels()
 
         # Update scrollbar markers
         total = max(self._editor.document().blockCount(), 1)
