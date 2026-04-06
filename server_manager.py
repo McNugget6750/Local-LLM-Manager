@@ -657,6 +657,10 @@ class ServerManager(tk.Tk):
             self._log_put(f"Command parse error: {e}", "err")
             return
 
+        self._log.config(state="normal")
+        self._log.delete("1.0", "end")
+        self._log.config(state="disabled")
+
         self._engine = _detect_engine(cmd)
         self._log_put(f"Starting {name} [{self._engine}]", "beat")
         self._btn_start.config(state="disabled")
