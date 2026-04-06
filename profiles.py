@@ -36,6 +36,14 @@ def _load_memory() -> str | None:
 
 SYSTEM_PROMPT = _load_system_prompt()
 
+_PULSE_PREFIX = "[Behavioral Reminder"
+
+def _load_behavioral_pulse() -> str | None:
+    pulse_file = Path(__file__).parent / "behavioral_pulse.md"
+    if pulse_file.exists():
+        return pulse_file.read_text(encoding="utf-8").strip()
+    return None
+
 
 # ── Model profiles (commands.json) ────────────────────────────────────────────
 

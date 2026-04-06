@@ -3,59 +3,24 @@
 A local LLM chat GUI + server manager supporting multiple inference backends:
 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp), [llama.cpp](https://github.com/ggml-org/llama.cpp), and [vLLM](https://github.com/vllm-project/vllm) (via WSL).
 
-Includes **Eli** — a coding assistant persona with tool use, sub-agents, agent queues, vision analysis, voice I/O, plan mode, slash commands, and persistent session state.
+Includes **Eli** — a coding assistant with tool use, background agents, agent queues, vision analysis, voice I/O, plan mode, slash commands, and persistent session state.
 
 ---
 
-## What this is
+## Components
 
-- **`server_manager.py`** — Tkinter GUI for launching and monitoring inference server instances. Tracks t/s, VRAM, GPU load, RAM, and CPU in real time. Supports multiple named model profiles from `commands.json` across different backends. Auto-detects the engine type from the launch command — llama.cpp binaries and WSL-hosted vLLM servers are handled transparently. Includes a loopback control API so Eli can switch models automatically. Manages the voice server lifecycle.
-- **`qt/main.py`** — Qt chat GUI (primary interface). Full-featured chat window with file explorer, code editor, agent output tab, token bar, slash command autocomplete, Knight Rider activity indicator, and session management. Slash command output (e.g. `/help`, `/role`) renders as formatted HTML panels in the chat view when the GUI is open. Launch via `qt/run.bat` or click **Open Chat** in the server manager.
-- **`chat.py`** — Terminal chat client (Eli). Same backend as the Qt GUI — use this if you prefer a terminal interface.
-
----
-
-## Supported backends
-
-All backends expose an OpenAI-compatible `/v1` API on the configured port. The server manager auto-detects the engine from the launch command and handles start/stop correctly for each.
-
-| Backend | Engine tag | Use case |
-|---------|-----------|----------|
-| ik_llama.cpp / llama.cpp | `llama` | GGUF models, Windows-native, CPU+GPU offload |
-| vLLM (WSL) | `wsl` | HuggingFace safetensors, NVFP4/FP8 quants, Blackwell GPU |
-
-**llama.cpp entry** (`commands.json`):
-```json
-"My Model · Q6_K": [
-  "..\\llama.cpp\\build\\bin\\Release\\llama-server.exe",
-  "-m", "path\\to\\model.gguf",
-  "-ngl", "999", "-c", "32768",
-  "-ctk", "q8_0", "-ctv", "q8_0", "-fa", "on",
-  "--no-mmap", "--jinja",
-  "-b", "4096", "-ub", "4096", "-t", "16",
-  "--parallel", "2", "--port", "1234", "--host", "0.0.0.0"
-]
-```
-
-**vLLM (WSL) entry** (`commands.json`):
-```json
-"My Model · NVFP4 [vLLM]": [
-  "wsl", "--exec", "bash", "-c",
-  "/home/user/miniconda3/bin/conda run -n vllm-env python -m vllm.entrypoints.openai.api_server --model /mnt/c/path/to/model --quantization modelopt --dtype bfloat16 --max-model-len 8192 --max-num-seqs 2 --port 1234 --host 0.0.0.0"
-]
-```
-
----
-
-## Requirements
-
-- Python 3.11+
-- At least one inference backend:
-  - [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) or [llama.cpp](https://github.com/ggml-org/llama.cpp) built — `llama-server.exe` configured in `commands.json`
-  - Or: WSL2 + Ubuntu + vLLM installed in a conda environment
-- GGUF or HuggingFace model files
-- Windows (server_manager.py uses Windows APIs for GPU/RAM stats)
-- NVIDIA GPU recommended; NVFP4 requires Blackwell (RTX 5000/6000 series, B100/B200)
+| File / directory | Role |
+|-----------------|------|
+| `server_manager.py` | Tkinter GUI — launch, monitor, and switch inference servers |
+| `qt/main.py` | Qt chat GUI (primary interface) — launch via `qt/run.bat` or **Open Chat** |
+| `chat.py` | Terminal chat client — same backend as Qt GUI |
+| `commands.json` | Model profiles (gitignored — copy from `commands.example.json`) |
+| `ELI.md` | Eli's behavioral rules and persona |
+| `behavioral_pulse.md` | Condensed rules injected before every turn for attention retention |
+| `agents/` | Agent persona definitions |
+| `skills/` | Slash command prompt workflows |
+| `eli.toml` | Project-specific config (gitignored, auto-loaded from cwd) |
+| `USER_PROFILE.md` | Personal info Eli uses to personalize responses (gitignored) |
 
 ---
 
@@ -65,142 +30,216 @@ All backends expose an OpenAI-compatible `/v1` API on the configured port. The s
 git clone https://github.com/McNugget6750/Local-LLM-Manager.git
 cd Local-LLM-Manager
 
-:: Create venv
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 
-:: Configure model profiles
 copy commands.example.json commands.json
-:: Edit commands.json — fill in your backend binary path and model paths
+:: Edit commands.json — set your binary path and model paths
 
-:: Optional: personalize Eli
 copy USER_PROFILE.example.md USER_PROFILE.md
-:: Edit USER_PROFILE.md with your name, background, projects
+:: Edit USER_PROFILE.md with your background and preferences
 
-:: Start server manager GUI
-run.bat
-
-:: Start Eli chat — or click "Open Chat" in the GUI once a model is loaded
-chat.bat
+run.bat          :: server manager
+qt\run.bat       :: chat GUI (connect to a running server)
+chat.bat         :: terminal chat
 ```
 
 ---
 
-## Usage
+## Server manager
 
-### Server manager
+`run.bat` opens the Tkinter GUI. Select a model profile, click **Start**. Add new profiles with **+ Add Model** — saved to `commands.json`.
 
-```bat
-run.bat
+Once running, click **Open Chat** to launch the Qt GUI with `--continue` (resumes last session). The voice server starts and stops alongside the inference server.
+
+The server manager exposes a loopback control API on port 1235. Eli uses this to switch models automatically when dispatching agents — the GUI tracks state correctly throughout.
+
+---
+
+## Supported backends
+
+All backends expose an OpenAI-compatible `/v1` API. The engine is auto-detected from the first token of the launch command.
+
+| Backend | Engine tag | Notes |
+|---------|-----------|-------|
+| ik_llama.cpp / llama.cpp | `llama` | GGUF models, Windows-native, CPU+GPU offload |
+| vLLM via WSL | `wsl` | HuggingFace safetensors, NVFP4/FP8 quants, Blackwell GPU |
+
+### llama.cpp profile
+
+```json
+"My Model · Q6_K": [
+  "..\\llama.cpp\\build\\bin\\Release\\llama-server.exe",
+  "-m", "path\\to\\model.gguf",
+  "-ngl", "999", "-c", "32768",
+  "-ctk", "q4_0", "-ctv", "q4_0", "-fa", "on",
+  "--no-mmap", "--jinja",
+  "-b", "512", "-ub", "512", "-t", "16",
+  "--parallel", "2", "--port", "1234", "--host", "0.0.0.0"
+]
 ```
 
-Opens the GUI. Select a model profile, click **Start**. The GUI monitors t/s, VRAM, GPU, RAM, and CPU in real time. Add new model profiles with **+ Add Model** — they are saved to `commands.json`.
+> **Large context tip:** Use `-b 512 -ub 512` for contexts above 32k. A large batch size combined with flash attention causes a temporary memory spike during prefill proportional to `batch × context` — at 128k this can crash the server silently.
 
-Once a server is running, click **Open Chat** to launch the Qt chat GUI with `--continue` (resumes last session automatically). The voice server starts and stops alongside the inference server.
+### vLLM (WSL) profile
 
-The server manager also exposes a loopback control API on port 1235. Eli uses this to switch models automatically when running agents on different model profiles — the GUI stays in sync with start/stop state throughout.
-
-### Qt chat GUI
-
-```bat
-qt\run.bat               # new session
-qt\run.bat --continue    # resume last session with all settings restored
-qt\run.bat --resume name # resume a specific named session
+```json
+"My Model · NVFP4 [vLLM]": [
+  "wsl", "--exec", "bash", "-c",
+  "/home/user/miniconda3/bin/conda run -n vllm-env python -m vllm.entrypoints.openai.api_server --model /mnt/c/path/to/model --quantization modelopt --dtype bfloat16 --max-model-len 8192 --max-num-seqs 2 --port 1234 --host 0.0.0.0"
+]
 ```
 
-Connects to `http://localhost:1234` by default. The file explorer on the left roots at the drive level — double-click a directory to set it as the working directory. The editor panel supports syntax highlighting, excerpts, and line references. The Agent tab streams sub-agent output separately.
+NVFP4 requires a Blackwell GPU (RTX 5000/6000 series, B100/B200) and ~96 GB VRAM for comfortable use. On a 32 GB card (RTX 5090), use 4096 context maximum and `--enforce-eager`.
 
-Slash command output (e.g. `/help`, `/role`, `/model`, `/status`) renders as styled HTML panels directly in the chat view when the GUI is open. In terminal-only mode the same output goes to the Rich console as before.
+---
 
-### Eli chat CLI (terminal)
+## Qt chat GUI
 
 ```bat
-chat.bat           # new session
-chat.bat --continue  # resume last session with all settings restored
+qt\run.bat               :: new session
+qt\run.bat --continue    :: resume last session
+qt\run.bat --resume name :: resume named session
 ```
 
-Same backend as the Qt GUI. Use this if you prefer a terminal interface.
+- File explorer on the left — double-click a directory to set the working directory
+- Code editor panel with syntax highlighting, excerpt selection, and line references
+- Agent tab streams sub-agent output in real time
+- Per-slot context bars above the input — one bar for Eli, one added per active agent slot. Color shifts yellow at 60%, red at 80%. Agents are stopped automatically at 92% context fill to prevent silent server crashes.
+- Slash command output renders as styled HTML panels in the chat view
+- Up/Down arrows in the input box navigate message history
+- Voice selector in the server manager populates once the voice server is running; selection persists across restarts
 
-**Session persistence** — think level, compact mode, approval level, model, active role, and working directory are saved with each session and restored on `--continue` or `/resume`.
+---
 
-**Slash commands:**
+## Slash commands
 
 | Command | Description |
 |---------|-------------|
 | `/skills` | List available skills with triggers |
 | `/commit` | Generate a conventional commit message |
-| `/review <file>` | Deep code review sub-agent (reads code + callers + tests) |
-| `/research <topic>` | Skeptical research sub-agent (3-pass protocol) |
+| `/review <file>` | Deep code review sub-agent |
+| `/research <topic>` | 3-pass skeptical research sub-agent |
 | `/plan <feature>` | Implementation planning sub-agent |
 | `/code <task>` | Production code writing sub-agent |
-| `/queue-results [label]` | List recent agent queue runs or show one by label |
-| `/model [name]` | List available model profiles or switch to one |
+| `/queue-results [label]` | List or show agent queue run results |
+| `/model [name]` | List profiles or switch to one |
 | `/role <name>` | Adopt an agent persona (`/role eli` to revert) |
 | `/voice [ptt\|auto] [tools]` | Start voice conversation mode |
-| `/config` | Show loaded eli.toml config |
+| `/config` | Show loaded `eli.toml` config |
 | `/cd <path>` | Change working directory |
 | `/think [off\|on\|deep]` | Set thinking level |
 | `/approval [auto\|ask-writes\|ask-all\|yolo]` | Set tool approval level |
 | `/compact` | Summarise older messages to free context |
-| `/status` | Show token usage and context window info |
+| `/status` | Token usage and context window info |
 
-**Keyboard shortcuts:**
+**Keyboard shortcuts (Qt GUI):**
 
-- `Ctrl+C` — cancel current response (stays in session)
-- `Ctrl+D` — exit
-- `Shift+Tab` — toggle plan mode (Eli plans but doesn't execute)
-- `Ctrl+O` — toggle compact mode (collapse thinking/tool output)
+- `Ctrl+C` — cancel current response
+- `Shift+Tab` — toggle plan mode (reads/searches only, write tools blocked)
+- Up / Down — navigate input history
 
 ---
 
 ## Voice mode
 
+Requires `eli_voice_server` on port 1236 (Kokoro ONNX TTS + faster-whisper STT). Starts automatically with the inference server, or run `voice_server.bat` standalone.
+
 ```
-/voice              # PTT mode (default)
-/voice auto         # VAD — speak naturally, pause to send
-/voice ptt tools    # PTT with tool access enabled
-/voice auto tools   # auto VAD with tool access
+/voice              :: PTT mode (hold Insert key to record)
+/voice auto         :: VAD mode (silence detection triggers send)
+/voice ptt tools    :: PTT with tool access enabled
+/voice auto tools   :: VAD with tool access
 ```
 
-Voice requires the **eli_voice_server** running on port 1236 (Kokoro ONNX TTS + faster-whisper STT). Start it standalone with `voice_server.bat` — no model loaded in the server manager needed for TTS/STT alone. In PTT mode, hold the configured key to record; release to transcribe and send. In auto mode, silence detection triggers the send automatically. Press Escape to exit voice mode.
-
-The `voice_input.py` standalone tool provides system-wide push-to-type voice input (Insert key PTT by default). It types transcriptions into any target window you pick, with optional auto-submit.
+The active voice in the server manager is saved to `ui_prefs.json` and restored on restart. The `speak` tool sends audio output and also displays the spoken text in the chat view.
 
 ---
 
-## Model switching
+## Agents
 
-Eli knows which model profiles are available at startup — descriptions, strengths, weaknesses, and speed are injected from `commands.json` as a system message. Eli can switch models automatically before spawning a sub-agent and restores the original model when done.
+Eli dispatches sub-agents for specialized tasks. Agents run on the inference server (with an optional model switch) and report back. The GUI shows a per-agent context bar while it's running.
 
-The switch goes through the Server Manager control API, so all logging, UI state, and Stop button behaviour remain correct.
+### Background vs inline
+
+- **Background agents** run in parallel while Eli stays responsive. Results are injected into context and Eli is notified automatically to continue any pending task list.
+- **Inline agents** block the current turn. Use only when the result is required before anything else can proceed.
+
+Eli's default is background — fire immediately and stay available for other questions.
+
+### Agent profiles (`agents/*.md`)
+
+Each profile is a Markdown file with a YAML frontmatter block and a system prompt body:
+
+```markdown
+---
+write_domains: [python_files]
+read_domains: [python_files, test_files, docs]
+---
+
+You are an expert software engineer...
+```
+
+**Frontmatter fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `write_domains` | list | Tool domains the agent may write to. Empty = read-only. |
+| `read_domains` | list | Tool domains the agent may read from. |
+| `Recommended model` | string | If present, Eli switches to this model profile before spawning the agent, then restores the original model when done. **Omit this field to keep the agent on the current model and preserve background mode.** |
+
+**Domain values:** `python_files`, `test_files`, `docs`, `html_css_js`, `text files`
+
+> **Model switching and background mode:** When an agent profile contains a `Recommended model` line, the server must switch models before the agent can run. This forces the agent to run inline (blocking) because background mode cannot survive a server switch. If you want agents to run in background, leave `Recommended model` out of the profile — the agent will use whatever model is currently loaded.
+
+**Available profiles:**
+
+| Profile | Write domains | Purpose |
+|---------|--------------|---------|
+| `code-researcher` | — | Targeted code research, API lookup, install commands |
+| `code-review` | — | Review code for correctness, safety, and design issues |
+| `doc-writer` | docs | Write docstrings or README sections |
+| `expert_coder` | python_files | Production code implementation |
+| `generic` | — | General-purpose tasks, quick tests, system checks |
+| `graphics_designer` | — | Brand identity, icons, colour systems |
+| `level_designer` | — | Game level layout, encounter design, puzzle design |
+| `researcher` | — | Research a library, API, or technical question |
+| `test-writer` | test_files | Write unit tests |
+| `voice` | — | Voice interaction persona |
+| `web_designer` | html_css_js | UI/UX, layout feedback, CSS/HTML critique |
+
+### Spawning agents
+
+```python
+# Single agent (background by default)
+spawn_agent(system_prompt="researcher", task="What are the tradeoffs of X?")
+
+# Two independent agents in parallel
+spawn_agent(system_prompt="code-researcher", task="Find the httpx streaming API")
+spawn_agent(system_prompt="expert_coder", task="Implement the download manager")
+
+# Ordered pipeline (researcher output feeds expert_coder)
+queue_agents(tasks=[
+    {"system_prompt": "researcher", "task": "Research library X"},
+    {"system_prompt": "expert_coder", "task": "Implement using the research above"}
+])
+```
+
+Results from completed background agents are injected into Eli's context before the next user turn. Eli is then notified with a system message listing which agents finished, so it can continue any pending task list items that were waiting.
 
 ---
 
-## Agent queues
+## Agent queues (`/queue-results`)
 
-Eli can run a sequence of agents — each with its own task, model, and time budget — without manual intervention:
+`queue_agents` runs a sequence where each agent's output is available to the next. Model switches between consecutive agents on the same model are skipped. The original model is restored after the queue completes. Results are written to `sessions/queue_{ts}_{label}/results.json`.
 
-```
-Queue two agents:
-  1. researcher on the fast model — "what are the tradeoffs of MoE quantization?" (120s)
-  2. code-review on the high-quality model — "review _tool_queue_agents in chat.py" (240s)
-```
-
-Model switches between agents are skipped when consecutive agents share the same model. The original model is restored after the entire queue completes. Results are written to `sessions/queue_{ts}_{label}/results.json` and browsable with `/queue-results`.
+Browse results with `/queue-results` (list all) or `/queue-results <label>` (show one).
 
 ---
 
 ## Vision
 
-Eli can analyse images using a local vision-language model. The vision model runs on the same port as text models — the server switches automatically, processes all queued images, then restores the text model.
-
-```
-Eli, analyse these screenshots and tell me which UI layout looks cleaner.
-```
-
-For batch processing, pass multiple image paths in one call — the model loads once and processes them all before restoring.
-
-**`commands.json` vision config:**
+Eli analyses images via a local vision-language model. The server switches automatically, processes all queued images, then restores the text model.
 
 ```json
 {
@@ -211,21 +250,45 @@ For batch processing, pass multiple image paths in one call — the model loads 
 }
 ```
 
-Set `vision_external: true` if your vision model runs on a separate machine — Eli will call it directly without switching the local server.
+Set `vision_external: true` for a vision model on a separate machine — Eli calls it directly without switching the local server.
+
+---
+
+## Model switching
+
+Eli knows all available model profiles at startup (descriptions, strengths, weaknesses, speed) from `commands.json`. It can:
+
+- Switch models manually via `/model <name>`
+- Switch automatically before an agent that has a `Recommended model` in its profile
+- Restore the original model when the agent or queue completes
+
+All switches go through the server manager control API so UI state stays in sync.
 
 ---
 
 ## Configuration
 
-### `commands.json` (gitignored)
+### `commands.json`
 
-Model profiles for the server manager, plus optional metadata. Copy from `commands.example.json`. Supports both llama.cpp (Windows binary) and vLLM (WSL) entries — the engine is auto-detected from the first token of the command.
+Model profiles plus optional metadata. Copy from `commands.example.json`. Gitignored.
 
-Profile metadata (description, strengths, weaknesses, speed) is injected into Eli's context at startup so he can make informed model-selection decisions.
+Profile metadata (optional `_meta` block):
 
-### `eli.toml` (gitignored)
+```json
+{
+  "_meta": {
+    "vision_url": "http://localhost:1234",
+    "vision_external": false
+  },
+  "My Model · Q6_K": ["..."]
+}
+```
 
-Project-specific config injected as a system message at startup:
+Each profile entry is a list of command tokens (the engine is auto-detected from `entry[0]`). The profile name, strengths, and speed description are injected into Eli's context at startup.
+
+### `eli.toml`
+
+Project-specific config injected as a system message at startup. Place in any project root (or a parent directory — Eli walks up from the cwd):
 
 ```toml
 [project]
@@ -235,51 +298,29 @@ name = "my-project"
 command = "cmake --build build --preset release"
 cwd = "."
 
-[tools]
-cmake = "C:\\path\\to\\cmake.exe"
+[hooks]
+post_edit = "run_tests.bat"
 ```
 
-Place `eli.toml` in any project root. Run `/config` inside Eli to see what's loaded.
+Run `/config` to inspect what's loaded.
 
-### `USER_PROFILE.md` (gitignored)
+### `behavioral_pulse.md`
 
-Personal info about you — name, background, projects, preferences. Eli reads this to personalize responses. Copy from `USER_PROFILE.example.md`.
+Condensed behavioral rules injected as a system message immediately before every user turn. This keeps critical rules in high-attention position as the conversation grows long — the same mechanism Claude Code uses for CLAUDE.md. The previous injection is replaced each turn so history stays flat (exactly one pulse in context at all times). Edit this file to tune Eli's priorities without touching code.
 
----
+### `ELI.md`
 
-## Agent profiles
+Full behavioral rules, persona, tool protocols, and workflow guides. Loaded once as the system prompt. For rules that Eli tends to forget over long conversations, the key points should also appear in `behavioral_pulse.md`.
 
-Sub-agents are spawned by Eli for specialized tasks. Profiles live in `agents/`:
+### `USER_PROFILE.md`
 
-| Profile | Purpose |
-|---------|---------|
-| `code-researcher` | Targeted code research and API lookup |
-| `code-review` | Review a file for correctness and safety issues |
-| `doc-writer` | Write docstrings or README sections |
-| `expert_coder` | Production code implementation |
-| `researcher` | Research a library, API, or technical question |
-| `test-writer` | Write unit tests |
-| `web_designer` | UI/UX and web design feedback |
+Personal info about you — name, background, projects, preferences. Eli reads this at startup to personalize responses. Gitignored. Copy from `USER_PROFILE.example.md`.
 
 ---
 
 ## Skills
 
-Prompt workflows stored in `skills/`. Invoked with `/skillname` or triggered automatically when your message matches a skill's trigger list. Use `/skills` to list all available skills with their triggers.
-
-| Skill | Spawns agent | Description |
-|-------|:------------:|-------------|
-| `/research` | yes | 3-pass skeptical research protocol — initial sweep, cross-examination, synthesis |
-| `/plan` | yes | Implementation planning — reads codebase, evaluates approaches, produces ordered task checklist |
-| `/code` | yes | Production code writing — reads first, designs, implements, writes tests, self-reviews |
-| `/review` | yes | Deep code review — reads code, callers, and tests; reports issues by severity with fixes |
-| `/commit` | no | Conventional commit message template |
-| `/pr` | no | Pull request description template |
-| `/git-status` | no | Git status summary |
-
-Skills that spawn agents support a `max_iterations` frontmatter field to control how long they run. The hard ceiling is 50 iterations.
-
-Skill files use YAML frontmatter:
+Prompt workflows in `skills/`. Invoked with `/skillname` or triggered automatically when your message matches a skill's trigger list.
 
 ```yaml
 ---
@@ -291,12 +332,39 @@ max_iterations: 20
 triggers: [keyword, another keyword]
 context_files: [path/to/extra.md]
 ---
+
+Your skill prompt here...
 ```
+
+| Skill | Agent | Description |
+|-------|:-----:|-------------|
+| `/research` | yes | 3-pass skeptical research — sweep, cross-examine, synthesise |
+| `/plan` | yes | Implementation planning — reads codebase, evaluates approaches, produces task checklist |
+| `/code` | yes | Production code — reads first, designs, implements, tests, self-reviews |
+| `/review` | yes | Deep code review — reads code, callers, and tests; reports issues by severity |
+| `/commit` | no | Conventional commit message template |
+| `/pr` | no | Pull request description template |
+| `/git-status` | no | Git status summary |
+
+---
+
+## Session persistence
+
+The following are saved per session and restored on `--continue` or `/resume`:
+
+- Think level, compact mode, approval level
+- Active model and role
+- Working directory
+- Full message history (with compaction summary if `/compact` was used)
+
+Sessions are stored in `sessions/` as JSON.
 
 ---
 
 ## Credits
 
-- [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) — high-performance llama.cpp fork by ikawrakow
+- [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) — high-performance llama.cpp fork
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) — upstream project
 - [vLLM](https://github.com/vllm-project/vllm) — GPU-accelerated inference for HuggingFace models
+- [Kokoro](https://github.com/remsky/Kokoro-FastAPI) — ONNX TTS
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — STT
