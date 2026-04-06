@@ -320,6 +320,7 @@ class QtChatAdapter(QThread):
     approval_needed = Signal(str, str, str, str)    # title, message, tool_name, args_str
     text_done       = Signal(str)
     usage           = Signal(int, int)             # tokens_used, ctx_window
+    agent_usage     = Signal(int, str, str, int, int)  # slot_index, tool_id, agent_label, tokens_used, ctx_window
     system_msg      = Signal(str)
     system_html     = Signal(str)   # pre-formatted HTML from slash command output
     error_msg       = Signal(str)
@@ -581,10 +582,17 @@ class QtChatAdapter(QThread):
                 if event.get("source") != "agent":   # sub-agent text shown via tool_done result
                     self.text_done.emit(event["text"])
             elif etype == "usage":
-                self.usage.emit(
-                    int(event.get("tokens", 0)),
-                    int(event.get("ctx", 0)),
-                )
+                tool_id_ev = event.get("tool_id", "")
+                if tool_id_ev:
+                    self.agent_usage.emit(
+                        int(event.get("slot_index", -1)),
+                        tool_id_ev,
+                        event.get("agent_label", ""),
+                        int(event.get("tokens", 0)),
+                        int(event.get("ctx", 0)),
+                    )
+                else:
+                    self.usage.emit(int(event.get("tokens", 0)), int(event.get("ctx", 0)))
             elif etype == "clear_chat":
                 self.clear_chat.emit()
             elif etype == "cwd_changed":
@@ -633,6 +641,18 @@ class QtChatAdapter(QThread):
                     self.agent_text_token.emit(event["text"], event.get("agent_label", ""))
                 elif etype == "tool_start":
                     self.tool_start.emit(event.get("id", ""), event.get("name", ""), event.get("args", ""))
+                elif etype == "usage":
+                    tool_id_ev = event.get("tool_id", "")
+                    if tool_id_ev:
+                        self.agent_usage.emit(
+                            int(event.get("slot_index", -1)),
+                            tool_id_ev,
+                            event.get("agent_label", ""),
+                            int(event.get("tokens", 0)),
+                            int(event.get("ctx", 0)),
+                        )
+                    else:
+                        self.usage.emit(int(event.get("tokens", 0)), int(event.get("ctx", 0)))
                 elif etype == "tool_done":
                     _completed += 1
                     lbl = event.get("agent_label") or f"agent {_completed}"

@@ -79,6 +79,7 @@ from profiles import (
     _load_commands_meta, _build_model_context, _load_agent_profile,
     _can_run_parallel, _all_can_parallel, _load_project_config,
     _format_project_config, SYSTEM_PROMPT,
+    _load_behavioral_pulse, _PULSE_PREFIX,
 )
 
 
@@ -987,6 +988,14 @@ class ChatSession(AgentsMixin):
             if self._pending_bg_results:
                 await self._inject_pending_bg_results()
             user_text = await self._maybe_compact_input(user_text)
+            # Inject behavioral pulse right before user message (high attention proximity).
+            # Remove previous pulse first so it never accumulates in history.
+            _pulse_text = _load_behavioral_pulse()
+            if _pulse_text:
+                if (self.messages and self.messages[-1].get("role") == "system"
+                        and self.messages[-1].get("content", "").startswith(_PULSE_PREFIX)):
+                    self.messages.pop()
+                self.messages.append({"role": "system", "content": _pulse_text})
             self.messages.append({"role": "user", "content": user_text})
 
             # Per-turn call-count tracking for loop detection.
@@ -1300,7 +1309,6 @@ class ChatSession(AgentsMixin):
 
             if self.tui_queue:
                 await self.tui_queue.put({"type": "usage", "tokens": self.tokens_used, "ctx": self.ctx_window})
-                await self.tui_queue.put({"type": "done"})
             elif self.tokens_used:
                 pct   = self.tokens_used / self.ctx_window
                 style = "yellow" if pct > 0.6 else "dim"
@@ -1309,6 +1317,10 @@ class ChatSession(AgentsMixin):
             else:
                 console.print(Rule(style="dim"))
             self._autosave()
+        # "done" is emitted AFTER the async-with exits so the ISM slot is fully
+        # released before _drain_queue returns and the next turn can acquire it.
+        if self.tui_queue:
+            await self.tui_queue.put({"type": "done"})
 
     @staticmethod
     def _compact_args(name: str, args: dict) -> str:

@@ -187,6 +187,7 @@ class AgentsMixin:
                 agent_label=label,
                 current_model_hint=current_model,
                 _is_background=True,
+                _tool_id=tc["id"],
             )
             log.debug("BgAgent[%s]: completed normally", label)
         except asyncio.CancelledError:
@@ -313,6 +314,7 @@ class AgentsMixin:
                             _args.get("model"),
                             agent_label=_label,
                             current_model_hint=_h,
+                            _tool_id=_tc["id"],
                         )
                         return _tc["id"], _res
                     _group_results = list(await asyncio.gather(*[
@@ -332,6 +334,7 @@ class AgentsMixin:
                             _args.get("model"),
                             agent_label=_lbl,
                             current_model_hint=_hint,
+                            _tool_id=_tc["id"],
                         )
                         _pair_results.append((_tc["id"], _res))
 
@@ -358,6 +361,7 @@ class AgentsMixin:
         agent_label: str = "",
         current_model_hint: str | None = None,
         _is_background: bool = False,
+        _tool_id: str = "",
     ) -> str:
         """Run an isolated sub-agent loop and return its final text response.
 
@@ -478,6 +482,7 @@ class AgentsMixin:
                 text_buf = ""
                 tool_calls_received = []
                 assistant_content = ""
+                _usage_data: dict = {}
 
                 async with self.client.stream(
                     "POST",
@@ -533,6 +538,8 @@ class AgentsMixin:
                                 tool_calls_received = data
                                 if not self.tui_queue:
                                     live.update(Text(""))
+                            elif event_type == "usage":
+                                _usage_data = data
                             elif event_type == "stop":
                                 if self.tui_queue:
                                     await self.tui_queue.put({"type": "text_done", "text": text_buf, "source": "agent", "agent_label": agent_label})
@@ -544,6 +551,28 @@ class AgentsMixin:
                                     ))
                                 else:
                                     live.update(Text(""))
+
+                # Emit agent context usage and check for approaching limit
+                if _usage_data:
+                    _prompt_toks = _usage_data.get("prompt_tokens", 0)
+                    _ctx = self.ctx_window
+                    if self.tui_queue:
+                        await self.tui_queue.put({"type": "usage", "tokens": _usage_data.get("total_tokens", 0), "ctx": _ctx, "agent_label": agent_label, "tool_id": _tool_id, "slot_index": _slot.index})
+                    _pct = _prompt_toks / _ctx if _ctx else 0
+                    _warn_msg = None
+                    if _pct >= 0.92:
+                        _warn_msg = f"[{agent_label}] Context at {_pct:.0%} ({_prompt_toks:,} / {_ctx:,} tokens) — stopping agent to avoid server crash."
+                        log.warning("Agent context limit: %s", _warn_msg)
+                        if self.tui_queue:
+                            await self.tui_queue.put({"type": "system", "text": _warn_msg})
+                        final_text = (final_text or "") + f"\n\n[Agent stopped: context {_pct:.0%} full — report based on work completed so far.]"
+                        break
+                    elif _pct >= 0.75:
+                        _warn_msg = f"[{agent_label}] Context at {_pct:.0%} ({_prompt_toks:,} / {_ctx:,} tokens)"
+                        if self.tui_queue:
+                            await self.tui_queue.put({"type": "system", "text": _warn_msg})
+                        else:
+                            console.print(f"[yellow]{_warn_msg}[/yellow]")
 
                 if assistant_content:          # keep last meaningful text; don't overwrite with ""
                     final_text = assistant_content

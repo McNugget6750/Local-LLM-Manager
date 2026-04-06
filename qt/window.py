@@ -205,6 +205,97 @@ class _SlotPanel(QWidget):
             p.fillRect(i * 12, 0, 10, 14, color)
 
 
+class _CtxBarsWidget(QWidget):
+    """Fixed pool of context bars: slot 0 = Eli, slots 1..N = agent slots.
+    Always visible; agent slots show zero when idle."""
+
+    _CHUNK_CSS = (
+        "QProgressBar {{ border: none; background: #1a1a1a; }}"
+        "QProgressBar::chunk {{ background: {color}; }}"
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._vl = QVBoxLayout(self)
+        self._vl.setContentsMargins(0, 0, 0, 0)
+        self._vl.setSpacing(2)
+        # Each entry: (bar, val_lbl, name_lbl, row_widget)
+        self._rows: list[tuple] = []
+        self._tool_id_to_slot: dict[str, int] = {}  # tool_id → slot_index (for remove_agent)
+        self._ensure_slots(1)   # always at least Eli
+
+    def _make_row(self, name: str) -> tuple:
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(4)
+        name_lbl = QLabel(name)
+        name_lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 9px;")
+        name_lbl.setFixedWidth(72)
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(5)
+        val = QLabel("— / —")
+        val.setStyleSheet(f"color: {TEXT_DIM}; font-size: 9px;")
+        rl.addWidget(name_lbl)
+        rl.addWidget(bar, stretch=1)
+        rl.addWidget(val)
+        self._vl.addWidget(row)
+        self.updateGeometry()
+        return bar, val, name_lbl, row
+
+    def _ensure_slots(self, n: int):
+        """Grow the pool to at least n rows (index 0 = Eli, 1..n-1 = agent slots)."""
+        while len(self._rows) < n:
+            idx = len(self._rows)
+            label = "Eli" if idx == 0 else f"Slot {idx}"
+            self._rows.append(self._make_row(label))
+
+    def _slot_name(self, idx: int) -> str:
+        return "Eli" if idx == 0 else f"Slot {idx}"
+
+    def _set_bar(self, bar, val_lbl, tokens: int, ctx: int):
+        if ctx <= 0:
+            bar.setValue(0)
+            bar.setStyleSheet(self._CHUNK_CSS.format(color="#7dff7d"))
+            val_lbl.setText("— / —")
+            return
+        pct = min(int(tokens / ctx * 100), 100)
+        color = "#ef4444" if pct >= 80 else "#fbbf24" if pct >= 60 else "#7dff7d"
+        bar.setValue(pct)
+        bar.setStyleSheet(self._CHUNK_CSS.format(color=color))
+        val_lbl.setText(f"{tokens // 1000:.1f}k / {ctx // 1000:.0f}k ({pct}%)")
+
+    def update_slot_count(self, total: int, _in_use: int):
+        """Called from slots_updated signal — ensures we have enough bars."""
+        self._ensure_slots(max(total, 1))
+
+    def update_eli(self, tokens: int, ctx: int):
+        bar, val, _, _ = self._rows[0]
+        self._set_bar(bar, val, tokens, ctx)
+
+    def update_slot(self, slot_index: int, tool_id: str, display_name: str, tokens: int, ctx: int):
+        """Update a bar directly by ISM slot index."""
+        if slot_index < 0:
+            return
+        self._ensure_slots(slot_index + 1)
+        if tool_id:
+            self._tool_id_to_slot[tool_id] = slot_index
+        bar, val, name_lbl, _ = self._rows[slot_index]
+        if display_name and slot_index > 0 and name_lbl.text() == self._slot_name(slot_index):
+            name_lbl.setText(display_name[:16])
+        self._set_bar(bar, val, tokens, ctx)
+
+    def remove_agent(self, tool_id: str):
+        slot_index = self._tool_id_to_slot.pop(tool_id, None)
+        if slot_index is not None and slot_index < len(self._rows):
+            bar, val, name_lbl, _ = self._rows[slot_index]
+            name_lbl.setText(self._slot_name(slot_index))
+            self._set_bar(bar, val, 0, 0)
+
+
 class CodeEditor(QPlainTextEdit):
     """QPlainTextEdit extended with a line-number gutter."""
 
@@ -684,22 +775,13 @@ class MainWindow(QMainWindow):
         self._chat_tabs.addTab(self._agent_view, "Agent")
         layout.addWidget(self._chat_tabs, stretch=1)
 
-        # Token usage bar (above input)
-        ctx_row = QWidget()
-        ctx_row.setFixedHeight(18)
-        ctx_rl = QHBoxLayout(ctx_row)
-        ctx_rl.setContentsMargins(6, 2, 6, 0)
-        ctx_rl.setSpacing(6)
-        self._chat_ctx_bar = QProgressBar()
-        self._chat_ctx_bar.setRange(0, 100)
-        self._chat_ctx_bar.setValue(0)
-        self._chat_ctx_bar.setTextVisible(False)
-        self._chat_ctx_bar.setFixedHeight(6)
-        self._chat_ctx_label = QLabel("— / —")
-        self._chat_ctx_label.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px;")
-        ctx_rl.addWidget(self._chat_ctx_bar, stretch=1)
-        ctx_rl.addWidget(self._chat_ctx_label)
-        layout.addWidget(ctx_row)
+        # Per-slot context bars (above input) — Eli row always visible, agent rows added dynamically
+        self._ctx_bars = _CtxBarsWidget()
+        ctx_wrap = QWidget()
+        ctx_wl = QHBoxLayout(ctx_wrap)
+        ctx_wl.setContentsMargins(6, 2, 6, 2)
+        ctx_wl.addWidget(self._ctx_bars)
+        layout.addWidget(ctx_wrap)
 
         # Input area
         input_container = QWidget()
@@ -1055,6 +1137,7 @@ class MainWindow(QMainWindow):
         self._adapter.tool_done.connect(self._on_tool_done_signal)
         self._adapter.approval_needed.connect(self._on_approval_needed)
         self._adapter.usage.connect(self._on_usage)
+        self._adapter.agent_usage.connect(self._on_agent_usage)
         self._adapter.system_msg.connect(self._on_system_msg)
         self._adapter.system_html.connect(self._on_system_html)
         self._adapter.error_msg.connect(self._on_error_msg)
@@ -1087,6 +1170,7 @@ class MainWindow(QMainWindow):
 
         # Background agents
         self._adapter.slots_updated.connect(self._slot_panel.update_slots)
+        self._adapter.slots_updated.connect(self._ctx_bars.update_slot_count)
         self._adapter.bg_agents_complete.connect(self._on_bg_agents_complete)
 
         # Editor navigation and highlights from model
@@ -1435,7 +1519,8 @@ class MainWindow(QMainWindow):
         # Pick color — agents get a palette slot, others get a fixed category color
         if name in ("spawn_agent", "queue_agents"):
             color = _AGENT_PALETTE[self._agent_counter % len(_AGENT_PALETTE)]
-            self._active_agents[tool_id] = color
+            _ag_display = a.get("system_prompt", "") or f"Agent {self._agent_counter + 1}"
+            self._active_agents[tool_id] = (color, tool_id)
             self._agent_counter += 1
             self._agent_nesting += 1
             self._current_agent_color = color
@@ -1488,11 +1573,18 @@ class MainWindow(QMainWindow):
     def _on_tool_done_signal(self, tool_id: str, name: str, result: str, is_error: bool):
         if name in ("write_file", "edit") and not is_error:
             self._clear_model_highlight()
-        agent_color = self._active_agents.pop(tool_id, None)
+        _agent_entry = self._active_agents.pop(tool_id, None)
+        agent_color = (_agent_entry[0] if isinstance(_agent_entry, tuple) else _agent_entry)
         is_agent_tool = name in ("spawn_agent", "queue_agents")
 
         if is_agent_tool:
             self._agent_nesting = max(0, self._agent_nesting - 1)
+            if result.startswith("[background:"):
+                # Placeholder tool_done — agent is still running in background.
+                # Keep the context bar slot alive so usage events can update it.
+                # The real tool_done from _run_background_agent will call remove_agent.
+                return
+            self._ctx_bars.remove_agent(tool_id)
             color = agent_color or "#22d3ee"
             indent = ""
             bg = AGENT_BG
@@ -1645,14 +1737,15 @@ class MainWindow(QMainWindow):
             self._ctx_label.setText(f"{tokens // 1000:.1f}k / {ctx // 1000:.0f}k tokens ({pct}%)")
             self._ctx_bar.setStyleSheet(chunk_css)
             self._ctx_warn.setVisible(pct >= 75)
-            self._chat_ctx_bar.setValue(pct)
-            self._chat_ctx_bar.setStyleSheet(chunk_css)
-            self._chat_ctx_label.setText(f"{tokens // 1000:.1f}k / {ctx // 1000:.0f}k ({pct}%)")
+            self._ctx_bars.update_eli(tokens, ctx)
         else:
             self._ctx_bar.setValue(0)
             self._ctx_label.setText("— / — tokens")
-            self._chat_ctx_bar.setValue(0)
-            self._chat_ctx_label.setText("— / —")
+            self._ctx_bars.update_eli(0, 0)
+
+    @Slot(str, str, int, int)
+    def _on_agent_usage(self, slot_index: int, tool_id: str, label: str, tokens: int, ctx: int):
+        self._ctx_bars.update_slot(slot_index, tool_id, label or "Agent", tokens, ctx)
 
     @Slot(str)
     def _on_system_msg(self, text: str):
