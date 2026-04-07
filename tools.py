@@ -59,13 +59,40 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "write_file",
-            "description": "Write content to a file, creating parent directories as needed.",
+            "name": "edit",
+            "description": (
+                "Replace an exact string in a file with new content. "
+                "ALWAYS use this for modifying existing files — it is precise, safe, and uses minimal context. "
+                "Read the file first to get the exact text, then pass it as old_string. "
+                "Fails if old_string is not found or matches multiple times (make it more specific in that case). "
+                "Returns a unified diff confirming the change — do NOT re-read the file to verify."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path to write"},
-                    "content": {"type": "string", "description": "Content to write"},
+                    "path":       {"type": "string", "description": "File path to edit"},
+                    "old_string": {"type": "string", "description": "Exact string to find and replace (must be unique in the file)"},
+                    "new_string": {"type": "string", "description": "Replacement string"},
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Write content to a file, creating parent directories as needed. "
+                "Only use this for NEW files or when replacing an entire file from scratch. "
+                "NEVER use this to modify an existing file — use `edit` instead. "
+                "After a successful write the result includes a content preview; do NOT re-read the file to verify."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":    {"type": "string", "description": "File path to write"},
+                    "content": {"type": "string", "description": "Full file content to write"},
                 },
                 "required": ["path", "content"],
             },
@@ -139,22 +166,6 @@ TOOLS = [
                     "max_results": {"type": "integer", "description": "Max matches to return (default 100)"},
                 },
                 "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit",
-            "description": "Replace an exact string in a file with new content. Fails if old_string is not found or matches multiple times.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "File path to edit"},
-                    "old_string": {"type": "string", "description": "Exact string to find and replace"},
-                    "new_string": {"type": "string", "description": "Replacement string"},
-                },
-                "required": ["path", "old_string", "new_string"],
             },
         },
     },
@@ -795,7 +806,13 @@ async def tool_write_file(path: str, content: str) -> str:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-        return f"Written {len(content)} chars to {path}"
+        lines = content.splitlines()
+        preview = "\n".join(lines[:3])
+        tail = f"\n  ... ({len(lines) - 3} more lines)" if len(lines) > 3 else ""
+        return (
+            f"Written {len(lines)} lines ({len(content)} chars) to {path}\n"
+            f"Content preview:\n  {preview.replace(chr(10), chr(10) + '  ')}{tail}"
+        )
     except Exception as e:
         return f"[error: {e}]"
 
