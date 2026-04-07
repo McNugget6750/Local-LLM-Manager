@@ -393,7 +393,7 @@ class CodeEditor(QPlainTextEdit):
 
 class _ServerPollWorker(QThread):
     """Background thread for server health/stats polling."""
-    polled = Signal(bool, str, str, int, str)
+    polled = Signal(bool, str, str, int, str, int, int)
 
     def __init__(self, base_url: str, parent=None):
         super().__init__(parent)
@@ -405,6 +405,8 @@ class _ServerPollWorker(QThread):
         speed_text = "Speed: —"
         vram_pct = 0
         vram_label = "—"
+        ctx  = 0
+        used = 0
         try:
             r = httpx.get(f"{self._base}/health", timeout=1.5)
             running = r.status_code == 200
@@ -426,7 +428,7 @@ class _ServerPollWorker(QThread):
                         vram_label = f"{used} / {ctx} tok"
             except Exception:
                 pass
-        self.polled.emit(running, ctx_text, speed_text, vram_pct, vram_label)
+        self.polled.emit(running, ctx_text, speed_text, vram_pct, vram_label, ctx, used)
 
 
 # ── Tool / agent display constants ────────────────────────────────────────────
@@ -1242,8 +1244,12 @@ class MainWindow(QMainWindow):
                     return True
 
             if key == Qt.Key.Key_Up and self._input_history:
-                cursor = self._input.textCursor()
-                on_first_line = cursor.blockNumber() == 0
+
+                cursor_rect = self._input.cursorRect()
+                cursor_y = cursor_rect.top() + self._input.verticalScrollBar().value()
+                line_height = self._input.fontMetrics().lineSpacing()
+                on_first_line = cursor_y < line_height
+
                 if on_first_line:
                     if self._input_history_idx == -1:
                         self._input_history_draft = self._input.toPlainText()
@@ -1255,8 +1261,17 @@ class MainWindow(QMainWindow):
                     return True
 
             if key == Qt.Key.Key_Down and self._input_history_idx >= 0:
-                cursor = self._input.textCursor()
-                on_last_line = cursor.blockNumber() == self._input.document().blockCount() - 1
+                # Get current cursor vertical position
+                current_cursor_y = self._input.cursorRect().top() + self._input.verticalScrollBar().value()
+                
+                # Get the vertical position of the last character in the document
+                last_cursor = self._input.textCursor()
+                last_cursor.movePosition(last_cursor.MoveOperation.End)
+                last_line_y = self._input.cursorRect(last_cursor).top() + self._input.verticalScrollBar().value()
+                
+                # Trigger if the cursor is on or below the last visual line
+                on_last_line = current_cursor_y >= last_line_y
+                
                 if on_last_line:
                     next_idx = self._input_history_idx - 1
                     if next_idx < 0:
@@ -2055,17 +2070,20 @@ class MainWindow(QMainWindow):
         self._poll_worker.polled.connect(self._on_poll_result)
         self._poll_worker.start()
 
-    @Slot(bool, str, str, int, str)
+    @Slot(bool, str, str, int, str, int, int)
     def _on_poll_result(self, running: bool, ctx_text: str, speed_text: str,
-                        vram_pct: int, vram_label: str):
+                        vram_pct: int, vram_label: str, ctx: int, used: int):
         if running:
             self._stat_status.setText("● Running")
             self._stat_status.setStyleSheet("color: #7dff7d;")
             self._server_status.setStyleSheet("color: #7dff7d; font-size: 14px;")
+            if ctx > 0:
+                self._ctx_bars.update_eli(used, ctx)
         else:
             self._stat_status.setText("● Offline")
             self._stat_status.setStyleSheet("color: #ef4444;")
             self._server_status.setStyleSheet("color: #ef4444; font-size: 14px;")
+            self._ctx_bars.update_eli(0, 0)
         self._stat_speed.setText(speed_text)
 
     @Slot(str)

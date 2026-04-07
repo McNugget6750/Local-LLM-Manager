@@ -280,6 +280,13 @@ class AgentsMixin:
         _label_offset = 0
         _pair_results: list = []
 
+        # On a single-slot server Eli holds the only slot during send_and_stream.
+        # Release it now so inline agents can acquire it; re-acquire in finally.
+        _single_slot = _ism.total_slots() == 1
+        if _single_slot and self._eli_slot is not None:
+            await self._eli_slot.release()
+            self._eli_slot = None
+
         try:
             for _target_model, _group in _ordered:
                 # Switch model if needed (only when original is known)
@@ -345,6 +352,10 @@ class AgentsMixin:
             # Fires on normal exit, exception, and asyncio cancellation.
             if _attempted_switch and _original_model:
                 await _switch_server(_original_model)
+            # Re-acquire Eli's slot so send_and_stream can release it at turn end.
+            if _single_slot:
+                self._eli_slot = await _ism.acquire(
+                    "Eli", timeout_secs=None, bypass_capacity=True)
 
         for (_tc_id, _result), _tc in zip(_pair_results, batch):
             self.messages.append({"role": "tool", "tool_call_id": _tc_id, "content": _result})

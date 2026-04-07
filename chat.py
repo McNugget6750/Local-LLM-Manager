@@ -667,6 +667,7 @@ class ChatSession(AgentsMixin):
         self._pending_bg_results:   list[tuple[str, str]] = []   # (tool_call_id, result_text)
         self._pending_bg_tool_calls: list[dict] = []             # tc dicts for tool_done emit
         self._write_locks:          dict[str, str] = {}          # abs_path → holder label
+        self._eli_slot:             "SlotHandle | None" = None   # held during send_and_stream; released before inline agents
 
     async def __aenter__(self):
         await self._health_check()
@@ -983,7 +984,8 @@ class ChatSession(AgentsMixin):
             self.messages.pop()
 
     async def send_and_stream(self, user_text: str, plan_mode: bool = False):
-        async with await _ism.acquire("Eli", timeout_secs=None, bypass_capacity=True):
+        self._eli_slot = await _ism.acquire("Eli", timeout_secs=None, bypass_capacity=True)
+        try:
             # Inject any completed background agent results before Eli sees this message
             if self._pending_bg_results:
                 await self._inject_pending_bg_results()
@@ -1317,8 +1319,12 @@ class ChatSession(AgentsMixin):
             else:
                 console.print(Rule(style="dim"))
             self._autosave()
-        # "done" is emitted AFTER the async-with exits so the ISM slot is fully
-        # released before _drain_queue returns and the next turn can acquire it.
+        finally:
+            if self._eli_slot is not None:
+                await self._eli_slot.release()
+                self._eli_slot = None
+        # "done" is emitted AFTER the slot is released so _drain_queue can
+        # acquire the slot for the next turn before it returns.
         if self.tui_queue:
             await self.tui_queue.put({"type": "done"})
 
