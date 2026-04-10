@@ -2633,6 +2633,69 @@ _LANG_ALIAS = {
 
 _MD_ESC = str.maketrans({"&": "&amp;", "<": "&lt;", ">": "&gt;"})
 
+# LaTeX command → Unicode symbol, used for $...$ inline math spans.
+_LATEX_SYMS: dict[str, str] = {
+    # Arrows
+    r"\rightarrow": "→", r"\to": "→",
+    r"\leftarrow": "←", r"\gets": "←",
+    r"\leftrightarrow": "↔",
+    r"\Rightarrow": "⇒",
+    r"\Leftarrow": "⇐",
+    r"\Leftrightarrow": "⇔",
+    r"\uparrow": "↑", r"\Uparrow": "⇑",
+    r"\downarrow": "↓", r"\Downarrow": "⇓",
+    r"\nearrow": "↗", r"\searrow": "↘",
+    r"\nwarrow": "↖", r"\swarrow": "↙",
+    r"\mapsto": "↦",
+    # Relations
+    r"\neq": "≠", r"\ne": "≠",
+    r"\leq": "≤", r"\le": "≤",
+    r"\geq": "≥", r"\ge": "≥",
+    r"\approx": "≈", r"\equiv": "≡",
+    r"\sim": "∼", r"\simeq": "≃",
+    r"\propto": "∝", r"\cong": "≅",
+    r"\ll": "≪", r"\gg": "≫",
+    # Arithmetic / operators
+    r"\pm": "±", r"\mp": "∓",
+    r"\times": "×", r"\div": "÷",
+    r"\cdot": "·", r"\circ": "∘",
+    r"\oplus": "⊕", r"\otimes": "⊗",
+    # Set / logic
+    r"\in": "∈", r"\notin": "∉",
+    r"\subset": "⊂", r"\supset": "⊃",
+    r"\subseteq": "⊆", r"\supseteq": "⊇",
+    r"\cup": "∪", r"\cap": "∩",
+    r"\emptyset": "∅", r"\varnothing": "∅",
+    r"\forall": "∀", r"\exists": "∃",
+    r"\neg": "¬", r"\lnot": "¬",
+    r"\land": "∧", r"\lor": "∨",
+    # Calculus / analysis
+    r"\infty": "∞",
+    r"\nabla": "∇", r"\partial": "∂",
+    r"\sum": "∑", r"\prod": "∏", r"\int": "∫",
+    r"\sqrt": "√",
+    r"\ldots": "…", r"\cdots": "⋯", r"\vdots": "⋮",
+    # Greek lowercase
+    r"\alpha": "α", r"\beta": "β", r"\gamma": "γ",
+    r"\delta": "δ", r"\epsilon": "ε", r"\varepsilon": "ε",
+    r"\zeta": "ζ", r"\eta": "η", r"\theta": "θ", r"\vartheta": "ϑ",
+    r"\iota": "ι", r"\kappa": "κ", r"\lambda": "λ",
+    r"\mu": "μ", r"\nu": "ν", r"\xi": "ξ",
+    r"\pi": "π", r"\varpi": "ϖ",
+    r"\rho": "ρ", r"\sigma": "σ", r"\varsigma": "ς",
+    r"\tau": "τ", r"\upsilon": "υ", r"\phi": "φ", r"\varphi": "φ",
+    r"\chi": "χ", r"\psi": "ψ", r"\omega": "ω",
+    # Greek uppercase
+    r"\Gamma": "Γ", r"\Delta": "Δ", r"\Theta": "Θ",
+    r"\Lambda": "Λ", r"\Xi": "Ξ", r"\Pi": "Π",
+    r"\Sigma": "Σ", r"\Upsilon": "Υ", r"\Phi": "Φ",
+    r"\Psi": "Ψ", r"\Omega": "Ω",
+    # Misc
+    r"\hbar": "ℏ", r"\ell": "ℓ",
+    r"\dag": "†", r"\ddag": "‡",
+    r"\bullet": "•", r"\star": "★",
+}
+
 
 def _inline_html(text: str) -> str:
     """Convert inline markdown (bold, italic, code, links) to HTML.
@@ -2640,6 +2703,15 @@ def _inline_html(text: str) -> str:
     """
     import re
     t = text.translate(_MD_ESC)
+    # Inline LaTeX math: $...$  →  unicode symbols in a subtle italic span.
+    # Processed before bold/italic so that _ inside math doesn't trigger italic.
+    def _latex_math(m: re.Match) -> str:
+        inner = m.group(1)
+        def _sub_cmd(cm: re.Match) -> str:
+            return _LATEX_SYMS.get(cm.group(0), cm.group(0))
+        inner = re.sub(r'\\[A-Za-z]+', _sub_cmd, inner)
+        return f'<span style="color:#c8a8e8;font-style:italic;">{inner}</span>'
+    t = re.sub(r'\$([^$\n]+)\$', _latex_math, t)
     # Bold+italic combined
     t = re.sub(r'\*\*\*(.*?)\*\*\*', r'<b><i>\1</i></b>', t)
     # Bold
