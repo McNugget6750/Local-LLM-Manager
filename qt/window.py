@@ -206,8 +206,8 @@ class _SlotPanel(QWidget):
 
 
 class _CtxBarsWidget(QWidget):
-    """Fixed pool of context bars: slot 0 = Eli, slots 1..N = agent slots.
-    Always visible; agent slots show zero when idle."""
+    """Fixed pool of context bars: one bar per ISM slot index.
+    Always visible; idle slots show zero."""
 
     _CHUNK_CSS = (
         "QProgressBar {{ border: none; background: #1a1a1a; }}"
@@ -247,14 +247,13 @@ class _CtxBarsWidget(QWidget):
         return bar, val, name_lbl, row
 
     def _ensure_slots(self, n: int):
-        """Grow the pool to at least n rows (index 0 = Eli, 1..n-1 = agent slots)."""
+        """Grow the pool to at least n rows."""
         while len(self._rows) < n:
             idx = len(self._rows)
-            label = "Eli" if idx == 0 else f"Slot {idx}"
-            self._rows.append(self._make_row(label))
+            self._rows.append(self._make_row(f"Slot {idx}"))
 
     def _slot_name(self, idx: int) -> str:
-        return "Eli" if idx == 0 else f"Slot {idx}"
+        return f"Slot {idx}"
 
     def _set_bar(self, bar, val_lbl, tokens: int, ctx: int):
         if ctx <= 0:
@@ -272,10 +271,6 @@ class _CtxBarsWidget(QWidget):
         """Called from slots_updated signal — ensures we have enough bars."""
         self._ensure_slots(max(total, 1))
 
-    def update_eli(self, tokens: int, ctx: int):
-        bar, val, _, _ = self._rows[0]
-        self._set_bar(bar, val, tokens, ctx)
-
     def update_slot(self, slot_index: int, tool_id: str, display_name: str, tokens: int, ctx: int):
         """Update a bar directly by ISM slot index."""
         if slot_index < 0:
@@ -283,16 +278,13 @@ class _CtxBarsWidget(QWidget):
         self._ensure_slots(slot_index + 1)
         if tool_id:
             self._tool_id_to_slot[tool_id] = slot_index
-        bar, val, name_lbl, _ = self._rows[slot_index]
-        if display_name and slot_index > 0 and name_lbl.text() == self._slot_name(slot_index):
-            name_lbl.setText(display_name[:16])
+        bar, val, _, _ = self._rows[slot_index]
         self._set_bar(bar, val, tokens, ctx)
 
     def remove_agent(self, tool_id: str):
         slot_index = self._tool_id_to_slot.pop(tool_id, None)
         if slot_index is not None and slot_index < len(self._rows):
-            bar, val, name_lbl, _ = self._rows[slot_index]
-            name_lbl.setText(self._slot_name(slot_index))
+            bar, val, _, _ = self._rows[slot_index]
             self._set_bar(bar, val, 0, 0)
 
 
@@ -771,6 +763,7 @@ class MainWindow(QMainWindow):
         self._agent_view = QTextBrowser()
         self._agent_view.setOpenExternalLinks(False)
         self._agent_view.setOpenLinks(False)
+        self._agent_view.viewport().installEventFilter(self)
 
         self._chat_tabs = QTabWidget()
         self._chat_tabs.addTab(self._full_view, "Chat")
@@ -1194,6 +1187,9 @@ class MainWindow(QMainWindow):
         w = self._full_view.viewport().width()
         if w > 0:
             self._full_view.document().setTextWidth(w)
+        w = self._agent_view.viewport().width()
+        if w > 0:
+            self._agent_view.document().setTextWidth(w)
 
     def eventFilter(self, obj, event):
         from PySide6.QtCore import QEvent
@@ -1285,10 +1281,15 @@ class MainWindow(QMainWindow):
 
         # Keep document text width in sync with viewport — required for width:100% tables
         from PySide6.QtCore import QEvent
-        if obj is self._full_view.viewport() and event.type() == QEvent.Type.Resize:
-            w = self._full_view.viewport().width()
-            if w > 0:
-                self._full_view.document().setTextWidth(w)
+        if event.type() == QEvent.Type.Resize:
+            if obj is self._full_view.viewport():
+                w = self._full_view.viewport().width()
+                if w > 0:
+                    self._full_view.document().setTextWidth(w)
+            elif obj is self._agent_view.viewport():
+                w = self._agent_view.viewport().width()
+                if w > 0:
+                    self._agent_view.document().setTextWidth(w)
 
         # Ctrl+LMB on _full_view viewport — open file path links
         if (obj is self._full_view.viewport()
@@ -1738,8 +1739,8 @@ class MainWindow(QMainWindow):
         dlg.exec()
         self._adapter.resolve_approval(result["approved"], result["notes"])
 
-    @Slot(int, int)
-    def _on_usage(self, tokens: int, ctx: int):
+    @Slot(int, int, int)
+    def _on_usage(self, slot_index: int, tokens: int, ctx: int):
         self._stat_msgs.setText(f"Tokens: {tokens:,}")
         if ctx > 0:
             pct = int(tokens / ctx * 100)
@@ -1752,11 +1753,11 @@ class MainWindow(QMainWindow):
             self._ctx_label.setText(f"{tokens // 1000:.1f}k / {ctx // 1000:.0f}k tokens ({pct}%)")
             self._ctx_bar.setStyleSheet(chunk_css)
             self._ctx_warn.setVisible(pct >= 75)
-            self._ctx_bars.update_eli(tokens, ctx)
+            self._ctx_bars.update_slot(slot_index, "", "", tokens, ctx)
         else:
             self._ctx_bar.setValue(0)
             self._ctx_label.setText("— / — tokens")
-            self._ctx_bars.update_eli(0, 0)
+            self._ctx_bars.update_slot(slot_index, "", "", 0, 0)
 
     @Slot(str, str, int, int)
     def _on_agent_usage(self, slot_index: int, tool_id: str, label: str, tokens: int, ctx: int):
@@ -2830,7 +2831,7 @@ def _diff_block_html(code: str) -> str:
             f'<tr style="{bg}">'
             f'<td style="{_NUM_STYLE}">{num_cell}</td>'
             f'<td style="color:{gc};{_GLYPH_STYLE}">{glyph}</td>'
-            f'<td style="white-space:pre;padding:0;">{content_html}</td>'
+            f'<td style="white-space:pre-wrap;padding:0;word-wrap:break-word;">{content_html}</td>'
             f'</tr>'
         )
 
@@ -2864,7 +2865,7 @@ def _code_block_html(lang: str, code: str) -> str:
         f'<tr>'
         f'<td style="color:#444466;text-align:right;padding:0 8px 0 6px;'
         f'white-space:pre;vertical-align:top;">{str(i).rjust(num_w)}</td>'
-        f'<td style="white-space:pre;padding:0;">{line_html}</td>'
+        f'<td style="white-space:pre-wrap;padding:0;word-wrap:break-word;">{line_html}</td>'
         f'</tr>'
         for i, line_html in enumerate(code_lines, 1)
     )
@@ -2944,7 +2945,8 @@ def _table_html(lines: list[str], footer_rows: set[int] | None = None) -> str:
     th = "".join(
         f'<th style="padding:5px 12px;border-bottom:2px solid #334466;'
         f'border-right:1px solid #1e2a40;color:#7aafdd;background:#080818;'
-        f'text-align:{aligns[ci] if ci < len(aligns) else "left"};font-weight:bold;">'
+        f'text-align:{aligns[ci] if ci < len(aligns) else "left"};font-weight:bold;'
+        f'word-wrap:break-word;">'
         f'{_inline_html(h)}</th>'
         for ci, h in enumerate(header_cells)
     )
@@ -2958,7 +2960,7 @@ def _table_html(lines: list[str], footer_rows: set[int] | None = None) -> str:
         tds = "".join(
             f'<td style="padding:4px 12px;border-bottom:1px solid #141428;'
             f'border-right:1px solid #141428;background:{bg};{color}'
-            f'text-align:{aligns[ci] if ci < len(aligns) else "left"};">'
+            f'text-align:{aligns[ci] if ci < len(aligns) else "left"};word-wrap:break-word;">'
             f'{_inline_html(c)}</td>'
             for ci, c in enumerate(cells)
         )
@@ -2966,7 +2968,7 @@ def _table_html(lines: list[str], footer_rows: set[int] | None = None) -> str:
 
     return (
         f'<table style="border-collapse:collapse;margin:6px 0;font-size:12px;'
-        f'border:1px solid #1e2a40;">'
+        f'border:1px solid #1e2a40;width:100%;table-layout:fixed;">'
         f'<thead><tr>{th}</tr></thead>'
         f'<tbody>{"".join(trs)}</tbody></table>'
     )

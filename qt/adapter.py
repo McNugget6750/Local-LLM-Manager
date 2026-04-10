@@ -319,7 +319,7 @@ class QtChatAdapter(QThread):
     tool_done       = Signal(str, str, str, bool)  # id, name, result, is_error
     approval_needed = Signal(str, str, str, str)    # title, message, tool_name, args_str
     text_done       = Signal(str)
-    usage           = Signal(int, int)             # tokens_used, ctx_window
+    usage           = Signal(int, int, int)         # slot_index, tokens_used, ctx_window
     agent_usage     = Signal(int, str, str, int, int)  # slot_index, tool_id, agent_label, tokens_used, ctx_window
     system_msg      = Signal(str)
     system_html     = Signal(str)   # pre-formatted HTML from slash command output
@@ -592,7 +592,7 @@ class QtChatAdapter(QThread):
                         int(event.get("ctx", 0)),
                     )
                 else:
-                    self.usage.emit(int(event.get("tokens", 0)), int(event.get("ctx", 0)))
+                    self.usage.emit(int(event.get("slot_index", 0)), int(event.get("tokens", 0)), int(event.get("ctx", 0)))
             elif etype == "clear_chat":
                 self.clear_chat.emit()
             elif etype == "cwd_changed":
@@ -652,7 +652,7 @@ class QtChatAdapter(QThread):
                             int(event.get("ctx", 0)),
                         )
                     else:
-                        self.usage.emit(int(event.get("tokens", 0)), int(event.get("ctx", 0)))
+                        self.usage.emit(int(event.get("slot_index", 0)), int(event.get("tokens", 0)), int(event.get("ctx", 0)))
                 elif etype == "tool_done":
                     _completed += 1
                     lbl = event.get("agent_label") or f"agent {_completed}"

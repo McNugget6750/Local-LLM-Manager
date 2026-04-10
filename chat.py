@@ -1310,7 +1310,7 @@ class ChatSession(AgentsMixin):
                     break
 
             if self.tui_queue:
-                await self.tui_queue.put({"type": "usage", "tokens": self.tokens_used, "ctx": self.ctx_window})
+                await self.tui_queue.put({"type": "usage", "tokens": self.tokens_used, "ctx": self.ctx_window, "slot_index": self._eli_slot.index if self._eli_slot else 0})
             elif self.tokens_used:
                 pct   = self.tokens_used / self.ctx_window
                 style = "yellow" if pct > 0.6 else "dim"
