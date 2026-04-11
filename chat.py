@@ -702,6 +702,7 @@ class ChatSession(AgentsMixin):
         self._pending_bg_results:   list[tuple[str, str]] = []   # (tool_call_id, result_text)
         self._pending_bg_tool_calls: list[dict] = []             # tc dicts for tool_done emit
         self._write_locks:          dict[str, str] = {}          # abs_path → holder label
+        self._last_read:            set[str]       = set()       # abs paths freshly read; cleared after write/edit
         self._eli_slot:             "SlotHandle | None" = None   # held during send_and_stream; released before inline agents
         self.backend: str           = "llamacpp"                 # "llamacpp" | "vllm" — set by _health_check
 
@@ -1539,13 +1540,17 @@ class ChatSession(AgentsMixin):
                 _bash_cwd = Path(args["cwd"]) if args.get("cwd") else self.cwd
                 return await tool_bash(args.get("command", ""), args.get("timeout", 30), cwd=_bash_cwd)
             elif name == "read_file":
-                return await tool_read_file(
-                    self._resolve_path(args.get("path", "") or args.get("file_path", "")),
-                    offset=int(args.get("offset", 1)),
-                    limit=int(args.get("limit", 200)),
-                )
+                _rf_abs = os.path.abspath(self._resolve_path(args.get("path", "") or args.get("file_path", "")))
+                result = await tool_read_file(_rf_abs, offset=int(args.get("offset", 1)), limit=int(args.get("limit", 200)))
+                self._last_read.add(_rf_abs)
+                return result
             elif name == "write_file":
-                return await tool_write_file(self._resolve_path(args.get("path", "") or args.get("file_path", "")), args.get("content", ""))
+                _wf_abs = os.path.abspath(self._resolve_path(args.get("path", "") or args.get("file_path", "")))
+                if os.path.exists(_wf_abs) and _wf_abs not in self._last_read:
+                    return f"[error: must read '{os.path.basename(_wf_abs)}' with read_file before writing it]"
+                result = await tool_write_file(_wf_abs, args.get("content", ""))
+                self._last_read.discard(_wf_abs)
+                return result
             elif name == "list_dir":
                 return await tool_list_dir(self._resolve_path(args.get("path", ".")))
             elif name == "glob":
@@ -1570,7 +1575,12 @@ class ChatSession(AgentsMixin):
                     args.get("max_results", 100),
                 )
             elif name == "edit":
-                return await tool_edit(self._resolve_path(args.get("path", "") or args.get("file_path", "")), args.get("old_string", ""), args.get("new_string", ""))
+                _ed_abs = os.path.abspath(self._resolve_path(args.get("path", "") or args.get("file_path", "")))
+                if _ed_abs not in self._last_read:
+                    return f"[error: must read '{os.path.basename(_ed_abs)}' with read_file before editing it]"
+                result = await tool_edit(_ed_abs, args.get("old_string", ""), args.get("new_string", ""))
+                self._last_read.discard(_ed_abs)
+                return result
             elif name == "web_fetch":
                 return await tool_web_fetch(args.get("url", ""))
             elif name == "web_search":

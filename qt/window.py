@@ -6,6 +6,7 @@ Panels: Explorer | Chat+Input | Editor | Server Stats
 import os
 import sys
 from pathlib import Path
+from urllib.parse import unquote
 
 # Ensure qt/ siblings are importable regardless of working directory
 sys.path.insert(0, str(Path(__file__).parent))
@@ -701,11 +702,17 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._voice_autosend_cb)
 
         tb.addSeparator()
-        self._follow_along_cb = QCheckBox("Follow")
-        self._follow_along_cb.setChecked(False)
+        self._follow_along_cb = QCheckBox("Follow along with model's file operations")
+        self._follow_along_cb.setChecked(True)
         self._follow_along_cb.setToolTip("Follow along: open each file the agent reads or edits in the editor and jump to the relevant section")
         self._follow_along_cb.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px;")
         tb.addWidget(self._follow_along_cb)
+
+        self._auto_scroll_cb = QCheckBox("Auto-scroll")
+        self._auto_scroll_cb.setChecked(True)
+        self._auto_scroll_cb.setToolTip("Auto-scroll chat to bottom when new content arrives")
+        self._auto_scroll_cb.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px;")
+        tb.addWidget(self._auto_scroll_cb)
 
         # Keep hidden server_url for compatibility with poll logic
         self._server_url = QLineEdit("localhost:1234")
@@ -766,11 +773,13 @@ class MainWindow(QMainWindow):
         self._full_view.setOpenExternalLinks(False)
         self._full_view.setOpenLinks(False)
         self._full_view.viewport().installEventFilter(self)
+        self._full_view.anchorClicked.connect(self._on_anchor_clicked)
 
         self._agent_view = QTextBrowser()
         self._agent_view.setOpenExternalLinks(False)
         self._agent_view.setOpenLinks(False)
         self._agent_view.viewport().installEventFilter(self)
+        self._agent_view.anchorClicked.connect(self._on_anchor_clicked)
 
         self._chat_tabs = QTabWidget()
         self._chat_tabs.addTab(self._full_view, "Chat")
@@ -1298,21 +1307,6 @@ class MainWindow(QMainWindow):
                 if w > 0:
                     self._agent_view.document().setTextWidth(w)
 
-        # Ctrl+LMB on _full_view viewport — open file path links
-        if (obj is self._full_view.viewport()
-                and event.type() == QEvent.Type.MouseButtonPress
-                and event.button() == Qt.MouseButton.LeftButton
-                and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
-            href = self._full_view.anchorAt(event.pos())
-            if href.startswith("eli://open/"):
-                raw = href[len("eli://open/"):]
-                path, line = self._resolve_file_path(raw)
-                if path:
-                    self._on_open_in_editor(path, line)
-                else:
-                    self._status_bar.showMessage(f"File not found: {raw}", 3000)
-                return True
-
         return super().eventFilter(obj, event)
 
     # ── Editor search ─────────────────────────────────────────────────────────
@@ -1401,6 +1395,18 @@ class MainWindow(QMainWindow):
         self._search_input.setFocus()
         self._search_input.selectAll()
 
+    @Slot()
+    def _on_anchor_clicked(self, url) -> None:
+        """Handle clicks on eli://open/ links in either chat view."""
+        raw_url = url.toString()
+        if raw_url.startswith("eli://open/"):
+            raw = unquote(raw_url[len("eli://open/"):])
+            path, line = self._resolve_file_path(raw)
+            if path:
+                self._on_open_in_editor(path, line)
+            else:
+                self._status_bar.showMessage(f"File not found: {raw}", 3000)
+
     def _resolve_file_path(self, raw: str) -> tuple[str, int]:
         """Resolve a raw path token (from a chat link) to (absolute_path, line). Returns ('', 1) if not found."""
         line = 1
@@ -1478,7 +1484,7 @@ class MainWindow(QMainWindow):
         self._response_buf = ""
         self._agent_buf = ""
         self._current_agent_label = ""
-        self._full_view.append("")
+        self._append(self._full_view, "")
         self._adapter.submit(submit_text, self._plan_mode)
 
     @Slot(str)
@@ -1498,7 +1504,7 @@ class MainWindow(QMainWindow):
         if label and label != self._current_agent_label:
             self._current_agent_label = label
             sep = f'<p style="color:#555;font-size:10px;margin:4px 0;">── {label} ──</p>'
-            self._agent_view.append(sep)
+            self._append(self._agent_view, sep)
         self._agent_buf += token
         _insert_plain(self._agent_view, token)
         self._auto_scroll(self._agent_view)
@@ -1509,7 +1515,7 @@ class MainWindow(QMainWindow):
         # Use table pattern: narrow colored left cell = border stripe; background on content cell.
         # Qt's QTextDocument does not support border-left or background on <div>.
         self._full_view.document().setTextWidth(self._full_view.viewport().width())
-        self._full_view.append(
+        self._append(self._full_view,
             f'<table width="100%" style="border-spacing:0;border-collapse:collapse;table-layout:fixed;margin:2px 0;">'
             f'<tr>'
             f'<td width="3" style="background:{ELI_BORDER};padding:0;vertical-align:top;"></td>'
@@ -1518,7 +1524,7 @@ class MainWindow(QMainWindow):
             f'{rendered}'
             f'</td></tr></table>'
         )
-        self._full_view.append("")   # escape trailing table frames
+        self._append(self._full_view, "")   # escape trailing table frames
         self._full_view.verticalScrollBar().setValue(self._full_view.verticalScrollBar().maximum())
 
     @Slot(str, str, str)
@@ -1570,7 +1576,7 @@ class MainWindow(QMainWindow):
                 f'<span style="color:#cccccc;">{task_safe}</span>'
                 f'</td></tr></table>'
             )
-            self._full_view.append(html)
+            self._append(self._full_view, html)
             self._auto_scroll(self._full_view)
             return
         else:
@@ -1598,7 +1604,7 @@ class MainWindow(QMainWindow):
             diff_args = None
             if name == "edit":
                 diff_args = {
-                    "file_path": a.get("file_path", ""),
+                    "file_path": a.get("path", "") or a.get("file_path", ""),
                     "old_string": a.get("old_string", ""),
                     "new_string": a.get("new_string", ""),
                 }
@@ -1651,7 +1657,7 @@ class MainWindow(QMainWindow):
                 f'<span style="color:{err_color};">{icon} {name}</span>'
                 f'</td></tr></table>'
             )
-            self._full_view.append(done_html)
+            self._append(self._full_view, done_html)
         else:
             # Pop buffered start metadata and render a single combined line
             pending = self._pending_tools.pop(tool_id, None)
@@ -1681,7 +1687,7 @@ class MainWindow(QMainWindow):
                 f' <span style="color:{outcome_color};">{outcome_icon}</span>'
                 f'</td></tr></table>'
             )
-            self._full_view.append(done_html)
+            self._append(self._full_view, done_html)
 
             # For edit/write_file, render a unified diff block
             if name in ("edit", "write_file") and not is_error and pending:
@@ -1701,7 +1707,8 @@ class MainWindow(QMainWindow):
                         lineterm="",
                     ))
                     if diff_text:
-                        self._full_view.append(_diff_block_html(diff_text))
+                        self._append(self._full_view, _diff_block_html(diff_text))
+                        self._auto_scroll(self._full_view)
 
             # Follow along: silently open the file and jump to the relevant line
             if (self._follow_along_cb.isChecked()
@@ -1737,7 +1744,7 @@ class MainWindow(QMainWindow):
                 '<span style="color:#555566;font-style:italic;">(no text output)</span>'
             )
             self._full_view.document().setTextWidth(self._full_view.viewport().width())
-            self._full_view.append(
+            self._append(self._full_view,
                 f'<table width="100%" style="border-spacing:0;border-collapse:collapse;table-layout:fixed;margin:2px 0;">'
                 f'<tr>'
                 f'<td width="3" style="background:{label_color};padding:0;vertical-align:top;"></td>'
@@ -1849,22 +1856,22 @@ class MainWindow(QMainWindow):
     def _on_system_msg(self, text: str):
         self._status_bar.showMessage(text.splitlines()[0] if text else "", 4000)
         html = _markdown_to_html(text)
-        self._compact_view.append(html)
-        self._full_view.append(html)
+        self._append(self._compact_view, html)
+        self._append(self._full_view, html)
         self._auto_scroll(self._compact_view)
         self._auto_scroll(self._full_view)
 
     @Slot(str)
     def _on_system_html(self, html: str):
         """Display pre-formatted HTML from slash command output in the chat views."""
-        self._compact_view.append(html)
-        self._full_view.append(html)
+        self._append(self._compact_view, html)
+        self._append(self._full_view, html)
         self._auto_scroll(self._compact_view)
         self._auto_scroll(self._full_view)
 
     @Slot(str)
     def _on_error_msg(self, msg: str):
-        self._compact_view.append(f'<span style="color:#ef4444;">Error: {msg}</span><br>')
+        self._append(self._compact_view, f'<span style="color:#ef4444;">Error: {msg}</span><br>')
         self._message_queue.clear()
         self._queue_label.setVisible(False)
         self._set_input_enabled(True)
@@ -1893,7 +1900,7 @@ class MainWindow(QMainWindow):
             return
         self._full_view.setHtml(html)
         # Append a visual separator so new messages are clearly distinct
-        self._full_view.append(
+        self._append(self._full_view,
             "<hr style='border:none;border-top:1px solid #333;margin:6px 0;'>"
             "<p style='color:#444;font-size:10px;text-align:center;margin:2px 0;'>"
             "─── resume point ───</p>"
@@ -1920,7 +1927,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_turn_done(self):
-        self._full_view.append("<br>")
+        self._append(self._full_view, "<br>")
         self._plan_mode = False
         self._plan_btn.setChecked(False)
         self._stop_btn.setEnabled(False)
@@ -1934,7 +1941,7 @@ class MainWindow(QMainWindow):
             self._response_buf = ""
             self._agent_buf = ""
             self._current_agent_label = ""
-            self._full_view.append("")
+            self._append(self._full_view, "")
             self._adapter.submit(submit_text, plan_mode)
             # stay busy — _set_input_enabled(False) was already called
         else:
@@ -2510,9 +2517,9 @@ class MainWindow(QMainWindow):
             f'</table>'
         )
         # append() always inserts a new paragraph outside any table frame
-        self._compact_view.append(html)
+        self._append(self._compact_view, html)
         self._full_view.document().setTextWidth(self._full_view.viewport().width())
-        self._full_view.append(html)
+        self._append(self._full_view, html)
         self._auto_scroll(self._compact_view)
         self._auto_scroll(self._full_view)
 
@@ -2524,7 +2531,7 @@ class MainWindow(QMainWindow):
         self._response_buf = ""
         self._agent_buf    = ""
         self._current_agent_label = ""
-        self._full_view.append("")
+        self._append(self._full_view, "")
 
     def _append_remote(self, text: str):
         """Render a remote-injected prompt — bright blue stripe, labelled 'Remote'."""
@@ -2539,7 +2546,7 @@ class MainWindow(QMainWindow):
             f'</td></tr></table>'
         )
         self._full_view.document().setTextWidth(self._full_view.viewport().width())
-        self._full_view.append(html)
+        self._append(self._full_view, html)
         self._auto_scroll(self._full_view)
 
     @Slot(int)
@@ -2555,7 +2562,7 @@ class MainWindow(QMainWindow):
             ' <span style="color:#666666;">— results included in your next message to Eli</span>'
             '</td></tr></table>'
         )
-        self._full_view.append(html)
+        self._append(self._full_view, html)
         self._auto_scroll(self._full_view)
 
     @Slot(str, int)
@@ -2645,11 +2652,27 @@ class MainWindow(QMainWindow):
             self._editor.setTextCursor(QTextCursor(start_block))
             self._editor.centerCursor()
 
-    @staticmethod
-    def _auto_scroll(view: QTextBrowser):
+    def _auto_scroll(self, view: QTextBrowser):
+        if not self._auto_scroll_cb.isChecked():
+            return
         sb = view.verticalScrollBar()
         if sb.value() >= sb.maximum() - 10:
             sb.setValue(sb.maximum())
+
+    def _append(self, view: QTextBrowser, html: str):
+        """Append HTML to a chat view, respecting the auto-scroll setting.
+
+        QTextBrowser.append() always scrolls to the bottom regardless of the
+        user's scroll position.  When auto-scroll is off, we save the scroll
+        position before appending and restore it afterwards so the user can
+        read history without being yanked away.
+        """
+        sb = view.verticalScrollBar()
+        old_val = sb.value()
+        at_bottom = old_val >= sb.maximum() - 10
+        view.append(html)
+        if not self._auto_scroll_cb.isChecked() and not at_bottom:
+            sb.setValue(old_val)
 
     def _set_input_enabled(self, enabled: bool):
         self._busy = not enabled
