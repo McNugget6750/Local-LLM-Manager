@@ -1277,7 +1277,7 @@ class ChatSession(AgentsMixin):
 
                     async def _emit_tool_done(tc_name: str, tc_id: str, result: str) -> None:
                         if self.tui_queue:
-                            is_err = result.startswith(("[error", "[unknown", "[blocked", "[cancelled", _GATE_REJECTED_PREFIX))
+                            is_err = result.startswith(("[error", "[unknown", "[blocked", "[cancelled", "[loop-detected]", _GATE_REJECTED_PREFIX))
                             await self.tui_queue.put({"type": "tool_done", "id": tc_id, "name": tc_name, "result": result, "is_error": is_err})
 
                     # If any state-changing tool ran in this iteration, the world has changed —
@@ -1533,6 +1533,18 @@ class ChatSession(AgentsMixin):
                 reason = ""
             return False, reason
 
+    @staticmethod
+    def _validate_path_arg(raw: str) -> str | None:
+        """Return an error string if raw looks like a malformed path, else None."""
+        if not raw:
+            return None
+        if "\n" in raw or "\r" in raw:
+            return f"[error: malformed path argument — contains newline: {raw[:120]!r}]"
+        # Reject paths longer than 512 chars (prose bleed-through)
+        if len(raw) > 512:
+            return f"[error: malformed path argument — suspiciously long ({len(raw)} chars): {raw[:80]!r}...]"
+        return None
+
     async def _dispatch_tool(self, name: str, args: dict) -> str:
         """Pure tool dispatch — no display, no approval check."""
         try:
@@ -1540,12 +1552,18 @@ class ChatSession(AgentsMixin):
                 _bash_cwd = Path(args["cwd"]) if args.get("cwd") else self.cwd
                 return await tool_bash(args.get("command", ""), args.get("timeout", 30), cwd=_bash_cwd)
             elif name == "read_file":
-                _rf_abs = os.path.abspath(self._resolve_path(args.get("path", "") or args.get("file_path", "")))
+                _rf_raw = args.get("path", "") or args.get("file_path", "")
+                if _pv_err := self._validate_path_arg(_rf_raw):
+                    return _pv_err
+                _rf_abs = os.path.abspath(self._resolve_path(_rf_raw))
                 result = await tool_read_file(_rf_abs, offset=int(args.get("offset", 1)), limit=int(args.get("limit", 200)))
                 self._last_read.add(_rf_abs)
                 return result
             elif name == "write_file":
-                _wf_abs = os.path.abspath(self._resolve_path(args.get("path", "") or args.get("file_path", "")))
+                _wf_raw = args.get("path", "") or args.get("file_path", "")
+                if _pv_err := self._validate_path_arg(_wf_raw):
+                    return _pv_err
+                _wf_abs = os.path.abspath(self._resolve_path(_wf_raw))
                 if os.path.exists(_wf_abs) and os.path.getsize(_wf_abs) > 0:
                     return (f"[error: '{_wf_abs}' already exists and has content — "
                             f"use edit to modify existing files. "
@@ -1577,7 +1595,10 @@ class ChatSession(AgentsMixin):
                     args.get("max_results", 100),
                 )
             elif name == "edit":
-                _ed_abs = os.path.abspath(self._resolve_path(args.get("path", "") or args.get("file_path", "")))
+                _ed_raw = args.get("path", "") or args.get("file_path", "")
+                if _pv_err := self._validate_path_arg(_ed_raw):
+                    return _pv_err
+                _ed_abs = os.path.abspath(self._resolve_path(_ed_raw))
                 if _ed_abs not in self._last_read:
                     return f"[error: must read '{_ed_abs}' with read_file before editing it]"
                 result = await tool_edit(_ed_abs, args.get("old_string", ""), args.get("new_string", ""))

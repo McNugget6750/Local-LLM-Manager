@@ -449,6 +449,10 @@ class AgentsMixin:
             f"Current working directory: {self.cwd}\n"
             f"All relative file paths resolve against this directory."
         )
+        if not task or not task.strip():
+            self._subagent_depth -= 1
+            return "[error: spawn_agent called with empty task — agent not started]"
+
         _TASK_CHAR_LIMIT = 40_000  # ~10k tokens — tasks should be instructions, not data dumps
         if len(task) > _TASK_CHAR_LIMIT:
             self._subagent_depth -= 1

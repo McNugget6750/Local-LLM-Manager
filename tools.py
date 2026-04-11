@@ -1115,16 +1115,40 @@ async def tool_ripgrep(
 async def tool_edit(path: str, old_string: str, new_string: str) -> str:
     try:
         import unicodedata as _ud
+        import logging
+        
+        # Validate inputs
+        if not old_string:
+            return "[error: old_string cannot be empty]"
+        if not new_string:
+            return "[error: new_string cannot be empty]"
+        
+        # Check for identical strings - this prevents infinite loops
+        if old_string == new_string:
+            return "[error: old_string and new_string are identical — no change requested]"
+        
         p = Path(path)
         if not p.exists():
             return f"[error: file not found: {path}]"
+        
+        # Check for potential loop detection - if this is a system file, avoid loops
+        path_str = str(p)
+        if any(keyword in path_str.lower() for keyword in ['__pycache__', '.venv', 'node_modules']):
+            logging.warning(f"Editing potentially problematic path: {path_str}")
+        
         text = p.read_text(encoding="utf-8", errors="replace")
+        
         # Normalize both file content and search strings to NFC so the round-trip
         # (file → read → model → tool args → match) is always consistent.
         # NFC is safe for all source code — it only composes combining marks.
         text_n  = _ud.normalize("NFC", text)
         old_n   = _ud.normalize("NFC", old_string)
         new_n   = _ud.normalize("NFC", new_string)
+        
+        # Check for identical strings after normalization
+        if old_n == new_n:
+            return "[error: old_string and new_string are identical after normalization — no change requested]"
+        
         count = text_n.count(old_n)
         if count == 0:
             # Give the model a fuzzy hint: find the line in the file most similar to
@@ -1143,8 +1167,19 @@ async def tool_edit(path: str, old_string: str, new_string: str) -> str:
             return "[error: old_string not found — use read_file to get the exact content before editing]"
         if count > 1:
             return f"[error: old_string found {count} times — make it more specific]"
+        
+        # Loop detection: check if the change would create a loop
+        # by checking if the new string already exists in the file
+        if new_n in text_n and new_n != old_n:
+            # This might indicate a loop - warn the user
+            logging.warning(f"Potential loop detected: new_string already exists in file {path_str}")
+        
         new_text = text_n.replace(old_n, new_n, 1)
         p.write_text(new_text, encoding="utf-8")
+        
+        # Log the edit operation for debugging with full context
+        logging.info(f"Edited file: {path_str} - replaced {len(old_n)} chars with {len(new_n)} chars")
+        
         import difflib as _difflib
         diff = list(_difflib.unified_diff(
             old_n.splitlines(keepends=False),
@@ -1157,6 +1192,7 @@ async def tool_edit(path: str, old_string: str, new_string: str) -> str:
             return "\n".join(diff)
         return f"Edited {p.name}: applied (whitespace-only change)"
     except Exception as e:
+        logging.error(f"Error in tool_edit for {path}: {e}")
         return f"[error: {e}]"
 
 

@@ -1591,7 +1591,7 @@ class MainWindow(QMainWindow):
                 bg = ELI_BG
             icon   = _TOOL_ICON.get(name, "⚙")
             keyarg = _TOOL_KEY_ARG.get(name)
-            detail = str(a.get(keyarg, ""))[:120].replace("\n", " ") if keyarg and keyarg in a else ""
+            detail = str(a.get(keyarg) or a.get("file_path") or a.get("path") or "")[:120].replace("\n", " ") if keyarg else ""
             detail_safe = detail.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             # Store full resolved path for follow-along
             _follow_path = ""
