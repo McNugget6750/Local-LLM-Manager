@@ -1767,7 +1767,7 @@ class MainWindow(QMainWindow):
             args = {}
         path = args.get("path", "")
         cmd  = args.get("command", "")
-        if tool_name in ("edit", "write_file") and path:
+        if tool_name in ("edit", "write_file"):
             rule = f"path_prefix:{self._cwd}"
             rule_label = f"Allow all edits/writes in CWD ({self._cwd})"
         elif tool_name == "bash" and cmd:
