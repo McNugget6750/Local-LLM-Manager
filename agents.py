@@ -183,7 +183,7 @@ class AgentsMixin:
                 args.get("task", ""),
                 args.get("tools"),
                 args.get("think_level"),
-                min(args.get("max_iterations", 10), 30),
+                min(args.get("max_iterations", 60), 60),
                 None,                        # model=None: eligibility confirmed same-model
                 agent_label=label,
                 current_model_hint=current_model,
@@ -318,7 +318,7 @@ class AgentsMixin:
                             _args.get("task", ""),
                             _args.get("tools"),
                             _args.get("think_level"),
-                            min(_args.get("max_iterations", 10), 30),
+                            min(_args.get("max_iterations", 60), 60),
                             _args.get("model"),
                             agent_label=_label,
                             current_model_hint=_h,
@@ -338,7 +338,7 @@ class AgentsMixin:
                             _args.get("task", ""),
                             _args.get("tools"),
                             _args.get("think_level"),
-                            min(_args.get("max_iterations", 10), 30),
+                            min(_args.get("max_iterations", 60), 60),
                             _args.get("model"),
                             agent_label=_lbl,
                             current_model_hint=_hint,
@@ -368,7 +368,7 @@ class AgentsMixin:
         task: str,
         tools: list[str] | None = None,
         think_level: str | None = None,
-        max_iterations: int = 10,
+        max_iterations: int = 60,
         model: str | None = None,
         agent_label: str = "",
         current_model_hint: str | None = None,
@@ -399,7 +399,7 @@ class AgentsMixin:
             sub_tools = [t for t in sub_tools if t["function"]["name"] in tools]
 
         think = think_level or self.think_level
-        max_iter = min(max_iterations, 50)
+        max_iter = min(max_iterations, 60)
 
         # ── Model switch ──────────────────────────────────────────────────────
         restore_profile: str | None = None
@@ -439,6 +439,15 @@ class AgentsMixin:
             f"Current working directory: {self.cwd}\n"
             f"All relative file paths resolve against this directory."
         )
+        _TASK_CHAR_LIMIT = 40_000  # ~10k tokens — tasks should be instructions, not data dumps
+        if len(task) > _TASK_CHAR_LIMIT:
+            self._subagent_depth -= 1
+            return (
+                f"[error: task string is {len(task):,} chars (~{len(task)//4:,} tokens) which exceeds the "
+                f"{_TASK_CHAR_LIMIT:,}-char limit. Pass instructions only — never embed file contents in a task. "
+                f"The agent can read files itself.]"
+            )
+
         messages: list[dict] = [
             {"role": "system", "content": system_prompt + _ctx},
             {"role": "user", "content": task},
@@ -446,7 +455,7 @@ class AgentsMixin:
 
         _label_prefix = f"[{agent_label}] " if agent_label else ""
         if self.tui_queue:
-            await self.tui_queue.put({"type": "system", "text": f"{_label_prefix}Agent: {task[:200]}{'…' if len(task) > 200 else ''}", "agent_label": agent_label})
+            await self.tui_queue.put({"type": "system", "text": f"{_label_prefix}Agent: {task}", "agent_label": agent_label})
         elif self.compact_mode:
             quote = random.choice(COMPACT_QUOTES)
             console.print(f"[dim cyan]  ◌ {quote}[/dim cyan]")
@@ -474,10 +483,11 @@ class AgentsMixin:
             for _iter in range(max_iter):
                 temperature = 0.3 if think == "deep" else 0.6
                 think_kwargs: dict = {}
-                if think == "off":
-                    think_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-                else:
-                    think_kwargs["chat_template_kwargs"] = {"enable_thinking": True}
+                if self.backend == "llamacpp":
+                    if think == "off":
+                        think_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+                    else:
+                        think_kwargs["chat_template_kwargs"] = {"enable_thinking": True}
 
                 payload = {
                     "model": self.model,
@@ -502,7 +512,9 @@ class AgentsMixin:
                     json=payload,
                     headers={"Accept": "text/event-stream"},
                 ) as response:
-                    response.raise_for_status()
+                    if response.status_code >= 400:
+                        body = await response.aread()
+                        raise RuntimeError(f"HTTP {response.status_code}: {body.decode('utf-8', errors='replace')[:600]}")
                     _live_ctx = _NullLive() if (self.tui_queue or self.compact_mode) else Live(console=console, refresh_per_second=8)
                     with _live_ctx as live:
                         show_thinking = think != "off" and not self.compact_mode
@@ -730,7 +742,7 @@ class AgentsMixin:
                                     ],
                                     "stream": False,
                                     "temperature": 0.1,
-                                    "chat_template_kwargs": {"enable_thinking": False},
+                                    **({"chat_template_kwargs": {"enable_thinking": False}} if self.backend == "llamacpp" else {}),
                                 },
                                 timeout=60,
                             )
@@ -926,6 +938,18 @@ class AgentsMixin:
         if not agent_specs:
             return "[error: queue_agents called with empty agents list]"
 
+        # Local models sometimes emit the agents array as a JSON-encoded string instead of
+        # an actual array. Detect and decode it before validation.
+        if isinstance(agent_specs, str):
+            import json as _json
+            try:
+                agent_specs = _json.loads(agent_specs)
+            except Exception:
+                return "[error: queue_agents 'agents' value is a string and could not be parsed as JSON. Pass a proper JSON array of objects.]"
+
+        if not isinstance(agent_specs, list):
+            return "[error: queue_agents 'agents' must be a JSON array of objects.]"
+
         # Defensive: local models sometimes emit strings instead of objects
         bad = [i for i, s in enumerate(agent_specs) if not isinstance(s, dict)]
         if bad:
@@ -966,7 +990,7 @@ class AgentsMixin:
             agent_num = idx + 1
             target_model = spec.get("model")
             timeout_s = max(30, int(spec.get("timeout_seconds", 300)))
-            max_iter = min(int(spec.get("max_iterations", 10)), 50)
+            max_iter = min(int(spec.get("max_iterations", 60)), 60)
             think = spec.get("think_level") or self.think_level
             tools_wl = spec.get("tools")
             task = spec.get("task", "")
@@ -1004,6 +1028,23 @@ class AgentsMixin:
             sub_tools = [t for t in TOOLS if t["function"]["name"] not in ("spawn_agent", "queue_agents", "analyze_image")]
             if tools_wl:
                 sub_tools = [t for t in sub_tools if t["function"]["name"] in tools_wl]
+
+            _TASK_CHAR_LIMIT = 40_000
+            if len(task) > _TASK_CHAR_LIMIT:
+                results.append({
+                    "index": idx, "system_prompt": spec.get("system_prompt", ""),
+                    "task": task[:200], "model": target_model,
+                    "timeout_seconds": timeout_s, "status": "error",
+                    "result": (
+                        f"[error: task string is {len(task):,} chars (~{len(task)//4:,} tokens) which exceeds the "
+                        f"{_TASK_CHAR_LIMIT:,}-char limit. Pass instructions only — never embed file contents in a task. "
+                        f"The agent can read files itself.]"
+                    ),
+                    "duration_seconds": 0.0,
+                })
+                if not self.tui_queue:
+                    console.print(f"[red]  Agent {agent_num}/{total} skipped — task too large ({len(task):,} chars)[/red]")
+                continue
 
             messages: list[dict] = [
                 {"role": "system", "content": sp},
@@ -1051,10 +1092,11 @@ class AgentsMixin:
                         break
 
                     think_kwargs: dict = {}
-                    if think == "off":
-                        think_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-                    else:
-                        think_kwargs["chat_template_kwargs"] = {"enable_thinking": True}
+                    if self.backend == "llamacpp":
+                        if think == "off":
+                            think_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+                        else:
+                            think_kwargs["chat_template_kwargs"] = {"enable_thinking": True}
 
                     payload = {
                         "model": self.model, "messages": messages,
@@ -1073,7 +1115,9 @@ class AgentsMixin:
                         "POST", f"{BASE_URL}/v1/chat/completions",
                         json=payload, headers={"Accept": "text/event-stream"},
                     ) as response:
-                        response.raise_for_status()
+                        if response.status_code >= 400:
+                            body = await response.aread()
+                            raise RuntimeError(f"HTTP {response.status_code}: {body.decode('utf-8', errors='replace')[:600]}")
                         _live = _NullLive() if (self.tui_queue or self.compact_mode) else Live(console=console, refresh_per_second=8)
                         with _live as live:
                             async for ev_type, ev_data in stream_events(

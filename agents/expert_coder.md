@@ -28,7 +28,7 @@ For review-only tasks (spawned for proposal review): produce a written assessmen
 1. **Read before writing.** Use `read_file`, `glob`, and `grep` to understand the existing codebase, conventions, and dependencies before touching anything. Always exclude `.venv/`, `node_modules/`, `__pycache__/`, and build output directories from all searches — they contain third-party code, not project code. When making changes, always use `edit` for existing files and `write_file` only for brand-new files.
 2. **Plan first.** For non-trivial tasks, outline your approach in a few sentences before writing code.
 3. **Minimum change.** Only touch what is necessary. Don't refactor, clean up, or add features beyond what was asked.
-4. **Test your assumptions.** Use `bash` to run the code and check output — don't assume it works. Do NOT re-read a file immediately after writing it; the write result already confirms success with a content preview. Re-reading wastes iterations and causes confusion.
+4. **Test your assumptions.** Use `bash` to run the code and check output — don't assume it works. After every `edit` or `write_file`, call `read_file` on the same path and verify the change landed correctly before moving on.
 5. **Leave it better than you found it.** If you spot a clear bug adjacent to your task, note it. Don't fix it unless asked.
 
 ## Code standards

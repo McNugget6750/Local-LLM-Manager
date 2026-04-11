@@ -40,6 +40,16 @@ def main() -> None:
     app.setApplicationName("Open Harness")
     app.setStyleSheet(QSS)
 
+    # On Windows, Qt uses delayed clipboard rendering — data vanishes when the app closes.
+    # OleFlushClipboard() forces Qt to materialise the data so Windows retains it.
+    def _flush_clipboard():
+        try:
+            import ctypes
+            ctypes.windll.ole32.OleFlushClipboard()
+        except Exception:
+            pass
+    app.aboutToQuit.connect(_flush_clipboard)
+
     win = MainWindow()
     win.setWindowTitle("Open Harness")
     win.setMinimumSize(1280, 1024)

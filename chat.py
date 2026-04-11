@@ -297,6 +297,15 @@ def _debug_write_line(line: str) -> None:
             pass
 
 
+async def _post_timing(data: dict) -> None:
+    """Fire-and-forget: POST timing stats to the server manager control API."""
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as _c:
+            await _c.post(f"{CONTROL_URL}/api/timing", json=data)
+    except Exception:
+        pass  # server manager not running — silently ignore
+
+
 # ── SSE stream parser ─────────────────────────────────────────────────────────
 async def stream_events(
     response: httpx.Response,
@@ -311,11 +320,13 @@ async def stream_events(
     """
     accumulators: dict[int, ToolCallAccumulator] = {}
     in_think = False
-    # Holdback buffer for <think>/</ think> tag detection at chunk boundaries
+    # Holdback buffer for think-tag detection across chunk boundaries.
+    # Supports Qwen3 (<think>/</think>) and Gemma 4 (<|channel>/<channel|>).
     holdback = ""
-    OPEN_TAG = "<think>"
-    CLOSE_TAG = "</think>"
-    MAX_HOLD = max(len(OPEN_TAG), len(CLOSE_TAG))
+    _OPEN_TAGS  = ["<think>", "<|channel>"]
+    _CLOSE_TAGS = {"<think>": "</think>", "<|channel>": "<channel|>"}
+    active_close = "</think>"
+    MAX_HOLD = max(len(t) for t in _OPEN_TAGS + list(_CLOSE_TAGS.values()))
 
     def flush_text(token: str, is_thinking: bool):
         if token:
@@ -363,31 +374,37 @@ async def stream_events(
             acc.name = acc.name or fn.get("name", "")
             acc.arguments += fn.get("arguments", "")
 
-        # Handle text content with <think> tag state machine
+        # Handle text content with think-tag state machine (Qwen3 + Gemma 4)
         content = delta.get("content") or ""
         if content:
             holdback += content
             # Process holdback: emit safe prefix, keep potential-tag suffix
             while True:
                 if in_think:
-                    pos = holdback.find(CLOSE_TAG)
+                    pos = holdback.find(active_close)
                     if pos != -1:
-                        yield ("think", holdback[:pos])
-                        holdback = holdback[pos + len(CLOSE_TAG):]
+                        if pos > 0:
+                            yield ("think", holdback[:pos])
+                        holdback = holdback[pos + len(active_close):]
                         in_think = False
                     else:
-                        # Keep last MAX_HOLD chars in holdback (might be partial tag)
                         safe = holdback[:-MAX_HOLD] if len(holdback) > MAX_HOLD else ""
                         if safe:
                             yield ("think", safe)
                         holdback = holdback[len(safe):]
                         break
                 else:
-                    pos = holdback.find(OPEN_TAG)
-                    if pos != -1:
-                        if pos > 0:
-                            yield ("text", holdback[:pos])
-                        holdback = holdback[pos + len(OPEN_TAG):]
+                    # Find whichever open tag appears earliest
+                    best_pos, best_tag = -1, ""
+                    for ot in _OPEN_TAGS:
+                        p = holdback.find(ot)
+                        if p != -1 and (best_pos == -1 or p < best_pos):
+                            best_pos, best_tag = p, ot
+                    if best_pos != -1:
+                        if best_pos > 0:
+                            yield ("text", holdback[:best_pos])
+                        holdback = holdback[best_pos + len(best_tag):]
+                        active_close = _CLOSE_TAGS[best_tag]
                         in_think = True
                     else:
                         safe = holdback[:-MAX_HOLD] if len(holdback) > MAX_HOLD else ""
@@ -600,7 +617,7 @@ async def _invoke_skill(skill_name: str, skill_args: str, session: "ChatSession"
     if spawn:
         tools      = skill.get("agent_tools") or None
         think      = skill.get("think_level") or None
-        max_iter   = int(skill.get("max_iterations", 10))
+        max_iter   = int(skill.get("max_iterations", 60))
         if not session.tui_queue:
             console.print(Panel(
                 f"[dim]Invoking agent skill '[bold]{skill_name}[/bold]'...[/dim]",
@@ -686,6 +703,7 @@ class ChatSession(AgentsMixin):
         self._pending_bg_tool_calls: list[dict] = []             # tc dicts for tool_done emit
         self._write_locks:          dict[str, str] = {}          # abs_path → holder label
         self._eli_slot:             "SlotHandle | None" = None   # held during send_and_stream; released before inline agents
+        self.backend: str           = "llamacpp"                 # "llamacpp" | "vllm" — set by _health_check
 
     async def __aenter__(self):
         await self._health_check()
@@ -709,6 +727,23 @@ class ChatSession(AgentsMixin):
         try:
             r = await self.client.get(f"{BASE_URL}/v1/models")
             r.raise_for_status()
+            data = r.json()
+            if data.get("data"):
+                first_model = data["data"][0]
+                if self.model == "auto":
+                    self.model = first_model["id"]
+                # vLLM identifies itself via owned_by field or by full-path model IDs
+                owned_by = first_model.get("owned_by", "")
+                model_id = first_model.get("id", "")
+                if owned_by == "vllm" or "/" in model_id or "\\" in model_id:
+                    self.backend = "vllm"
+                    # vLLM exposes max_model_len directly — use it as ctx_window
+                    max_len = first_model.get("max_model_len")
+                    if max_len and isinstance(max_len, int) and max_len > 0:
+                        self.ctx_window = max_len
+                    console.print(f"[dim]Backend: vLLM  model={self.model}  ctx={self.ctx_window:,}[/dim]")
+                else:
+                    console.print(f"[dim]Backend: llama.cpp  model={self.model}[/dim]")
         except Exception as e:
             console.print(f"[red]Server not reachable at {BASE_URL}: {e}[/red]")
             console.print("[yellow]Start the server first via server_manager.py[/yellow]")
@@ -1030,10 +1065,13 @@ class ChatSession(AgentsMixin):
             while True:
                 temperature = 0.3 if self.think_level == "deep" else 0.6
                 think_kwargs: dict = {}
-                if self.think_level == "off":
-                    think_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-                else:
-                    think_kwargs["chat_template_kwargs"] = {"enable_thinking": True}
+                if self.backend == "llamacpp":
+                    # llama.cpp Qwen3 jinja template needs this flag to toggle thinking
+                    if self.think_level == "off":
+                        think_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+                    else:
+                        think_kwargs["chat_template_kwargs"] = {"enable_thinking": True}
+                # vLLM: no chat_template_kwargs — let the model template handle thinking natively
 
                 if plan_mode:
                     plan_system = (
@@ -1079,6 +1117,11 @@ class ChatSession(AgentsMixin):
                 tool_calls_received = []
                 assistant_content = ""
                 usage_data: dict | None = None
+                _t_request = asyncio.get_event_loop().time()
+                _t_first_token: float | None = None
+
+                if _debug_file:
+                    _debug_write_line(f"\n--- PAYLOAD ---\n{json.dumps(payload, indent=2, default=str)}\n--- END PAYLOAD ---")
 
                 async with self.client.stream(
                     "POST",
@@ -1086,7 +1129,14 @@ class ChatSession(AgentsMixin):
                     json=payload,
                     headers={"Accept": "text/event-stream"},
                 ) as response:
-                    response.raise_for_status()
+                    if _debug_file:
+                        _debug_write_line(f"--- HTTP {response.status_code} headers: {dict(response.headers)} ---")
+                    if response.status_code >= 400:
+                        body = await response.aread()
+                        body_text = body.decode("utf-8", errors="replace")[:600]
+                        raise RuntimeError(
+                            f"HTTP {response.status_code} from server: {body_text}"
+                        )
 
                     # Render text live via rich.live (or null in TUI mode)
                     _live_ctx = _NullLive() if self.tui_queue else Live(console=console, refresh_per_second=8)
@@ -1103,6 +1153,8 @@ class ChatSession(AgentsMixin):
                             label=f"send_and_stream | model={self.model} | {BASE_URL}",
                         ):
                             if event_type == "think":
+                                if _t_first_token is None:
+                                    _t_first_token = asyncio.get_event_loop().time()
                                 thinking_buf += data
                                 if self.tui_queue:
                                     await self.tui_queue.put({"type": "think_token", "text": data})
@@ -1116,6 +1168,8 @@ class ChatSession(AgentsMixin):
                                     )
 
                             elif event_type == "text":
+                                if _t_first_token is None:
+                                    _t_first_token = asyncio.get_event_loop().time()
                                 if self.tui_queue:
                                     text_buf += data
                                     assistant_content += data
@@ -1162,6 +1216,22 @@ class ChatSession(AgentsMixin):
                     self.tokens_used = sum(
                         len(m.get("content") or "") for m in self.messages
                     ) // CHARS_PER_TOKEN
+
+                # Report timing to server manager (non-blocking fire-and-forget)
+                _t_end = asyncio.get_event_loop().time()
+                _gen_n = usage_data.get("completion_tokens", 0) if usage_data else 0
+                _pre_n = usage_data.get("prompt_tokens", 0) if usage_data else 0
+                if _gen_n > 0 and _t_first_token is not None:
+                    _gen_elapsed = max(_t_end - _t_first_token, 0.001)
+                    _pre_elapsed = max((_t_first_token - _t_request), 0.001)
+                    _timing = {
+                        "gen":      round(_gen_n / _gen_elapsed, 2),
+                        "pre":      round(_pre_n / _pre_elapsed, 2),
+                        "gen_n":    _gen_n,
+                        "pre_n":    _pre_n,
+                        "total_ms": round((_t_end - _t_request) * 1000, 1),
+                    }
+                    asyncio.create_task(_post_timing(_timing))
 
                 # Auto-compact if approaching context limit
                 if not self._compacting and self.tokens_used >= int(self.ctx_window * self.compact_threshold):
@@ -1325,6 +1395,14 @@ class ChatSession(AgentsMixin):
                 else:
                     if assistant_content:
                         self.messages.append({"role": "assistant", "content": assistant_content})
+                    elif not tool_calls_received:
+                        # Server returned a 200 stream with no content and no tool calls —
+                        # surface this as a visible error rather than silent no-op.
+                        _warn = "[empty response from server — no content or tool calls in stream]"
+                        if self.tui_queue:
+                            await self.tui_queue.put({"type": "system", "text": _warn})
+                        else:
+                            console.print(f"[yellow]{_warn}[/yellow]")
                     break
 
             if self.tui_queue:
@@ -1462,12 +1540,12 @@ class ChatSession(AgentsMixin):
                 return await tool_bash(args.get("command", ""), args.get("timeout", 30), cwd=_bash_cwd)
             elif name == "read_file":
                 return await tool_read_file(
-                    self._resolve_path(args.get("path", "")),
+                    self._resolve_path(args.get("path", "") or args.get("file_path", "")),
                     offset=int(args.get("offset", 1)),
                     limit=int(args.get("limit", 200)),
                 )
             elif name == "write_file":
-                return await tool_write_file(self._resolve_path(args.get("path", "")), args.get("content", ""))
+                return await tool_write_file(self._resolve_path(args.get("path", "") or args.get("file_path", "")), args.get("content", ""))
             elif name == "list_dir":
                 return await tool_list_dir(self._resolve_path(args.get("path", ".")))
             elif name == "glob":
@@ -1492,7 +1570,7 @@ class ChatSession(AgentsMixin):
                     args.get("max_results", 100),
                 )
             elif name == "edit":
-                return await tool_edit(self._resolve_path(args.get("path", "")), args.get("old_string", ""), args.get("new_string", ""))
+                return await tool_edit(self._resolve_path(args.get("path", "") or args.get("file_path", "")), args.get("old_string", ""), args.get("new_string", ""))
             elif name == "web_fetch":
                 return await tool_web_fetch(args.get("url", ""))
             elif name == "web_search":
@@ -1513,7 +1591,7 @@ class ChatSession(AgentsMixin):
                     args.get("task", ""),
                     args.get("tools"),
                     args.get("think_level"),
-                    min(args.get("max_iterations", 10), 30),
+                    min(args.get("max_iterations", 60), 60),
                     args.get("model"),
                 )
             elif name == "analyze_image":

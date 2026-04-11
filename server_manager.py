@@ -680,7 +680,12 @@ class ServerManager(tk.Tk):
             self._external = False
             self._btn_stop.config(state="normal")
             threading.Thread(target=self._read_proc, daemon=True).start()
-            self._schedule_heartbeat(45)
+            if self._engine == "wsl":
+                # WSL processes don't forward stdout reliably — poll the API directly
+                self._log_put("WSL engine: polling /v1/models every 15 s (up to 10 min)…", "info")
+                threading.Thread(target=self._wsl_startup_poll, daemon=True).start()
+            else:
+                self._schedule_heartbeat(45)
         except Exception as e:
             self._log_put(f"Failed to start: {e}", "err")
             self._btn_start.config(state="normal")
@@ -744,6 +749,36 @@ class ServerManager(tk.Tk):
         self._lbl_status.config(text="  Running")
         self._btn_chat.config(state="normal")
         self._start_voice_server()
+
+    def _wsl_startup_poll(self):
+        """Background thread: poll /v1/models every 15 s until ready or 10 min elapsed."""
+        import time
+        interval = 15      # seconds between probes
+        max_tries = 40     # 40 × 15 s = 600 s = 10 min
+        for attempt in range(1, max_tries + 1):
+            time.sleep(interval)
+            if not self._running:
+                return  # server was stopped while we were waiting
+            result = self._probe()
+            if result["ok"]:
+                self.after(0, lambda r=result: self._apply_wsl_ready(r))
+                return
+            remaining = (max_tries - attempt) * interval
+            self.after(0, lambda a=attempt, rem=remaining: self._log_put(
+                f"WSL probe {a}/{max_tries} — not ready yet, {rem}s remain", "info"
+            ))
+        # Gave up
+        self.after(0, lambda: self._log_put(
+            "WSL startup timeout (10 min) — server did not respond", "err"
+        ))
+
+    def _apply_wsl_ready(self, result):
+        """Called on the Tk thread when WSL probe first succeeds."""
+        model_short = result["model"]
+        self._lbl_model.config(text=model_short)
+        self._log_put(f"✓  {model_short}  ·  vLLM server ready", "ok")
+        self._set_running()
+        self._schedule_heartbeat()   # switch to normal 5-min heartbeat cycle
 
     # ── Voice server lifecycle ───────────────────────────────────────────────
     _VOICE_PYTHON = r"C:\Users\timob\claude-projects\qwen3-manager\.venv\Scripts\python.exe"
@@ -1139,6 +1174,12 @@ class ServerManager(tk.Tk):
                         msg = json.dumps({"error": f"unknown profile: {profile}",
                                           "available": available}).encode()
                         self._send(400, msg)
+
+                elif self.path == "/api/timing":
+                    # Posted by chat.py after each completed response with gen/prefill stats
+                    mgr._log_q.put((json.dumps(body), "__timing__"))
+                    self._send(200, b'{"ok":true}')
+
                 else:
                     self._send(404, b'{"error":"not found"}')
 

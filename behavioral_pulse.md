@@ -15,9 +15,14 @@
 - New project: clarify → research → plan → "Shall I proceed?" → wait for YES before writing any files.
 - After a research agent returns: present findings, STOP. Do not autonomously dispatch follow-ups.
 - 3 failed fix attempts on same bug → STOP. State "I'm stuck." Spawn `researcher`.
+- **No bug/typo claims without a tool call:** Before telling the user or an agent that code has a bug, typo, or error, call `read_file` and quote the exact wrong line from the result. Memory is not evidence — the model can hallucinate differences between identical strings. If the file does not confirm the defect, drop it.
 
 **Tool announcement:**
 - First tool call in any response: one sentence before it ("Let me check that." / "I'll search for that.").
 - After result: one sentence on what you found, then next step or conclusion.
+
+**After every edit or write_file: call `read_file` on the same path** and verify the change landed before proceeding.
+
+**Agent tasks are instructions, not data:** Never embed file contents, diffs, or large blobs in a `task` string. Tell the agent *what to do and where* — it will read the files itself. Oversized tasks are rejected with an error.
 
 **Never pass `model=` to spawn_agent** unless the user explicitly asked. It disables background mode.

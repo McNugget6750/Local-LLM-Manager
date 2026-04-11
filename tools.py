@@ -65,7 +65,7 @@ TOOLS = [
                 "ALWAYS use this for modifying existing files — it is precise, safe, and uses minimal context. "
                 "Read the file first to get the exact text, then pass it as old_string. "
                 "Fails if old_string is not found or matches multiple times (make it more specific in that case). "
-                "Returns a unified diff confirming the change — do NOT re-read the file to verify."
+                "After a successful edit, call read_file on the same path to verify the change landed."
             ),
             "parameters": {
                 "type": "object",
@@ -86,7 +86,7 @@ TOOLS = [
                 "Write content to a file, creating parent directories as needed. "
                 "Only use this for NEW files or when replacing an entire file from scratch. "
                 "NEVER use this to modify an existing file — use `edit` instead. "
-                "After a successful write the result includes a content preview; do NOT re-read the file to verify."
+                "After a successful write, call read_file on the same path to verify the content landed correctly."
             ),
             "parameters": {
                 "type": "object",
@@ -256,7 +256,7 @@ TOOLS = [
                     },
                     "max_iterations": {
                         "type": "integer",
-                        "description": "Max tool-use iterations (default 10, hard max 50). Increase for large codebases or deep research — code-review may need 20–30, research 40–50.",
+                        "description": "Max tool-use iterations (default 60, hard max 60. Increase for large codebases or deep research.",
                     },
                     "model": {
                         "type": "string",
@@ -330,7 +330,7 @@ TOOLS = [
                                 "timeout_seconds":  {"type": "integer", "description": "Max seconds for this agent (default 300)."},
                                 "tools":            {"type": "array", "items": {"type": "string"}, "description": "Optional tool whitelist."},
                                 "think_level":      {"type": "string", "description": "'off', 'on', or 'deep'."},
-                                "max_iterations":   {"type": "integer", "description": "Max tool-use iterations (default 10, hard max 50). Increase for large codebases or deep research — code-review may need 20–30, research 40–50."},
+                                "max_iterations":   {"type": "integer", "description": "Max tool-use iterations (default 60, hard max 60. Increase for large codebases or deep research."},
                             },
                             "required": ["system_prompt", "task"],
                         },

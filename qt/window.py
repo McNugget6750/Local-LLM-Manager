@@ -700,6 +700,13 @@ class MainWindow(QMainWindow):
         self._voice_autosend_cb.setToolTip("Auto-submit transcribed text to chat")
         tb.addWidget(self._voice_autosend_cb)
 
+        tb.addSeparator()
+        self._follow_along_cb = QCheckBox("Follow")
+        self._follow_along_cb.setChecked(False)
+        self._follow_along_cb.setToolTip("Follow along: open each file the agent reads or edits in the editor and jump to the relevant section")
+        self._follow_along_cb.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px;")
+        tb.addWidget(self._follow_along_cb)
+
         # Keep hidden server_url for compatibility with poll logic
         self._server_url = QLineEdit("localhost:1234")
         self._server_url.hide()
@@ -1551,8 +1558,8 @@ class MainWindow(QMainWindow):
             _AGENT_STRIPE = "#fbbf24"
             _AGENT_DISPATCH_BG = "#131000"
             _AGENT_LABEL_COLOR = "#e040fb"
-            task_raw = str(a.get("task", a.get("tasks", ""))).replace("\n", " ")
-            task_safe = task_raw.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            task_raw = str(a.get("task", a.get("tasks", "")))
+            task_safe = task_raw.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
             agent_num = self._agent_counter
             html = (
                 f'<table width="100%" style="border-spacing:0;border-collapse:collapse;table-layout:fixed;margin:3px 0;">'
@@ -1580,9 +1587,39 @@ class MainWindow(QMainWindow):
             keyarg = _TOOL_KEY_ARG.get(name)
             detail = str(a.get(keyarg, ""))[:120].replace("\n", " ") if keyarg and keyarg in a else ""
             detail_safe = detail.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            # Store full resolved path for follow-along
+            _follow_path = ""
+            if name in ("read_file", "write_file", "edit"):
+                _raw = a.get("path", "") or a.get("file_path", "")
+                if _raw:
+                    _p = Path(_raw) if os.path.isabs(_raw) else Path(self._cwd) / _raw
+                    _follow_path = str(_p.resolve())
+            _follow_line = int(a.get("offset", 1)) if name == "read_file" else 1
+            diff_args = None
+            if name == "edit":
+                diff_args = {
+                    "file_path": a.get("file_path", ""),
+                    "old_string": a.get("old_string", ""),
+                    "new_string": a.get("new_string", ""),
+                }
+            elif name == "write_file":
+                fp = a.get("file_path", a.get("path", ""))
+                try:
+                    with open(fp, encoding="utf-8", errors="replace") as _f:
+                        old_content = _f.read()
+                except Exception:
+                    old_content = ""
+                diff_args = {
+                    "file_path": fp,
+                    "old_content": old_content,
+                    "new_content": a.get("content", ""),
+                }
             self._pending_tools[tool_id] = {
                 "name": name, "icon": icon, "color": color,
                 "bg": bg, "indent": indent, "detail": detail_safe,
+                "diff_args": diff_args,
+                "follow_path": _follow_path,
+                "follow_line": _follow_line,
             }
 
     @Slot(str, str, str, bool)
@@ -1645,6 +1682,51 @@ class MainWindow(QMainWindow):
                 f'</td></tr></table>'
             )
             self._full_view.append(done_html)
+
+            # For edit/write_file, render a unified diff block
+            if name in ("edit", "write_file") and not is_error and pending:
+                diff_args = pending.get("diff_args")
+                if diff_args:
+                    import difflib
+                    fp = diff_args["file_path"]
+                    if name == "edit":
+                        old_lines = diff_args["old_string"].splitlines(keepends=True)
+                        new_lines = diff_args["new_string"].splitlines(keepends=True)
+                    else:
+                        old_lines = diff_args["old_content"].splitlines(keepends=True)
+                        new_lines = diff_args["new_content"].splitlines(keepends=True)
+                    diff_text = "".join(difflib.unified_diff(
+                        old_lines, new_lines,
+                        fromfile=f"a/{fp}", tofile=f"b/{fp}",
+                        lineterm="",
+                    ))
+                    if diff_text:
+                        self._full_view.append(_diff_block_html(diff_text))
+
+            # Follow along: silently open the file and jump to the relevant line
+            if (self._follow_along_cb.isChecked()
+                    and not is_error
+                    and name in ("read_file", "write_file", "edit")
+                    and pending):
+                follow_path = pending.get("follow_path", "")
+                follow_line = pending.get("follow_line", 1)
+                if follow_path and os.path.isfile(follow_path):
+                    if follow_path != self._current_file:
+                        self._load_file(follow_path)
+                    # For edit: find the start line of new_string in the file
+                    if name == "edit" and pending.get("diff_args"):
+                        new_str = pending["diff_args"].get("new_string", "")
+                        if new_str:
+                            doc = self._editor.document()
+                            found = doc.find(new_str.split("\n")[0].strip())
+                            if not found.isNull():
+                                follow_line = found.blockNumber() + 1
+                    doc = self._editor.document()
+                    block = doc.findBlockByNumber(max(0, follow_line - 1))
+                    if block.isValid():
+                        cursor = QTextCursor(block)
+                        self._editor.setTextCursor(cursor)
+                        self._editor.centerCursor()
 
         # Render agent output with its assigned color and full markdown
         if is_agent_tool:
