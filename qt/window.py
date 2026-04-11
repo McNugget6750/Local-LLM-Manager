@@ -2411,7 +2411,7 @@ class MainWindow(QMainWindow):
             pass
 
     def _append_user(self, text: str, queued: bool = False):
-        safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
         stripe = "#555555" if queued else USER_COLOR
         bg     = "#0d0d0d" if queued else "#0b1a1a"
         label  = '<span style="color:#555555;font-weight:bold;">You (queued)</span>' if queued else f'<span style="color:{USER_COLOR};font-weight:bold;">You</span>'
@@ -2446,7 +2446,7 @@ class MainWindow(QMainWindow):
 
     def _append_remote(self, text: str):
         """Render a remote-injected prompt — bright blue stripe, labelled 'Remote'."""
-        safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
         html = (
             f'<table width="100%" style="border-spacing:0;border-collapse:collapse;table-layout:fixed;margin:2px 0;">'
             f'<tr>'
