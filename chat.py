@@ -1546,8 +1546,10 @@ class ChatSession(AgentsMixin):
                 return result
             elif name == "write_file":
                 _wf_abs = os.path.abspath(self._resolve_path(args.get("path", "") or args.get("file_path", "")))
-                if os.path.exists(_wf_abs) and _wf_abs not in self._last_read:
-                    return f"[error: must read '{os.path.basename(_wf_abs)}' with read_file before writing it]"
+                if os.path.exists(_wf_abs):
+                    return (f"[error: '{os.path.basename(_wf_abs)}' already exists — "
+                            f"use edit to modify existing files. "
+                            f"write_file is only for creating new files.]")
                 result = await tool_write_file(_wf_abs, args.get("content", ""))
                 self._last_read.discard(_wf_abs)
                 return result

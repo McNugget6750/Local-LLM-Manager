@@ -84,8 +84,8 @@ TOOLS = [
             "name": "write_file",
             "description": (
                 "Write content to a file, creating parent directories as needed. "
-                "Only use this for NEW files or when replacing an entire file from scratch. "
-                "NEVER use this to modify an existing file — use `edit` instead. "
+                "Only use this for NEW files that do not exist yet. "
+                "Will FAIL with an error if the file already exists — use `edit` to modify existing files. "
                 "After a successful write, call read_file on the same path to verify the content landed correctly."
             ),
             "parameters": {

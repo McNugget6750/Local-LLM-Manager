@@ -325,10 +325,20 @@ class AgentsMixin:
                             _tool_id=_tc["id"],
                         )
                         return _tc["id"], _res
-                    _group_results = list(await asyncio.gather(*[
+                    _raw_results = await asyncio.gather(*[
                         _run_one_parallel(_tc, _args, _lbl)
                         for (_tc, _args), _lbl in zip(_group, _labels)
-                    ]))
+                    ], return_exceptions=True)
+                    # Convert any exception objects into error strings so one dead
+                    # agent doesn't cancel the others or crash the parent turn.
+                    _group_results = []
+                    for (_tc, _args), _r in zip(_group, _raw_results):
+                        if isinstance(_r, BaseException):
+                            _err = f"[agent died: {type(_r).__name__}: {_r}]"
+                            log.warning("Parallel agent crashed: %s", _r)
+                            _group_results.append((_tc["id"], _err))
+                        else:
+                            _group_results.append(_r)
                     _pair_results.extend(_group_results)
                 else:
                     for _i, (_tc, _args) in enumerate(_group):
@@ -772,6 +782,19 @@ class AgentsMixin:
                     if assistant_content:
                         messages.append({"role": "assistant", "content": assistant_content})
                     break
+        except asyncio.CancelledError:
+            raise  # let cancellation propagate so eviction works correctly
+        except Exception as _iter_exc:
+            # Catch network errors, HTTP failures, and any other crash so a dead
+            # agent doesn't kill the parent turn.  The finally block still runs
+            # to release the slot; the error string is returned to the parent
+            # model as the agent result so it can decide whether to retry.
+            _err_msg = f"[agent died: {type(_iter_exc).__name__}: {_iter_exc}]"
+            log.warning("Agent[%s] crashed: %s", agent_label or "?", _iter_exc)
+            if self.tui_queue:
+                await self.tui_queue.put({"type": "system", "text": _err_msg})
+            final_text = (final_text + "\n\n" if final_text else "") + _err_msg
+            _hit_max_iter = False  # don't trigger the iteration-limit summary prompt
         finally:
             self._subagent_depth -= 1
             if self.tui_queue:
