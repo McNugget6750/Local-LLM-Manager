@@ -545,10 +545,14 @@ def _extract_paths_from_subcmd(subcmd: str) -> list[str]:
     """Heuristically extract file path candidates from a single shell sub-command.
 
     Covers:
-    - Positional args (tokens not starting with -)
+    - Positional args (tokens not starting with - or /)
     - --flag=value and -f value forms
+    - Windows /flag forms (e.g. /s /b /q) — skipped, not treated as paths
     - Redirect targets: > file, >> file, 2> file
     """
+    # Windows-style flag: /letters with no backslash and no second slash
+    _WIN_FLAG = _re.compile(r'^/[a-zA-Z0-9]{1,4}$')
+
     candidates = []
     tokens = subcmd.split()
     if not tokens:
@@ -575,13 +579,13 @@ def _extract_paths_from_subcmd(subcmd: str) -> list[str]:
         if tok.startswith("--") and "=" in tok:
             candidates.append(tok.split("=", 1)[1])
             continue
-        # -f value (single-char flag followed by path-like token)
+        # -f value (single-char Unix flag followed by next token)
         if _re.match(r'^-[a-zA-Z]$', tok) and i + 1 < len(tokens):
             candidates.append(tokens[i + 1])
             skip_next = True
             continue
-        # skip other flags
-        if tok.startswith("-"):
+        # skip Unix flags and Windows /flag tokens
+        if tok.startswith("-") or _WIN_FLAG.match(tok):
             continue
         candidates.append(tok)
     return candidates

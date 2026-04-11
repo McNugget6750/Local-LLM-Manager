@@ -924,6 +924,14 @@ class AgentsMixin:
         if not agent_specs:
             return "[error: queue_agents called with empty agents list]"
 
+        # Defensive: local models sometimes emit strings instead of objects
+        bad = [i for i, s in enumerate(agent_specs) if not isinstance(s, dict)]
+        if bad:
+            return (
+                f"[error: queue_agents received non-object agent specs at position(s) {bad}. "
+                "Each entry in 'agents' must be a JSON object with 'system_prompt' and 'task' keys.]"
+            )
+
         # Validate models upfront — strip unknown ones rather than aborting
         commands = _load_commands()
         for spec in agent_specs:
