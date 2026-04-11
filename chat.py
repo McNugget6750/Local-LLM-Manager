@@ -1547,7 +1547,7 @@ class ChatSession(AgentsMixin):
             elif name == "write_file":
                 _wf_abs = os.path.abspath(self._resolve_path(args.get("path", "") or args.get("file_path", "")))
                 if os.path.exists(_wf_abs) and os.path.getsize(_wf_abs) > 0:
-                    return (f"[error: '{os.path.basename(_wf_abs)}' already exists and has content — "
+                    return (f"[error: '{_wf_abs}' already exists and has content — "
                             f"use edit to modify existing files. "
                             f"write_file is only for creating new files or overwriting empty files.]")
                 result = await tool_write_file(_wf_abs, args.get("content", ""))
@@ -1579,7 +1579,7 @@ class ChatSession(AgentsMixin):
             elif name == "edit":
                 _ed_abs = os.path.abspath(self._resolve_path(args.get("path", "") or args.get("file_path", "")))
                 if _ed_abs not in self._last_read:
-                    return f"[error: must read '{os.path.basename(_ed_abs)}' with read_file before editing it]"
+                    return f"[error: must read '{_ed_abs}' with read_file before editing it]"
                 result = await tool_edit(_ed_abs, args.get("old_string", ""), args.get("new_string", ""))
                 return result
             elif name == "web_fetch":
