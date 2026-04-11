@@ -1677,6 +1677,11 @@ class MainWindow(QMainWindow):
             outcome_icon  = "✗" if is_error else "✓"
             outcome_color = "#ef4444" if is_error else color
             detail_span   = f' <span style="color:#555577;">{detail}</span>' if detail else ""
+            error_span    = ""
+            if is_error and result:
+                _err_line = result.split("\n")[0][:300]
+                _err_safe = _err_line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                error_span = f' <span style="color:#ef4444;font-size:10px;">{_err_safe}</span>'
             done_html = (
                 f'<table width="100%" style="border-spacing:0;border-collapse:collapse;table-layout:fixed;margin:1px 0 2px 0;">'
                 f'<tr>'
@@ -1685,6 +1690,7 @@ class MainWindow(QMainWindow):
                 f'<span style="color:{color};">{icon} {name}</span>'
                 f'{detail_span}'
                 f' <span style="color:{outcome_color};">{outcome_icon}</span>'
+                f'{error_span}'
                 f'</td></tr></table>'
             )
             self._append(self._full_view, done_html)

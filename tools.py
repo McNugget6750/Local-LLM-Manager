@@ -116,12 +116,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "glob",
-            "description": "Find files matching a glob pattern (supports ** for recursive search).",
+            "description": "Find files matching a glob pattern (supports ** for recursive search). By default skips noise directories (.venv, __pycache__, node_modules, .git, etc.). Set include_all=true to search those directories too.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "Glob pattern, e.g. '**/*.py'"},
                     "path": {"type": "string", "description": "Root directory to search from (default: current dir)"},
+                    "include_all": {"type": "boolean", "description": "Include noise dirs (.venv, __pycache__, node_modules, etc.) — default false"},
                 },
                 "required": ["pattern"],
             },
@@ -131,7 +132,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "grep",
-            "description": "Search file contents for a regex pattern, optionally filtered by file glob.",
+            "description": "Search file contents for a regex pattern, optionally filtered by file glob. By default skips noise directories (.venv, __pycache__, node_modules, .git, etc.). Set include_all=true to search those directories too.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -140,6 +141,7 @@ TOOLS = [
                     "glob": {"type": "string", "description": "File glob filter, e.g. '*.py' (default: all files)"},
                     "case_insensitive": {"type": "boolean", "description": "Case-insensitive search (default: false)"},
                     "context_lines": {"type": "integer", "description": "Lines of context around each match (default: 2)"},
+                    "include_all": {"type": "boolean", "description": "Include noise dirs (.venv, __pycache__, node_modules, etc.) — default false"},
                 },
                 "required": ["pattern"],
             },
@@ -954,17 +956,35 @@ async def tool_list_dir(path: str = ".") -> str:
         return f"[error: {e}]"
 
 
-async def tool_glob(pattern: str, path: str = ".") -> str:
-    import fnmatch
+_GLOB_SKIP_DIRS = frozenset({
+    ".venv", "venv", ".env", "env",
+    "__pycache__", ".mypy_cache", ".ruff_cache", ".pytest_cache",
+    "node_modules", ".git", ".hg", ".svn",
+    "dist", "build", "*.egg-info", ".tox",
+})
+
+async def tool_glob(pattern: str, path: str = ".", include_all: bool = False) -> str:
     try:
         root = Path(path)
-        matches = sorted(root.glob(pattern))
+        all_matches = sorted(root.glob(pattern))
+        if include_all:
+            matches = all_matches
+            skipped = 0
+        else:
+            matches = [
+                m for m in all_matches
+                if not any(part in _GLOB_SKIP_DIRS for part in m.parts)
+            ]
+            skipped = len(all_matches) - len(matches)
         if not matches:
-            return "(no matches)"
+            note = f"  (skipped {skipped} files in noise dirs)" if skipped else ""
+            return f"(no matches){note}"
         lines = []
         for m in matches:
             suffix = "/" if m.is_dir() else f"  ({m.stat().st_size:,} bytes)"
             lines.append(f"{m.resolve()}{suffix}")
+        if skipped:
+            lines.append(f"  … {skipped} additional files skipped (.venv / __pycache__ / node_modules / etc.) — use include_all=true to search them")
         return "\n".join(lines)
     except Exception as e:
         return f"[error: {e}]"
@@ -976,6 +996,7 @@ async def tool_grep(
     glob: str = "**/*",
     case_insensitive: bool = False,
     context_lines: int = 2,
+    include_all: bool = False,
 ) -> str:
     import re
     try:
@@ -986,8 +1007,14 @@ async def tool_grep(
         # If path is a file, search just that file
         if root.is_file():
             candidates = [root]
-        else:
+        elif include_all:
             candidates = [f for f in root.glob(glob) if f.is_file()]
+        else:
+            candidates = [
+                f for f in root.glob(glob)
+                if f.is_file()
+                and not any(part in _GLOB_SKIP_DIRS for part in f.parts)
+            ]
 
         output_parts: list[str] = []
         total_matches = 0

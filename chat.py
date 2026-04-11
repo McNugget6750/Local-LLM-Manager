@@ -1546,17 +1546,16 @@ class ChatSession(AgentsMixin):
                 return result
             elif name == "write_file":
                 _wf_abs = os.path.abspath(self._resolve_path(args.get("path", "") or args.get("file_path", "")))
-                if os.path.exists(_wf_abs):
-                    return (f"[error: '{os.path.basename(_wf_abs)}' already exists — "
+                if os.path.exists(_wf_abs) and os.path.getsize(_wf_abs) > 0:
+                    return (f"[error: '{os.path.basename(_wf_abs)}' already exists and has content — "
                             f"use edit to modify existing files. "
-                            f"write_file is only for creating new files.]")
+                            f"write_file is only for creating new files or overwriting empty files.]")
                 result = await tool_write_file(_wf_abs, args.get("content", ""))
-                self._last_read.discard(_wf_abs)
                 return result
             elif name == "list_dir":
                 return await tool_list_dir(self._resolve_path(args.get("path", ".")))
             elif name == "glob":
-                return await tool_glob(args.get("pattern", "*"), self._resolve_path(args.get("path", ".")))
+                return await tool_glob(args.get("pattern", "*"), self._resolve_path(args.get("path", ".")), args.get("include_all", False))
             elif name == "grep":
                 return await tool_grep(
                     args.get("pattern", ""),
@@ -1564,6 +1563,7 @@ class ChatSession(AgentsMixin):
                     args.get("glob", "**/*"),
                     args.get("case_insensitive", False),
                     args.get("context_lines", 2),
+                    args.get("include_all", False),
                 )
             elif name == "ripgrep":
                 return await tool_ripgrep(
@@ -1581,7 +1581,6 @@ class ChatSession(AgentsMixin):
                 if _ed_abs not in self._last_read:
                     return f"[error: must read '{os.path.basename(_ed_abs)}' with read_file before editing it]"
                 result = await tool_edit(_ed_abs, args.get("old_string", ""), args.get("new_string", ""))
-                self._last_read.discard(_ed_abs)
                 return result
             elif name == "web_fetch":
                 return await tool_web_fetch(args.get("url", ""))
