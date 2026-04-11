@@ -37,6 +37,7 @@ from profiles import (
     _all_can_parallel,
 )
 from tools import TOOLS, _is_bare_python, _build_approval_check, _GATE_REJECTED_PREFIX
+from unicode_normalize import normalize_tool_args
 
 
 # ── Inference Slot Manager singleton ─────────────────────────────────────────
@@ -616,6 +617,7 @@ class AgentsMixin:
                             if self.tui_queue:
                                 await self.tui_queue.put({"type": "tool_done", "id": tc["id"], "name": tc_name, "result": _err, "is_error": True})
                             return tc["id"], _err
+                        tc_args = normalize_tool_args(tc_args)
                         if self.tui_queue:
                             await self.tui_queue.put({"type": "tool_start", "id": tc["id"], "name": tc_name, "args": tc_args_str})
                         elif self.compact_mode:
@@ -1112,6 +1114,7 @@ class AgentsMixin:
                                 tc_args = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"].strip() else {}
                             except json.JSONDecodeError:
                                 tc_args = {}
+                            tc_args = normalize_tool_args(tc_args)
                             if self.compact_mode:
                                 console.print(f"[dim]    ◌ {tc_name}{markup_escape(self._compact_args(tc_name, tc_args))}[/dim]")
                             tc_result = await self._dispatch_tool(tc_name, tc_args)

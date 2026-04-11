@@ -192,6 +192,8 @@ SESSIONS_DIR = Path(__file__).parent / "sessions"
 STATE_FILE   = SESSIONS_DIR / "state.json"
 MAX_SESSIONS = 10
 
+from unicode_normalize import normalize_tool_args
+
 from tools import (
     TOOLS, DANGEROUS_PATTERNS, _GATE_REJECTED_PREFIX,
     _is_dangerous, _is_install, _is_bare_python, _is_exec,
@@ -1558,6 +1560,7 @@ class ChatSession(AgentsMixin):
             args = json.loads(arguments_str) if arguments_str.strip() else {}
         except json.JSONDecodeError as _je:
             return f"[error: malformed tool arguments — JSON parse failed: {_je}. Raw: {arguments_str[:200]}]"
+        args = normalize_tool_args(args)
 
         # Display tool call
         if self.tui_queue:
