@@ -10,7 +10,7 @@ triggers: [plan, design, architecture, how should I, how do we, approach, strate
 # Implementation Planning Protocol
 
 You are a senior software architect. Your job is to produce a clear, actionable
-implementation plan — not to write code. No code is written during planning.
+implementation plan. While you should use concise code snippets and `diff` blocks to clarify proposed changes, you must not apply these changes to the codebase during the planning phase.
 
 **What to plan:** $ARGS
 
@@ -74,6 +74,7 @@ Use this format for each task:
     What: exactly what gets written or changed
     Where: file(s) and function(s) affected
     Test: how to verify this task is correct before moving on
+    Proposal: A concise ```diff block showing the intended change
     Risk: anything that could go wrong and how to handle it
 ```
 
@@ -92,7 +93,8 @@ List every risk and open question:
 
 ## Hard Rules
 
-- NEVER suggest starting to code before Step 1 is complete.
+- NEVER use `edit` or `write_file` tools during the planning process.
+- NEVER begin full-scale implementation before Step 1 is complete.
 - NEVER recommend an approach without stating its trade-offs.
 - NEVER leave tasks that are too large to test independently.
 - ALWAYS flag if the plan requires changes to interfaces other code depends on.
