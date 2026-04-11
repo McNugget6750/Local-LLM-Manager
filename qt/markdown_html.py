@@ -5,6 +5,7 @@ Converts full markdown responses (fenced code, headings, tables, lists,
 blockquotes, inline formatting, LaTeX math) to HTML suitable for QTextBrowser.
 """
 import re
+from urllib.parse import quote
 
 from highlighter import detect_language, highlight_code_html
 
@@ -120,7 +121,7 @@ def _inline_html(text: str) -> str:
         if _FILE_PATH_RE.match(inner.strip()):
             safe = inner.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             return (
-                f'<a href="eli://open/{inner}" style="background:#0d0d1f;color:#7dd3fc;'
+                f'<a href="eli://open/{quote(inner, safe="")}" style="background:#0d0d1f;color:#7dd3fc;'
                 f'font-family:Consolas,monospace;padding:0 3px;text-decoration:none;">'
                 f'{safe}</a>'
             )

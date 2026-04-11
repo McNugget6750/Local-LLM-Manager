@@ -51,7 +51,7 @@ _CONFUSABLES = str.maketrans({
 
 
 def _fix_str(v: str) -> str:
-    v = unicodedata.normalize("NFKC", v)
+    v = unicodedata.normalize("NFC", v)
     v = v.translate(_CONFUSABLES)
     v = _ZWS.sub("", v)
     return v
@@ -67,10 +67,32 @@ def _fix(v):
     return v
 
 
+# Keys that hold verbatim file content — must NOT have confusable chars mapped
+# because they may contain legitimate non-ASCII (e.g. Russian strings in source).
+_CONTENT_KEYS = frozenset({"old_string", "new_string", "content"})
+
+
+def _fix_path(v: str) -> str:
+    """Normalize a path/command/pattern string: NFC + confusables + strip ZWS."""
+    v = unicodedata.normalize("NFC", v)
+    v = v.translate(_CONFUSABLES)
+    v = _ZWS.sub("", v)
+    return v
+
+
 def normalize_tool_args(args: dict) -> dict:
     """Return a copy of args with all string values Unicode-normalized.
 
-    Applies NFKC, a Cyrillic/Greek confusables map, and zero-width char
-    stripping to every string value, recursively through nested dicts and lists.
+    For path/command/pattern keys: NFC + Cyrillic/Greek confusables map + ZWS strip.
+    For content keys (old_string, new_string, content): passed through verbatim —
+    tool_edit normalizes both sides to NFC at match time, which is the only correct
+    approach. Any normalization here would create divergence between what the model
+    read and what we compare against.
     """
-    return {k: _fix(v) for k, v in args.items()}
+    result = {}
+    for k, v in args.items():
+        if isinstance(v, str):
+            result[k] = v if k in _CONTENT_KEYS else _fix_path(v)
+        else:
+            result[k] = _fix(v)
+    return result

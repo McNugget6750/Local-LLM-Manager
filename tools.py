@@ -892,7 +892,9 @@ async def tool_bash(command: str, timeout: int = 30, cwd: Path | None = None) ->
 
 async def tool_read_file(path: str, offset: int = 1, limit: int = 200) -> str:
     try:
-        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        import unicodedata as _ud
+        raw = Path(path).read_text(encoding="utf-8", errors="replace")
+        lines = _ud.normalize("NFC", raw).splitlines()
         total = len(lines)
         start = max(0, offset - 1)          # convert 1-based to 0-based
         end   = min(total, start + limit)
@@ -923,6 +925,8 @@ async def tool_write_file(path: str, content: str) -> str:
             )
         )
     try:
+        import unicodedata as _ud
+        content = _ud.normalize("NFC", content)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         lines = content.splitlines()
@@ -1083,17 +1087,24 @@ async def tool_ripgrep(
 
 async def tool_edit(path: str, old_string: str, new_string: str) -> str:
     try:
+        import unicodedata as _ud
         p = Path(path)
         if not p.exists():
             return f"[error: file not found: {path}]"
         text = p.read_text(encoding="utf-8", errors="replace")
-        count = text.count(old_string)
+        # Normalize both file content and search strings to NFC so the round-trip
+        # (file → read → model → tool args → match) is always consistent.
+        # NFC is safe for all source code — it only composes combining marks.
+        text_n  = _ud.normalize("NFC", text)
+        old_n   = _ud.normalize("NFC", old_string)
+        new_n   = _ud.normalize("NFC", new_string)
+        count = text_n.count(old_n)
         if count == 0:
             # Give the model a fuzzy hint: find the line in the file most similar to
             # the first line of old_string so it can correct its old_string.
             import difflib as _difflib
-            target_first = old_string.splitlines()[0].strip() if old_string.strip() else ""
-            file_lines = text.splitlines()
+            target_first = old_n.splitlines()[0].strip() if old_n.strip() else ""
+            file_lines = text_n.splitlines()
             if target_first:
                 matches = _difflib.get_close_matches(target_first, file_lines, n=3, cutoff=0.4)
                 if matches:
@@ -1105,12 +1116,12 @@ async def tool_edit(path: str, old_string: str, new_string: str) -> str:
             return "[error: old_string not found — use read_file to get the exact content before editing]"
         if count > 1:
             return f"[error: old_string found {count} times — make it more specific]"
-        new_text = text.replace(old_string, new_string, 1)
+        new_text = text_n.replace(old_n, new_n, 1)
         p.write_text(new_text, encoding="utf-8")
         import difflib as _difflib
         diff = list(_difflib.unified_diff(
-            old_string.splitlines(keepends=False),
-            new_string.splitlines(keepends=False),
+            old_n.splitlines(keepends=False),
+            new_n.splitlines(keepends=False),
             fromfile=f"a/{p.name}",
             tofile=f"b/{p.name}",
             lineterm="",
