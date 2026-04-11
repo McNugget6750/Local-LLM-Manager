@@ -650,7 +650,8 @@ class AgentsMixin:
                         # Apply same approval rules as top-level _call_tool
                         _sa_ask, _sa_title, _sa_msg, _sa_style = _build_approval_check(
                             tc_name, tc_args, self.approval_level,
-                            prefix="Sub-Agent — ", session_rules=self.session_rules
+                            prefix="Sub-Agent — ", session_rules=self.session_rules,
+                            cwd=self.cwd,
                         )
                         if _sa_ask:
                             import json as _json

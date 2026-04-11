@@ -573,6 +573,19 @@ def _load_skills() -> dict:
     return result
 
 
+def _check_skill_triggers(user_input: str) -> tuple[str | None, str]:
+    """Check if any skill triggers are present in user input."""
+    skills = _load_skills()
+    for name, skill in skills.items():
+        triggers = skill.get("triggers", [])
+        if isinstance(triggers, str):
+            triggers = [triggers]
+        for trigger in triggers:
+            if trigger and trigger in user_input:
+                return name, user_input
+    return None, ""
+
+
 async def _invoke_skill(skill_name: str, skill_args: str, session: "ChatSession") -> bool:
     """Invoke a named skill. Returns True if found and invoked, False otherwise."""
     skills = _load_skills()
@@ -623,12 +636,15 @@ async def _invoke_skill(skill_name: str, skill_args: str, session: "ChatSession"
         session.messages.append({"role": "user", "content": report_text})
         session.messages.append({"role": "assistant", "content": "Understood. The agent report is in context."})
     else:
+        if not session.tui_queue:
+            console.print(f"[dim]Loading skill '[bold]{skill_name}[/bold]'...[/dim]")
         try:
             await session.send_and_stream(expanded)
         except Exception as e:
             console.print(f"[red]Could not send skill to model: {e}[/red]")
             if session.tui_queue:
                 await session.tui_queue.put({"type": "error", "text": f"Server not reachable: {e}"})
+
     return True
 
 
@@ -1627,7 +1643,7 @@ class ChatSession(AgentsMixin):
 
         # Approval guard
         _ask, _ask_title, _ask_msg, _ask_style = _build_approval_check(
-            name, args, self.approval_level, session_rules=self.session_rules
+            name, args, self.approval_level, session_rules=self.session_rules, cwd=self.cwd
         )
         if _ask:
             import json as _json
@@ -1875,6 +1891,12 @@ async def main():
                 except Exception as e:
                     console.print(f"[red]Error: {e}[/red]")
                 continue  # handle_slash_command always handles the command (returns True)
+
+            # Automatic skill trigger activation
+            skill_name, skill_args = _check_skill_triggers(user_input)
+            if skill_name:
+                if await _invoke_skill(skill_name, skill_args, chat):
+                    continue
 
             # Rule below the user's input, above the response
             console.print(Rule(style="dim"))

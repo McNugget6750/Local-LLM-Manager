@@ -37,11 +37,11 @@ def main() -> None:
             break
 
     app = QApplication(sys.argv)
-    app.setApplicationName("qwen3-manager")
+    app.setApplicationName("Open Harness")
     app.setStyleSheet(QSS)
 
     win = MainWindow()
-    win.setWindowTitle("qwen3-manager")
+    win.setWindowTitle("Open Harness")
     win.setMinimumSize(1280, 1024)
     win.show()
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Qwen3 Server Manager
+Open LLM Server Manager
 Desktop UI for managing ik_llama.cpp server instances.
 """
 
@@ -104,21 +104,21 @@ def _get_gpu_stats():
 
 
 
-PREFERRED_MODEL = "Qwen3-Coder-30B  \u00b7  Q6_K  \u00b7  96k ctx"
 
-def _load_models():
+def _load_models() -> tuple[dict, str | None]:
+    """Return (models_dict, default_name_or_None)."""
     if os.path.exists(COMMANDS_FILE):
         try:
             with open(COMMANDS_FILE) as f:
                 saved = json.load(f)
-            # Only keep list entries with non-_ keys (skips _meta and similar)
+            default = saved.get("_default") if isinstance(saved.get("_default"), str) else None
             models = {k: v for k, v in saved.items()
                       if not k.startswith("_") and isinstance(v, list)}
             if models:
-                return models
+                return models, default
         except Exception:
             pass
-    return dict(MODELS_DEFAULT)
+    return dict(MODELS_DEFAULT), None
 
 
 def _save_models(models):
@@ -189,12 +189,12 @@ def _str_to_cmd(s: str) -> list:
 class ServerManager(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Qwen3 Server Manager")
+        self.title("Open LLM Server Manager")
         self.configure(bg=BG)
         self.geometry("760x940")
         self.minsize(660, 740)
 
-        self._models      = _load_models()
+        self._models, self._default_model = _load_models()
         self._proc        = None
         self._voice_proc  = None
         self._log_q       = queue.Queue()
@@ -235,7 +235,7 @@ class ServerManager(tk.Tk):
         # Header
         hdr = tk.Frame(self, bg=PANEL, padx=14, pady=10)
         hdr.pack(fill="x")
-        tk.Label(hdr, text="Qwen3 Server Manager", bg=PANEL, fg=FG,
+        tk.Label(hdr, text="Open LLM Server Manager", bg=PANEL, fg=FG,
                  font=("Segoe UI", 13, "bold")).pack(side="left")
         tk.Label(hdr, text=f"port {PORT}", bg=PANEL, fg=FG_DIM,
                  font=("Segoe UI", 9)).pack(side="right", padx=4)
@@ -251,7 +251,7 @@ class ServerManager(tk.Tk):
         self._small_btn(sel_hdr, "＋ Add Model", "#1a5c3a",
                         self._add_model).pack(side="right")
 
-        _default = PREFERRED_MODEL if PREFERRED_MODEL in self._models else list(self._models.keys())[0]
+        _default = self._default_model if self._default_model in self._models else list(self._models.keys())[0]
         self._model_var = tk.StringVar(value=_default)
         self._combo = ttk.Combobox(sel, textvariable=self._model_var,
                                    values=list(self._models.keys()),

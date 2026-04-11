@@ -536,6 +536,86 @@ def _is_exec(command: str) -> bool:
     return bool(_re.search(r'\b\S+\.(py|js|sh|bat|ps1|exe)\b', candidate, _re.IGNORECASE))
 
 
+def _split_bash_commands(command: str) -> list[str]:
+    """Split a shell command string into individual sub-commands on &&, ||, ;, |."""
+    return [s.strip() for s in _re.split(r'&&|\|\||[;|]', command) if s.strip()]
+
+
+def _extract_paths_from_subcmd(subcmd: str) -> list[str]:
+    """Heuristically extract file path candidates from a single shell sub-command.
+
+    Covers:
+    - Positional args (tokens not starting with -)
+    - --flag=value and -f value forms
+    - Redirect targets: > file, >> file, 2> file
+    """
+    candidates = []
+    tokens = subcmd.split()
+    if not tokens:
+        return candidates
+    skip_next = False
+    for i, tok in enumerate(tokens):
+        if skip_next:
+            skip_next = False
+            continue
+        if i == 0:
+            continue  # skip the command itself
+        # redirect target
+        if tok in (">", ">>", "2>", "2>>", "<"):
+            if i + 1 < len(tokens):
+                candidates.append(tokens[i + 1])
+                skip_next = True
+            continue
+        if tok.startswith(">>") or tok.startswith(">") or tok.startswith("2>"):
+            after = _re.sub(r'^2?>>?', '', tok)
+            if after:
+                candidates.append(after)
+            continue
+        # --flag=value
+        if tok.startswith("--") and "=" in tok:
+            candidates.append(tok.split("=", 1)[1])
+            continue
+        # -f value (single-char flag followed by path-like token)
+        if _re.match(r'^-[a-zA-Z]$', tok) and i + 1 < len(tokens):
+            candidates.append(tokens[i + 1])
+            skip_next = True
+            continue
+        # skip other flags
+        if tok.startswith("-"):
+            continue
+        candidates.append(tok)
+    return candidates
+
+
+def _analyze_bash_command(command: str, cwd: Path) -> list[tuple[str, str, bool]]:
+    """Analyze a bash command for file paths outside cwd.
+
+    Splits on shell operators, extracts path candidates from each sub-command,
+    resolves them to absolute paths relative to cwd, and checks containment.
+
+    Returns a list of (subcmd, resolved_abs_path, within_cwd) tuples — one entry
+    per (subcmd, path) pair where the path could be resolved. Subcmds with no
+    path candidates are omitted.
+    """
+    results = []
+    cwd_resolved = cwd.resolve()
+    subcmds = _split_bash_commands(command)
+    for subcmd in subcmds:
+        paths = _extract_paths_from_subcmd(subcmd)
+        for raw in paths:
+            # Strip quotes
+            raw = raw.strip("'\"")
+            if not raw or raw.startswith("$"):
+                continue
+            try:
+                resolved = (cwd_resolved / raw).resolve()
+                within = str(resolved).startswith(str(cwd_resolved))
+                results.append((subcmd, str(resolved), within))
+            except Exception:
+                continue
+    return results
+
+
 def _fmt_tool_args(name: str, args: dict) -> str:
     """Format tool args as a human-readable string for approval dialogs."""
     if not args:
@@ -565,14 +645,25 @@ def _fmt_tool_args(name: str, args: dict) -> str:
     return "\n".join(lines)
 
 
-def _matches_session_rule(name: str, args: dict, rules: list[str]) -> bool:
+def _matches_session_rule(name: str, args: dict, rules: list[str], cwd: Path | None = None) -> bool:
     """Return True if this tool call is covered by a session-level allow rule."""
-    path = args.get("path", "")
-    cmd  = args.get("command", "")
+    raw_path = args.get("path", "")
+    cmd = args.get("command", "")
+
+    # Resolve path to absolute so relative paths match prefix rules correctly.
+    if raw_path and cwd:
+        try:
+            resolved_path = str((cwd / raw_path).resolve())
+        except Exception:
+            resolved_path = raw_path
+    else:
+        resolved_path = raw_path
+
     for rule in rules:
         if rule.startswith("path_prefix:"):
             prefix = rule[len("path_prefix:"):]
-            if path and os.path.normcase(path).startswith(os.path.normcase(prefix)):
+            check = resolved_path or raw_path
+            if check and os.path.normcase(check).startswith(os.path.normcase(prefix)):
                 return True
         elif rule.startswith("cmd_pattern:"):
             pattern = rule[len("cmd_pattern:"):]
@@ -591,10 +682,12 @@ def _build_approval_check(
     approval_level: str,
     prefix: str = "",
     session_rules: list[str] | None = None,
+    cwd: Path | None = None,
 ) -> tuple[bool, str, str, str]:
     """Return (ask_needed, title, message, style) for a tool call approval check.
 
     `prefix` is prepended to titles (e.g. "Sub-Agent — ") to distinguish sub-agent prompts.
+    `cwd` is used to resolve relative paths for session-rule matching and bash path analysis.
     Returns ask_needed=False when no approval is required.
     """
     if approval_level == "yolo":
@@ -619,6 +712,28 @@ def _build_approval_check(
             "Run it? Or install yourself and press Enter when ready."
         )
         ask_style = "yellow"
+    elif name == "bash" and cmd and cwd:
+        # Check for paths outside CWD in bash commands (handles &&-chained cmds and ../ paths)
+        outside = [
+            (subcmd, resolved)
+            for subcmd, resolved, within in _analyze_bash_command(cmd, cwd)
+            if not within
+        ]
+        if outside:
+            ask_needed = True
+            ask_title = f"{prefix}Command Targets Outside CWD"
+            lines = [f"Command targets path(s) outside the current working directory:\n"]
+            for subcmd, resolved in outside:
+                lines.append(f"  Command : {subcmd}")
+                lines.append(f"  Resolves: {resolved}\n")
+            lines.append(f"CWD: {cwd}\n\nFull command:\n{cmd}")
+            ask_msg = "\n".join(lines)
+            ask_style = "yellow"
+        elif approval_level == "auto" and _is_exec(cmd):
+            ask_needed = True
+            ask_title = f"{prefix}Script Execution"
+            ask_msg = f"Script execution detected:\n\n{_fmt_tool_args(name, args)}"
+            ask_style = "yellow"
     elif name == "bash" and approval_level == "auto" and _is_exec(cmd):
         ask_needed = True
         ask_title = f"{prefix}Script Execution"
@@ -636,7 +751,7 @@ def _build_approval_check(
             ask_msg = f"Write operation — {name}:\n\n{_fmt_tool_args(name, args)}"
 
     # Session rules can suppress non-dangerous prompts (install/exec/ask-writes/ask-all)
-    if ask_needed and ask_style != "red" and session_rules and _matches_session_rule(name, args, session_rules):
+    if ask_needed and ask_style != "red" and session_rules and _matches_session_rule(name, args, session_rules, cwd=cwd):
         return False, "", "", "yellow"
 
     return ask_needed, ask_title, ask_msg, ask_style
