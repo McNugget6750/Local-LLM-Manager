@@ -49,7 +49,10 @@ For each phase requiring definition, follow this iterative process:
 ### 3. Review Phase
 - Present the task breakdown to the user.
 - Show dependencies, sequencing, and parallel opportunities.
-- **Wait for user confirmation** before proceeding to the next phase.
+- **Wait for user confirmation** before proceeding to the next phase - unless specifically instructed to work through the entire plan.
+
+### 4. Final Step
+- Use a review agent to compare the implementation plan with what's actually been implemented.
 
 ## Plan Structure & Metadata
 

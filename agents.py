@@ -239,9 +239,12 @@ class AgentsMixin:
             _groups.setdefault(_tgt, []).append((_tc, _args))
         _ordered = sorted(_groups.items(), key=lambda kv: kv[0] != _original_model)
 
-        # Background eligibility: all agents target the current model + a free slot exists
+        # Background eligibility: all agents target the current model + at least 2 slots exist
+        # (one for the background agent, one for Eli's next turn — single-slot servers
+        #  would just serialize with extra overhead, so we skip background dispatch there)
         _bg_eligible = (
-            _ism.total_slots() - _ism.in_use() >= 1
+            _ism.total_slots() >= 2
+            and _ism.total_slots() - _ism.in_use() >= 1
             and len(_groups) == 1
             and list(_groups.keys())[0] == _original_model
         )
@@ -260,6 +263,12 @@ class AgentsMixin:
             # Each task acquires its own ISM slot on start, releases on finish.
             for _i, (_tc, _args) in enumerate(zip(batch, batch_args)):
                 _lbl = f"Agent {_i + 1}" if len(batch) > 1 else ""
+                _bg_task = _args.get("task", "")
+                if not _bg_task or not str(_bg_task).strip():
+                    _err = "[error: spawn_agent called with empty task — agent not started]"
+                    self.messages.append({"role": "tool", "tool_call_id": _tc["id"], "content": _err})
+                    await emit_fn("spawn_agent", _tc["id"], _err)
+                    continue
                 _placeholder = "[background: agent dispatched — result pending]"
                 self.messages.append({"role": "tool", "tool_call_id": _tc["id"], "content": _placeholder})
                 await emit_fn("spawn_agent", _tc["id"], _placeholder)
@@ -995,7 +1004,8 @@ class AgentsMixin:
                 spec["model"] = None
 
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        slug = label.lower().replace(" ", "-")[:32] if label else "run"
+        _slug_raw = _re.sub(r'[<>:"/\\|?*]', '', label.lower()).replace(" ", "-").strip("-") if label else ""
+        slug = _slug_raw[:32].strip("-") or "run"
         queue_dir = SESSIONS_DIR / f"queue_{ts}_{slug}"
         queue_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1021,6 +1031,17 @@ class AgentsMixin:
             think = spec.get("think_level") or self.think_level
             tools_wl = spec.get("tools")
             task = spec.get("task", "")
+            if not task or not task.strip():
+                results.append({
+                    "index": idx, "system_prompt": spec.get("system_prompt", ""),
+                    "task": "", "model": target_model,
+                    "timeout_seconds": timeout_s, "status": "error",
+                    "result": f"[error: queue_agents agent {agent_num}/{total} has empty task — skipped. Provide a non-empty task string.]",
+                    "duration_seconds": 0.0,
+                })
+                if not self.tui_queue:
+                    console.print(f"[red]  Agent {agent_num}/{total} skipped — empty task[/red]")
+                continue
             sp = spec.get("system_prompt", "")
 
             # Resolve profile → system prompt, auto-extract recommended model

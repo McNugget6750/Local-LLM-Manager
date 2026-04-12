@@ -1564,7 +1564,16 @@ class MainWindow(QMainWindow):
             _AGENT_STRIPE = "#fbbf24"
             _AGENT_DISPATCH_BG = "#131000"
             _AGENT_LABEL_COLOR = "#e040fb"
-            task_raw = str(a.get("task", a.get("tasks", "")))
+            if name == "queue_agents":
+                agents_list = a.get("agents", [])
+                if isinstance(agents_list, list) and agents_list:
+                    n = len(agents_list)
+                    first = agents_list[0].get("task", "") if isinstance(agents_list[0], dict) else ""
+                    task_raw = f"{n} agents — {first}" if first else f"{n} agent(s) queued"
+                else:
+                    task_raw = a.get("label", "queued agents") or "queued agents"
+            else:  # spawn_agent
+                task_raw = str(a.get("task", ""))
             task_safe = task_raw.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
             agent_num = self._agent_counter
             html = (
@@ -1637,12 +1646,12 @@ class MainWindow(QMainWindow):
         is_agent_tool = name in ("spawn_agent", "queue_agents")
 
         if is_agent_tool:
-            self._agent_nesting = max(0, self._agent_nesting - 1)
             if result.startswith("[background:"):
                 # Placeholder tool_done — agent is still running in background.
-                # Keep the context bar slot alive so usage events can update it.
-                # The real tool_done from _run_background_agent will call remove_agent.
+                # Do NOT decrement nesting; keep _agent_nesting > 0 so sub-tool calls
+                # that arrive via _drain_bg_agents are still routed to the agent view.
                 return
+            self._agent_nesting = max(0, self._agent_nesting - 1)
             self._ctx_bars.remove_agent(tool_id)
             color = agent_color or "#22d3ee"
             indent = ""
@@ -1693,7 +1702,8 @@ class MainWindow(QMainWindow):
                 f'{error_span}'
                 f'</td></tr></table>'
             )
-            self._append(self._full_view, done_html)
+            _target_view = self._agent_view if self._agent_nesting > 0 else self._full_view
+            self._append(_target_view, done_html)
 
             # For edit/write_file, render a unified diff block
             if name in ("edit", "write_file") and not is_error and pending:
@@ -1713,8 +1723,8 @@ class MainWindow(QMainWindow):
                         lineterm="",
                     ))
                     if diff_text:
-                        self._append(self._full_view, _diff_block_html(diff_text))
-                        self._auto_scroll(self._full_view)
+                        self._append(_target_view, _diff_block_html(diff_text))
+                        self._auto_scroll(_target_view)
 
             # Follow along: silently open the file and jump to the relevant line
             if (self._follow_along_cb.isChecked()
