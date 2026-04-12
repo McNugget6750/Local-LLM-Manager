@@ -43,6 +43,57 @@ from rich.text import Text
 
 # ── Constants & shared resources ─────────────────────────────────────────────
 from constants import BASE_URL, CONTROL_URL, TTS_URL, console
+
+# ── LaTeX math → Unicode for TUI display ─────────────────────────────────────
+_LATEX_SYMBOLS = [
+    (r"\rightarrow",  "→"), (r"\leftarrow",   "←"),
+    (r"\Rightarrow",  "⇒"), (r"\Leftarrow",   "⇐"),
+    (r"\implies",        "⟹"), (r"\iff",            "⟺"),
+    (r"\leftrightarrow", "↔"), (r"\Leftrightarrow", "⇔"),
+    (r"\uparrow",     "↑"), (r"\downarrow",   "↓"),
+    (r"\times",       "×"), (r"\div",         "÷"),
+    (r"\pm",          "±"), (r"\mp",          "∓"),
+    (r"\leq",         "≤"), (r"\geq",         "≥"),
+    (r"\ll",          "≪"), (r"\gg",          "≫"),
+    (r"\neq",         "≠"), (r"\approx",      "≈"),
+    (r"\sim",         "~"), (r"\simeq",       "≃"),
+    (r"\equiv",       "≡"), (r"\propto",      "∝"),
+    (r"\infty",       "∞"), (r"\cdot",        "·"),
+    (r"\ldots",       "…"), (r"\dots",        "…"),
+    (r"\in",          "∈"), (r"\notin",       "∉"),
+    (r"\subset",      "⊂"), (r"\supset",      "⊃"),
+    (r"\cup",         "∪"), (r"\cap",         "∩"),
+    (r"\sqrt",        "√"), (r"\sum",         "∑"),
+    (r"\prod",        "∏"), (r"\int",         "∫"),
+    (r"\partial",     "∂"), (r"\nabla",       "∇"),
+    (r"\forall",      "∀"), (r"\exists",      "∃"),
+    (r"\neg",         "¬"), (r"\land",        "∧"),
+    (r"\lor",         "∨"), (r"\oplus",       "⊕"),
+    (r"\alpha",  "α"), (r"\beta",  "β"), (r"\gamma", "γ"),
+    (r"\delta",  "δ"), (r"\epsilon","ε"), (r"\zeta",  "ζ"),
+    (r"\eta",    "η"), (r"\theta", "θ"), (r"\iota",  "ι"),
+    (r"\kappa",  "κ"), (r"\lambda","λ"), (r"\mu",    "μ"),
+    (r"\nu",     "ν"), (r"\xi",    "ξ"), (r"\pi",    "π"),
+    (r"\rho",    "ρ"), (r"\sigma", "σ"), (r"\tau",   "τ"),
+    (r"\upsilon","υ"), (r"\phi",   "φ"), (r"\chi",   "χ"),
+    (r"\psi",    "ψ"), (r"\omega", "ω"),
+    (r"\Gamma",  "Γ"), (r"\Delta", "Δ"), (r"\Theta", "Θ"),
+    (r"\Lambda", "Λ"), (r"\Pi",    "Π"), (r"\Sigma", "Σ"),
+    (r"\Phi",    "Φ"), (r"\Psi",   "Ψ"), (r"\Omega", "Ω"),
+]
+import re as _re_latex
+_LATEX_INLINE_RE = _re_latex.compile(r'\$([^$\n]+?)\$')
+
+def _render_latex(text: str) -> str:
+    """Replace inline LaTeX math ($...$) with Unicode equivalents for TUI display."""
+    def _sub(m):
+        expr = m.group(1)
+        for latex, uni in _LATEX_SYMBOLS:
+            expr = expr.replace(latex, uni)
+        # Strip any remaining backslash commands we don't know
+        expr = _re_latex.sub(r'\\[a-zA-Z]+', '', expr).strip()
+        return expr if expr else m.group(0)
+    return _LATEX_INLINE_RE.sub(_sub, text)
 MODEL = "auto"
 
 # ── Agents, slot manager, and server control ─────────────────────────────────
@@ -193,6 +244,9 @@ STATE_FILE   = SESSIONS_DIR / "state.json"
 MAX_SESSIONS = 10
 
 from unicode_normalize import normalize_tool_args
+from sanity_detector import SanityDetector, SanityError
+
+_ELI_MAX_SANITY_RETRIES = 1   # Eli gets 1 retry (2 total attempts) per user turn
 
 from tools import (
     TOOLS, DANGEROUS_PATTERNS, _GATE_REJECTED_PREFIX,
@@ -705,6 +759,9 @@ class ChatSession(AgentsMixin):
         self._last_read:            set[str]       = set()       # abs paths freshly read; cleared after write/edit
         self._eli_slot:             "SlotHandle | None" = None   # held during send_and_stream; released before inline agents
         self.backend: str           = "llamacpp"                 # "llamacpp" | "vllm" — set by _health_check
+        self._sanity_retry_count: int = 0                        # resets on each new user message
+        self._sanity_detector: SanityDetector = SanityDetector()
+        self._telegram_origin: bool = False                      # set when message arrived via Telegram bridge
 
     async def __aenter__(self):
         await self._health_check()
@@ -1037,8 +1094,14 @@ class ChatSession(AgentsMixin):
         if len(self.messages) > self._n_fixed and self.messages[-1]["role"] == "user":
             self.messages.pop()
 
-    async def send_and_stream(self, user_text: str, plan_mode: bool = False):
+    async def send_and_stream(self, user_text: str, plan_mode: bool = False,
+                              _sanity_retry: bool = False):
         self._eli_slot = await _ism.acquire("Eli", timeout_secs=None, bypass_capacity=True)
+        if not _sanity_retry:
+            # Fresh user turn — reset sanity state
+            self._sanity_retry_count = 0
+            self._sanity_detector.reset()
+            self._telegram_origin = False
         try:
             # Inject any completed background agent results before Eli sees this message
             if self._pending_bg_results:
@@ -1153,6 +1216,13 @@ class ChatSession(AgentsMixin):
                             response,
                             label=f"send_and_stream | model={self.model} | {BASE_URL}",
                         ):
+                            if event_type in ("think", "text"):
+                                _sd_trigger = self._sanity_detector.feed(
+                                    data, mode="think" if event_type == "think" else "text"
+                                )
+                                if _sd_trigger:
+                                    raise SanityError(_sd_trigger)
+
                             if event_type == "think":
                                 if _t_first_token is None:
                                     _t_first_token = asyncio.get_event_loop().time()
@@ -1192,7 +1262,7 @@ class ChatSession(AgentsMixin):
 
                                     text_buf += data
                                     assistant_content += data
-                                    live.update(Markdown(text_buf))
+                                    live.update(Markdown(_render_latex(text_buf)))
 
                             elif event_type == "tool_calls":
                                 tool_calls_received = data
@@ -1206,7 +1276,7 @@ class ChatSession(AgentsMixin):
                                 if self.tui_queue:
                                     await self.tui_queue.put({"type": "text_done", "text": text_buf})
                                 else:
-                                    live.update(Markdown(text_buf) if text_buf else Text(""))
+                                    live.update(Markdown(_render_latex(text_buf)) if text_buf else Text(""))
 
                 # Update token tracking
                 if usage_data:
@@ -1416,10 +1486,45 @@ class ChatSession(AgentsMixin):
             else:
                 console.print(Rule(style="dim"))
             self._autosave()
+        except SanityError as _se:
+            # Discard partial response — pop last user message so it can be re-sent
+            if self.messages and self.messages[-1]["role"] == "user":
+                self.messages.pop()
+            # Also remove the pulse that was injected before the user message
+            if (self.messages and self.messages[-1].get("role") == "system"
+                    and self.messages[-1].get("content", "").startswith(_PULSE_PREFIX)):
+                self.messages.pop()
+            self._sanity_retry_count += 1
+            _trigger = str(_se)
+            if self._sanity_retry_count <= _ELI_MAX_SANITY_RETRIES:
+                _notice = f"⚠ Sanity check triggered ({_trigger}) — retrying automatically…"
+                if self.tui_queue:
+                    await self.tui_queue.put({"type": "system", "text": _notice})
+                else:
+                    console.print(f"[yellow]{_notice}[/yellow]")
+                # Inject system warning so Eli knows what happened, then re-submit
+                _warn = (
+                    f"[SANITY CHECK FAILED — RETRY ATTEMPT {self._sanity_retry_count} of {_ELI_MAX_SANITY_RETRIES}]\n"
+                    f"Your previous response was aborted by the sanity detector ({_trigger}).\n"
+                    "The output entered a degenerate repetition loop and was discarded entirely.\n"
+                    "Please retry from scratch. Do not repeat or continue the previous output."
+                )
+                self.messages.insert(self._n_fixed, {"role": "system", "content": _warn})
+                # Re-submit the original user text as a retry (slot is released in finally first)
+                self._eli_slot_sanity_retry = (user_text, plan_mode)
+            else:
+                await self._sanity_abort(_trigger)
         finally:
             if self._eli_slot is not None:
                 await self._eli_slot.release()
                 self._eli_slot = None
+        # Handle sanity retry outside the slot so the new turn can acquire it cleanly
+        if hasattr(self, "_eli_slot_sanity_retry"):
+            _retry_text, _retry_plan = self._eli_slot_sanity_retry
+            del self._eli_slot_sanity_retry
+            self._sanity_detector.reset()
+            await self.send_and_stream(_retry_text, plan_mode=_retry_plan, _sanity_retry=True)
+            return
         # "done" is emitted AFTER the slot is released so _drain_queue can
         # acquire the slot for the next turn before it returns.
         if self.tui_queue:
@@ -1532,6 +1637,42 @@ class ChatSession(AgentsMixin):
             except (EOFError, KeyboardInterrupt):
                 reason = ""
             return False, reason
+
+    # ── Sanity abort ─────────────────────────────────────────────────────────
+
+    async def _sanity_abort(self, trigger: str) -> None:
+        """Display the full abort message and notify Telegram if applicable."""
+        _msg = (
+            f"The model entered a degenerate output loop twice in a row.\n"
+            f"Trigger: {trigger}\n\n"
+            "Suggestions:\n"
+            "  • Rephrase your prompt — shorter or more specific often helps\n"
+            "  • Try a different model profile (lower quantisation or smaller context)\n"
+            "  • Reduce context window size or clear history with /clear\n"
+            "  • Restart the inference server if the problem persists"
+        )
+        if self.tui_queue:
+            await self.tui_queue.put({"type": "error", "text": f"⚠ Sanity Check — Inference Aborted\n\n{_msg}"})
+        else:
+            console.print(Panel(_msg, title="[red]⚠ Sanity Check — Inference Aborted[/red]", border_style="red"))
+        if self._telegram_origin:
+            await self._notify_telegram_sanity_abort(trigger)
+
+    async def _notify_telegram_sanity_abort(self, trigger: str) -> None:
+        """Send a sanity abort notice back through the Telegram bridge."""
+        _tg_msg = (
+            f"⚠ Inference aborted (sanity check: {trigger})\n\n"
+            "The model entered a degenerate loop and could not recover.\n"
+            "Please try rephrasing your prompt, or try again later."
+        )
+        try:
+            import urllib.request as _ur, json as _json
+            _body = _json.dumps({"message": _tg_msg}).encode()
+            _req = _ur.Request("http://localhost:1237/chat", data=_body,
+                               headers={"Content-Type": "application/json"}, method="POST")
+            _ur.urlopen(_req, timeout=5)
+        except Exception:
+            pass  # Telegram bridge may not be running — fail silently
 
     @staticmethod
     def _validate_path_arg(raw: str) -> str | None:

@@ -18,6 +18,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from sanity_detector import SanityDetector, SanityError
+
+_AGENT_MAX_SANITY_RETRIES = 4   # agents get 4 retries (5 total attempts)
+
 log = logging.getLogger(__name__)
 
 import httpx
@@ -502,299 +506,357 @@ class AgentsMixin:
 
         final_text = ""
         _hit_max_iter = True  # cleared when agent breaks naturally
+        _sanity_detector = SanityDetector()
+        _sanity_triggered: str | None = None
         try:
-            for _iter in range(max_iter):
-                temperature = 0.3 if think == "deep" else 0.6
-                think_kwargs: dict = {}
-                if self.backend == "llamacpp":
-                    if think == "off":
-                        think_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-                    else:
-                        think_kwargs["chat_template_kwargs"] = {"enable_thinking": True}
-
-                payload = {
-                    "model": self.model,
-                    "messages": messages,
-                    "tools": sub_tools,
-                    "tool_choice": "auto",
-                    "stream": True,
-                    "stream_options": {"include_usage": True},
-                    "temperature": temperature,
-                    **think_kwargs,
-                }
-
-                thinking_buf = ""
-                text_buf = ""
-                tool_calls_received = []
-                assistant_content = ""
-                _usage_data: dict = {}
-
-                async with self.client.stream(
-                    "POST",
-                    f"{BASE_URL}/v1/chat/completions",
-                    json=payload,
-                    headers={"Accept": "text/event-stream"},
-                ) as response:
-                    if response.status_code >= 400:
-                        body = await response.aread()
-                        raise RuntimeError(f"HTTP {response.status_code}: {body.decode('utf-8', errors='replace')[:600]}")
-                    _live_ctx = _NullLive() if (self.tui_queue or self.compact_mode) else Live(console=console, refresh_per_second=8)
-                    with _live_ctx as live:
-                        show_thinking = think != "off" and not self.compact_mode
-
-                        async for event_type, data in stream_events(
-                            response,
-                            label=f"spawn_agent[iter] | model={model or self.model} | {BASE_URL}",
-                        ):
-                            if event_type == "think":
-                                thinking_buf += data
-                                if self.tui_queue:
-                                    await self.tui_queue.put({"type": "think_token", "text": data})
-                                elif show_thinking:
-                                    live.update(Panel(
-                                        Text(thinking_buf, style="dim italic"),
-                                        title="[dim cyan]Agent Thinking...[/dim cyan]",
-                                        border_style="dim cyan",
-                                    ))
-                            elif event_type == "text":
-                                if self.tui_queue:
-                                    text_buf += data
-                                    assistant_content += data
-                                    final_text = assistant_content
-                                    await self.tui_queue.put({"type": "text_token", "text": data, "source": "agent", "agent_label": agent_label})
-                                else:
-                                    if thinking_buf and show_thinking:
-                                        live.update(Text(""))
-                                        live.stop()
-                                        console.print(Panel(
+            for _sanity_attempt in range(_AGENT_MAX_SANITY_RETRIES + 1):
+                _sanity_detector.reset()
+                _sanity_triggered = None
+                for _iter in range(max_iter):
+                    temperature = 0.3 if think == "deep" else 0.6
+                    think_kwargs: dict = {}
+                    if self.backend == "llamacpp":
+                        if think == "off":
+                            think_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+                        else:
+                            think_kwargs["chat_template_kwargs"] = {"enable_thinking": True}
+    
+                    payload = {
+                        "model": self.model,
+                        "messages": messages,
+                        "tools": sub_tools,
+                        "tool_choice": "auto",
+                        "stream": True,
+                        "stream_options": {"include_usage": True},
+                        "temperature": temperature,
+                        **think_kwargs,
+                    }
+    
+                    thinking_buf = ""
+                    text_buf = ""
+                    tool_calls_received = []
+                    assistant_content = ""
+                    _usage_data: dict = {}
+    
+                    async with self.client.stream(
+                        "POST",
+                        f"{BASE_URL}/v1/chat/completions",
+                        json=payload,
+                        headers={"Accept": "text/event-stream"},
+                    ) as response:
+                        if response.status_code >= 400:
+                            body = await response.aread()
+                            raise RuntimeError(f"HTTP {response.status_code}: {body.decode('utf-8', errors='replace')[:600]}")
+                        _live_ctx = _NullLive() if (self.tui_queue or self.compact_mode) else Live(console=console, refresh_per_second=8)
+                        with _live_ctx as live:
+                            show_thinking = think != "off" and not self.compact_mode
+    
+                            async for event_type, data in stream_events(
+                                response,
+                                label=f"spawn_agent[iter] | model={model or self.model} | {BASE_URL}",
+                            ):
+                                if event_type in ("think", "text"):
+                                    _sd_check = _sanity_detector.feed(
+                                        data, mode="think" if event_type == "think" else "text"
+                                    )
+                                    if _sd_check:
+                                        _sanity_triggered = _sd_check
+                                        break  # break out of the async-for stream loop
+    
+                                if event_type == "think":
+                                    thinking_buf += data
+                                    if self.tui_queue:
+                                        await self.tui_queue.put({"type": "think_token", "text": data})
+                                    elif show_thinking:
+                                        live.update(Panel(
                                             Text(thinking_buf, style="dim italic"),
-                                            title="[dim cyan]Agent Thinking[/dim cyan]",
+                                            title="[dim cyan]Agent Thinking...[/dim cyan]",
                                             border_style="dim cyan",
                                         ))
-                                        live.start()
-                                        thinking_buf = ""
-                                    text_buf += data
-                                    assistant_content += data
-                                    final_text = assistant_content
-                                    live.update(Panel(
-                                        Markdown(text_buf),
-                                        title="[cyan]Agent[/cyan]",
-                                        border_style="cyan",
-                                    ))
-                            elif event_type == "tool_calls":
-                                tool_calls_received = data
-                                if not self.tui_queue:
-                                    live.update(Text(""))
-                            elif event_type == "usage":
-                                _usage_data = data
-                            elif event_type == "stop":
-                                if self.tui_queue:
-                                    await self.tui_queue.put({"type": "text_done", "text": text_buf, "source": "agent", "agent_label": agent_label})
-                                elif text_buf:
-                                    live.update(Panel(
-                                        Markdown(text_buf),
-                                        title="[cyan]Agent[/cyan]",
-                                        border_style="cyan",
-                                    ))
-                                else:
-                                    live.update(Text(""))
-
-                # Emit agent context usage and check for approaching limit
-                if _usage_data:
-                    _prompt_toks = _usage_data.get("prompt_tokens", 0)
-                    _ctx = self.ctx_window
-                    if self.tui_queue:
-                        await self.tui_queue.put({"type": "usage", "tokens": _usage_data.get("total_tokens", 0), "ctx": _ctx, "agent_label": agent_label, "tool_id": _tool_id, "slot_index": _slot.index})
-                    _pct = _prompt_toks / _ctx if _ctx else 0
-                    _warn_msg = None
-                    if _pct >= 0.92:
-                        _warn_msg = f"[{agent_label}] Context at {_pct:.0%} ({_prompt_toks:,} / {_ctx:,} tokens) — stopping agent to avoid server crash."
-                        log.warning("Agent context limit: %s", _warn_msg)
-                        if self.tui_queue:
-                            await self.tui_queue.put({"type": "system", "text": _warn_msg})
-                        final_text = (final_text or "") + f"\n\n[Agent stopped: context {_pct:.0%} full — report based on work completed so far.]"
+                                elif event_type == "text":
+                                    if self.tui_queue:
+                                        text_buf += data
+                                        assistant_content += data
+                                        final_text = assistant_content
+                                        await self.tui_queue.put({"type": "text_token", "text": data, "source": "agent", "agent_label": agent_label})
+                                    else:
+                                        if thinking_buf and show_thinking:
+                                            live.update(Text(""))
+                                            live.stop()
+                                            console.print(Panel(
+                                                Text(thinking_buf, style="dim italic"),
+                                                title="[dim cyan]Agent Thinking[/dim cyan]",
+                                                border_style="dim cyan",
+                                            ))
+                                            live.start()
+                                            thinking_buf = ""
+                                        text_buf += data
+                                        assistant_content += data
+                                        final_text = assistant_content
+                                        live.update(Panel(
+                                            Markdown(text_buf),
+                                            title="[cyan]Agent[/cyan]",
+                                            border_style="cyan",
+                                        ))
+                                elif event_type == "tool_calls":
+                                    tool_calls_received = data
+                                    if not self.tui_queue:
+                                        live.update(Text(""))
+                                elif event_type == "usage":
+                                    _usage_data = data
+                                elif event_type == "stop":
+                                    if self.tui_queue:
+                                        await self.tui_queue.put({"type": "text_done", "text": text_buf, "source": "agent", "agent_label": agent_label})
+                                    elif text_buf:
+                                        live.update(Panel(
+                                            Markdown(text_buf),
+                                            title="[cyan]Agent[/cyan]",
+                                            border_style="cyan",
+                                        ))
+                                    else:
+                                        live.update(Text(""))
+    
+                    # If sanity detector fired inside the stream, break out of _iter loop
+                    if _sanity_triggered:
                         break
-                    elif _pct >= 0.75:
-                        _warn_msg = f"[{agent_label}] Context at {_pct:.0%} ({_prompt_toks:,} / {_ctx:,} tokens)"
+    
+                    # Emit agent context usage and check for approaching limit
+                    if _usage_data:
+                        _prompt_toks = _usage_data.get("prompt_tokens", 0)
+                        _ctx = self.ctx_window
                         if self.tui_queue:
-                            await self.tui_queue.put({"type": "system", "text": _warn_msg})
-                        else:
-                            console.print(f"[yellow]{_warn_msg}[/yellow]")
-
-                if assistant_content:          # keep last meaningful text; don't overwrite with ""
-                    final_text = assistant_content
-
-                # Fallback: model emitted tool calls as text
-                if not tool_calls_received and assistant_content:
-                    _parsed = _try_parse_text_tool_calls(assistant_content)
-                    if _parsed:
-                        tool_calls_received = _parsed
-                        assistant_content = ""
-
-                # Auto-announce if model produced no text before first tool call (TUI only)
-                if tool_calls_received and not text_buf.strip() and not self.tui_queue:
-                    console.print(f"[dim]  {_tool_announce(tool_calls_received)}[/dim]")
-
-                if tool_calls_received:
-                    messages.append({
-                        "role": "assistant",
-                        "content": assistant_content or None,
-                        "tool_calls": tool_calls_received,
-                    })
-
-                    async def _run_agent_tool(tc):
-                        tc_name = tc["function"]["name"]
-                        tc_args_str = tc["function"]["arguments"]
-                        try:
-                            tc_args = json.loads(tc_args_str) if tc_args_str.strip() else {}
-                        except json.JSONDecodeError as _je:
-                            _err = f"[error: malformed tool arguments — JSON parse failed: {_je}. Raw: {tc_args_str[:200]}]"
+                            await self.tui_queue.put({"type": "usage", "tokens": _usage_data.get("total_tokens", 0), "ctx": _ctx, "agent_label": agent_label, "tool_id": _tool_id, "slot_index": _slot.index})
+                        _pct = _prompt_toks / _ctx if _ctx else 0
+                        _warn_msg = None
+                        if _pct >= 0.92:
+                            _warn_msg = f"[{agent_label}] Context at {_pct:.0%} ({_prompt_toks:,} / {_ctx:,} tokens) — stopping agent to avoid server crash."
+                            log.warning("Agent context limit: %s", _warn_msg)
                             if self.tui_queue:
-                                await self.tui_queue.put({"type": "tool_done", "id": tc["id"], "name": tc_name, "result": _err, "is_error": True})
-                            return tc["id"], _err
-                        tc_args = normalize_tool_args(tc_args)
-                        if self.tui_queue:
-                            await self.tui_queue.put({"type": "tool_start", "id": tc["id"], "name": tc_name, "args": tc_args_str})
-                        elif self.compact_mode:
-                            console.print(f"[dim]    ◌ {tc_name}{markup_escape(self._compact_args(tc_name, tc_args))}[/dim]")
-                        else:
-                            args_display = json.dumps(tc_args, indent=2) if tc_args else "(no args)"
-                            console.print(Panel(
-                                f"[bold]{tc_name}[/bold]\n[dim]{args_display}[/dim]",
-                                title="[cyan]Agent Tool Call[/cyan]",
-                                border_style="cyan",
-                            ))
-                        # Hard block — bare python/pip (venv rule, no override)
-                        if tc_name == "bash":
-                            cmd = tc_args.get("command", "")
-                            if _is_bare_python(cmd):
-                                if not self.tui_queue:
-                                    console.print(Panel(
-                                        f"[red]Bare python/pip call blocked.[/red] Sub-agents must use the project venv.\n"
-                                        f"[dim]{cmd}[/dim]",
-                                        title="[red]Venv Rule Violation[/red]",
-                                        border_style="red",
-                                    ))
-                                tc_result = (
-                                    "[blocked: bare python/pip — all Python must run inside the project venv. "
-                                    "If no venv exists yet, create one first: python -m venv .venv "
-                                    "Then use: .venv\\Scripts\\python.exe  or  .venv\\Scripts\\pip.exe install <pkg>]"
-                                )
-                                if not self.tui_queue:
-                                    console.print(Panel(tc_result, title="[dim cyan]Agent Tool Result[/dim cyan]", border_style="red"))
-                                return tc["id"], tc_result
-
-                        # Apply same approval rules as top-level _call_tool
-                        _sa_ask, _sa_title, _sa_msg, _sa_style = _build_approval_check(
-                            tc_name, tc_args, self.approval_level,
-                            prefix="Sub-Agent — ", session_rules=self.session_rules,
-                            cwd=self.cwd,
-                        )
-                        if _sa_ask:
-                            import json as _json
-                            _sa_args_str = _json.dumps(tc_args, ensure_ascii=False)
-                            _sa_approved, _sa_notes = await self._approval_prompt(
-                                _sa_title, _sa_msg, _sa_style,
-                                tool_name=tc_name, tool_args_str=_sa_args_str,
-                            )
-                            if not _sa_approved:
-                                _reason = f" User says: {_sa_notes}." if _sa_notes else ""
-                                tc_result = f"[cancelled by user]{_reason}"
-                                if not self.tui_queue:
-                                    console.print(Panel(
-                                        tc_result,
-                                        title="[dim cyan]Agent Tool Result[/dim cyan]",
-                                        border_style="cyan",
-                                    ))
-                                return tc["id"], tc_result
-                            if _sa_notes.startswith("session_allow:"):
-                                self.session_rules.append(_sa_notes[len("session_allow:"):])
-                            elif _sa_notes:
-                                self._approval_notes = _sa_notes
-                        # File write lock check for structured write tools
-                        _ag_wl_path = _extract_write_path(tc_name, tc_args)
-                        _ag_wl_abs = os.path.abspath(_ag_wl_path) if _ag_wl_path else None
-                        if _ag_wl_abs and _ag_wl_abs in self._write_locks:
-                            tc_result = f"[error: '{os.path.basename(_ag_wl_abs)}' is currently locked for writing by {self._write_locks[_ag_wl_abs]} — retry after it finishes]"
-                        else:
-                            if _ag_wl_abs:
-                                self._write_locks[_ag_wl_abs] = agent_label or "agent"
-                            try:
-                                tc_result = await self._dispatch_tool(tc_name, tc_args)
-                            finally:
-                                if _ag_wl_abs:
-                                    self._write_locks.pop(_ag_wl_abs, None)
-                        if self._approval_notes:
-                            tc_result += f"\n[Note from user: {self._approval_notes}]"
-                            self._approval_notes = ""
-                        if self.tui_queue:
-                            is_err = tc_result.startswith(("[error", "[unknown", "[blocked", "[cancelled"))
-                            await self.tui_queue.put({"type": "tool_done", "id": tc["id"], "name": tc_name, "result": tc_result, "is_error": is_err})
-                        elif self.compact_mode:
-                            console.print(f"[dim]      → {markup_escape(self._compact_result(tc_result))}[/dim]")
-                        else:
-                            border = "cyan" if not tc_result.startswith("[error") and not tc_result.startswith("[unknown") and not tc_result.startswith("[blocked") else "red"
-                            console.print(Panel(
-                                markup_escape(tc_result[:2000]) + ("..." if len(tc_result) > 2000 else ""),
-                                title="[dim cyan]Agent Tool Result[/dim cyan]",
-                                border_style=border,
-                            ))
-                        return tc["id"], tc_result
-
-                    _FETCH_SUMMARIZE_THRESHOLD = 2_000  # chars — below this, summarizing isn't worth it
-                    _FETCH_INPUT_CAP = 40_000           # chars fed to the summarizer (hard ceiling)
-
-                    async def _summarize_fetch(raw: str) -> str:
-                        """Distil a long web_fetch result down to task-relevant facts only."""
-                        prompt = (
-                            "Extract ONLY the facts, figures, dates, names, and quotes from the "
-                            "following web page content that are directly relevant to this research task:\n\n"
-                            f"Task: {task[:400]}\n\n"
-                            "Return a dense, factual summary — no fluff, no navigation, no ads. "
-                            "Keep important quotes verbatim. If nothing is relevant, say so in one sentence.\n\n"
-                            f"Content:\n{raw[:_FETCH_INPUT_CAP]}"
-                        )
-                        try:
-                            r = await self.client.post(
-                                f"{BASE_URL}/v1/chat/completions",
-                                json={
-                                    "model": self.model,
-                                    "messages": [
-                                        {"role": "system", "content": "You are a precise research extraction assistant. Be concise and factual."},
-                                        {"role": "user", "content": prompt},
-                                    ],
-                                    "stream": False,
-                                    "temperature": 0.1,
-                                    **({"chat_template_kwargs": {"enable_thinking": False}} if self.backend == "llamacpp" else {}),
-                                },
-                                timeout=60,
-                            )
-                            r.raise_for_status()
-                            summary = r.json()["choices"][0]["message"]["content"].strip()
-                            if summary:
-                                if not self.tui_queue:
-                                    console.print(f"[dim]  ↳ web fetch distilled: {len(raw):,} → {len(summary):,} chars[/dim]")
-                                return summary
-                        except Exception as e:
-                            if not self.tui_queue:
-                                console.print(f"[dim yellow]  ↳ fetch summarize failed ({e}), using truncation[/dim yellow]")
-                        return raw[:_FETCH_INPUT_CAP] + "\n[...truncated]"
-
-                    for tc in tool_calls_received:
-                        tc_id, tc_result_val = await _run_agent_tool(tc)
-                        tc_name = tc["function"]["name"]
-                        if tc_name == "web_fetch" and len(tc_result_val) > _FETCH_SUMMARIZE_THRESHOLD:
-                            tc_result_val = await _summarize_fetch(tc_result_val)
+                                await self.tui_queue.put({"type": "system", "text": _warn_msg})
+                            final_text = (final_text or "") + f"\n\n[Agent stopped: context {_pct:.0%} full — report based on work completed so far.]"
+                            break
+                        elif _pct >= 0.75:
+                            _warn_msg = f"[{agent_label}] Context at {_pct:.0%} ({_prompt_toks:,} / {_ctx:,} tokens)"
+                            if self.tui_queue:
+                                await self.tui_queue.put({"type": "system", "text": _warn_msg})
+                            else:
+                                console.print(f"[yellow]{_warn_msg}[/yellow]")
+    
+                    if assistant_content:          # keep last meaningful text; don't overwrite with ""
+                        final_text = assistant_content
+    
+                    # Fallback: model emitted tool calls as text
+                    if not tool_calls_received and assistant_content:
+                        _parsed = _try_parse_text_tool_calls(assistant_content)
+                        if _parsed:
+                            tool_calls_received = _parsed
+                            assistant_content = ""
+    
+                    # Auto-announce if model produced no text before first tool call (TUI only)
+                    if tool_calls_received and not text_buf.strip() and not self.tui_queue:
+                        console.print(f"[dim]  {_tool_announce(tool_calls_received)}[/dim]")
+    
+                    if tool_calls_received:
                         messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc_id,
-                            "content": tc_result_val,
+                            "role": "assistant",
+                            "content": assistant_content or None,
+                            "tool_calls": tool_calls_received,
                         })
-                else:
-                    _hit_max_iter = False
-                    if assistant_content:
-                        messages.append({"role": "assistant", "content": assistant_content})
-                    break
+    
+                        async def _run_agent_tool(tc):
+                            tc_name = tc["function"]["name"]
+                            tc_args_str = tc["function"]["arguments"]
+                            try:
+                                tc_args = json.loads(tc_args_str) if tc_args_str.strip() else {}
+                            except json.JSONDecodeError as _je:
+                                _err = f"[error: malformed tool arguments — JSON parse failed: {_je}. Raw: {tc_args_str[:200]}]"
+                                if self.tui_queue:
+                                    await self.tui_queue.put({"type": "tool_done", "id": tc["id"], "name": tc_name, "result": _err, "is_error": True})
+                                return tc["id"], _err
+                            tc_args = normalize_tool_args(tc_args)
+                            if self.tui_queue:
+                                await self.tui_queue.put({"type": "tool_start", "id": tc["id"], "name": tc_name, "args": tc_args_str})
+                            elif self.compact_mode:
+                                console.print(f"[dim]    ◌ {tc_name}{markup_escape(self._compact_args(tc_name, tc_args))}[/dim]")
+                            else:
+                                args_display = json.dumps(tc_args, indent=2) if tc_args else "(no args)"
+                                console.print(Panel(
+                                    f"[bold]{tc_name}[/bold]\n[dim]{args_display}[/dim]",
+                                    title="[cyan]Agent Tool Call[/cyan]",
+                                    border_style="cyan",
+                                ))
+                            # Hard block — bare python/pip (venv rule, no override)
+                            if tc_name == "bash":
+                                cmd = tc_args.get("command", "")
+                                if _is_bare_python(cmd):
+                                    if not self.tui_queue:
+                                        console.print(Panel(
+                                            f"[red]Bare python/pip call blocked.[/red] Sub-agents must use the project venv.\n"
+                                            f"[dim]{cmd}[/dim]",
+                                            title="[red]Venv Rule Violation[/red]",
+                                            border_style="red",
+                                        ))
+                                    tc_result = (
+                                        "[blocked: bare python/pip — all Python must run inside the project venv. "
+                                        "If no venv exists yet, create one first: python -m venv .venv "
+                                        "Then use: .venv\\Scripts\\python.exe  or  .venv\\Scripts\\pip.exe install <pkg>]"
+                                    )
+                                    if not self.tui_queue:
+                                        console.print(Panel(tc_result, title="[dim cyan]Agent Tool Result[/dim cyan]", border_style="red"))
+                                    return tc["id"], tc_result
+    
+                            # Apply same approval rules as top-level _call_tool
+                            _sa_ask, _sa_title, _sa_msg, _sa_style = _build_approval_check(
+                                tc_name, tc_args, self.approval_level,
+                                prefix="Sub-Agent — ", session_rules=self.session_rules,
+                                cwd=self.cwd,
+                            )
+                            if _sa_ask:
+                                import json as _json
+                                _sa_args_str = _json.dumps(tc_args, ensure_ascii=False)
+                                _sa_approved, _sa_notes = await self._approval_prompt(
+                                    _sa_title, _sa_msg, _sa_style,
+                                    tool_name=tc_name, tool_args_str=_sa_args_str,
+                                )
+                                if not _sa_approved:
+                                    _reason = f" User says: {_sa_notes}." if _sa_notes else ""
+                                    tc_result = f"[cancelled by user]{_reason}"
+                                    if not self.tui_queue:
+                                        console.print(Panel(
+                                            tc_result,
+                                            title="[dim cyan]Agent Tool Result[/dim cyan]",
+                                            border_style="cyan",
+                                        ))
+                                    return tc["id"], tc_result
+                                if _sa_notes.startswith("session_allow:"):
+                                    self.session_rules.append(_sa_notes[len("session_allow:"):])
+                                elif _sa_notes:
+                                    self._approval_notes = _sa_notes
+                            # File write lock check for structured write tools
+                            _ag_wl_path = _extract_write_path(tc_name, tc_args)
+                            _ag_wl_abs = os.path.abspath(_ag_wl_path) if _ag_wl_path else None
+                            if _ag_wl_abs and _ag_wl_abs in self._write_locks:
+                                tc_result = f"[error: '{os.path.basename(_ag_wl_abs)}' is currently locked for writing by {self._write_locks[_ag_wl_abs]} — retry after it finishes]"
+                            else:
+                                if _ag_wl_abs:
+                                    self._write_locks[_ag_wl_abs] = agent_label or "agent"
+                                try:
+                                    tc_result = await self._dispatch_tool(tc_name, tc_args)
+                                finally:
+                                    if _ag_wl_abs:
+                                        self._write_locks.pop(_ag_wl_abs, None)
+                            if self._approval_notes:
+                                tc_result += f"\n[Note from user: {self._approval_notes}]"
+                                self._approval_notes = ""
+                            if self.tui_queue:
+                                is_err = tc_result.startswith(("[error", "[unknown", "[blocked", "[cancelled"))
+                                await self.tui_queue.put({"type": "tool_done", "id": tc["id"], "name": tc_name, "result": tc_result, "is_error": is_err})
+                            elif self.compact_mode:
+                                console.print(f"[dim]      → {markup_escape(self._compact_result(tc_result))}[/dim]")
+                            else:
+                                border = "cyan" if not tc_result.startswith("[error") and not tc_result.startswith("[unknown") and not tc_result.startswith("[blocked") else "red"
+                                console.print(Panel(
+                                    markup_escape(tc_result[:2000]) + ("..." if len(tc_result) > 2000 else ""),
+                                    title="[dim cyan]Agent Tool Result[/dim cyan]",
+                                    border_style=border,
+                                ))
+                            return tc["id"], tc_result
+    
+                        _FETCH_SUMMARIZE_THRESHOLD = 2_000  # chars — below this, summarizing isn't worth it
+                        _FETCH_INPUT_CAP = 40_000           # chars fed to the summarizer (hard ceiling)
+    
+                        async def _summarize_fetch(raw: str) -> str:
+                            """Distil a long web_fetch result down to task-relevant facts only."""
+                            prompt = (
+                                "Extract ONLY the facts, figures, dates, names, and quotes from the "
+                                "following web page content that are directly relevant to this research task:\n\n"
+                                f"Task: {task[:400]}\n\n"
+                                "Return a dense, factual summary — no fluff, no navigation, no ads. "
+                                "Keep important quotes verbatim. If nothing is relevant, say so in one sentence.\n\n"
+                                f"Content:\n{raw[:_FETCH_INPUT_CAP]}"
+                            )
+                            try:
+                                r = await self.client.post(
+                                    f"{BASE_URL}/v1/chat/completions",
+                                    json={
+                                        "model": self.model,
+                                        "messages": [
+                                            {"role": "system", "content": "You are a precise research extraction assistant. Be concise and factual."},
+                                            {"role": "user", "content": prompt},
+                                        ],
+                                        "stream": False,
+                                        "temperature": 0.1,
+                                        **({"chat_template_kwargs": {"enable_thinking": False}} if self.backend == "llamacpp" else {}),
+                                    },
+                                    timeout=60,
+                                )
+                                r.raise_for_status()
+                                summary = r.json()["choices"][0]["message"]["content"].strip()
+                                if summary:
+                                    if not self.tui_queue:
+                                        console.print(f"[dim]  ↳ web fetch distilled: {len(raw):,} → {len(summary):,} chars[/dim]")
+                                    return summary
+                            except Exception as e:
+                                if not self.tui_queue:
+                                    console.print(f"[dim yellow]  ↳ fetch summarize failed ({e}), using truncation[/dim yellow]")
+                            return raw[:_FETCH_INPUT_CAP] + "\n[...truncated]"
+    
+                        for tc in tool_calls_received:
+                            tc_id, tc_result_val = await _run_agent_tool(tc)
+                            tc_name = tc["function"]["name"]
+                            if tc_name == "web_fetch" and len(tc_result_val) > _FETCH_SUMMARIZE_THRESHOLD:
+                                tc_result_val = await _summarize_fetch(tc_result_val)
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "content": tc_result_val,
+                            })
+                    else:
+                        _hit_max_iter = False
+                        if assistant_content:
+                            messages.append({"role": "assistant", "content": assistant_content})
+                        break
+
+                # ── Sanity retry / abort logic ────────────────────────────────────
+                if _sanity_triggered:
+                    _attempt_num = _sanity_attempt + 1
+                    _total = _AGENT_MAX_SANITY_RETRIES + 1
+                    if _sanity_attempt < _AGENT_MAX_SANITY_RETRIES:
+                        _notice = (
+                            f"⚠ Agent sanity check triggered ({_sanity_triggered}) "
+                            f"— retrying (attempt {_attempt_num + 1}/{_total})…"
+                        )
+                        if self.tui_queue:
+                            await self.tui_queue.put({"type": "system", "text": f"[{agent_label}] {_notice}"})
+                        else:
+                            console.print(f"[yellow]{_notice}[/yellow]")
+                        _warn = (
+                            f"\n\n[SANITY CHECK FAILED — ATTEMPT {_attempt_num} of {_total}]\n"
+                            f"Your previous response was aborted by the sanity detector ({_sanity_triggered}).\n"
+                            "The output entered a degenerate repetition loop and was discarded entirely.\n"
+                            "Please retry the task from scratch. Do not repeat or continue the previous output."
+                        )
+                        messages = [
+                            messages[0],  # system prompt
+                            {"role": "user", "content": task + _warn},
+                        ]
+                        final_text = ""
+                        _hit_max_iter = True
+                        continue  # next _sanity_attempt
+                    else:
+                        _abort_msg = (
+                            f"[SANITY_ABORT] Agent '{agent_label or system_prompt[:30]}' was terminated "
+                            f"by the sanity detector ({_sanity_triggered}) after {_total} attempts. "
+                            "The task has been abandoned. Inform the user and suggest rephrasing the prompt "
+                            "or trying a different server configuration."
+                        )
+                        if self.tui_queue:
+                            await self.tui_queue.put({"type": "system", "text": _abort_msg})
+                        else:
+                            console.print(Panel(_abort_msg, title="[red]⚠ Agent Sanity Abort[/red]", border_style="red"))
+                        final_text = _abort_msg
+                        _hit_max_iter = False
+                break  # no sanity trigger — agent completed normally, exit sanity loop
         except asyncio.CancelledError:
             raise  # let cancellation propagate so eviction works correctly
         except Exception as _iter_exc:
