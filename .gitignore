@@ -19,6 +19,14 @@ llama.log
 # Personal user profile
 USER_PROFILE.md
 
+# Telegram bot secrets and runtime state
+telegram_bot/.env
+telegram_bot/bot_auth.db*
+telegram_bot/blocklist.txt
+
+# Local GUI preferences
+ui_prefs.json
+
 # Artifacts
 render_power_curve.py
 audio.raw
