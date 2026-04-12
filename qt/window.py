@@ -1887,7 +1887,11 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_error_msg(self, msg: str):
-        self._append(self._compact_view, f'<span style="color:#ef4444;">Error: {msg}</span><br>')
+        html = f'<span style="color:#ef4444;">{msg}</span><br>'
+        self._append(self._compact_view, html)
+        self._append(self._full_view, html)
+        self._auto_scroll(self._compact_view)
+        self._auto_scroll(self._full_view)
         self._message_queue.clear()
         self._queue_label.setVisible(False)
         self._set_input_enabled(True)
