@@ -191,8 +191,9 @@ class ServerManager(tk.Tk):
         super().__init__()
         self.title("Open LLM Server Manager")
         self.configure(bg=BG)
-        self.geometry("760x940")
         self.minsize(660, 740)
+        _prefs = _load_prefs()
+        self.geometry(_prefs.get("window_geometry", "760x940"))
 
         self._models, self._default_model = _load_models()
         self._proc        = None
@@ -1287,6 +1288,11 @@ class ServerManager(tk.Tk):
 
     # ── Close ────────────────────────────────────────────────────────────────
     def _on_close(self):
+        # Persist window geometry before closing
+        prefs = _load_prefs()
+        prefs["window_geometry"] = self.geometry()
+        _save_prefs(prefs)
+
         if self._running and not self._external:
             self._stop_server()
         else:

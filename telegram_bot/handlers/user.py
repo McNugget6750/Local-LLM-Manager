@@ -87,8 +87,10 @@ async def handle_message(message: Message, bot: Bot, user_manager: UserManager, 
     typing_task = asyncio.create_task(send_typing_indicator(bot, message.chat.id, stop_typing))
 
     try:
-        # 3. Proxy to Backend
-        response_text = await backend_client.send_message(token, message.text)
+        # 3. Proxy to Backend — wrap with user_id so remote_chat.py can route replies
+        uid = message.from_user.id
+        wrapped = f"[TELEGRAM_REQUEST from user_id={uid}]\n{message.text}\n[/TELEGRAM_REQUEST]"
+        response_text = await backend_client.send_message(token, wrapped)
         
         # 4. Split and Send Response
         chunks = split_text(response_text)

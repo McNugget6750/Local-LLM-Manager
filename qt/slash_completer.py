@@ -29,6 +29,10 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/skill",         "Invoke a skill explicitly"),
     ("/queue-results", "List recent agent queue runs"),
     ("/excerpt",       "Insert selected editor code into prompt with line numbers"),
+    ("/schedule",      "Add a recurring research job: <when> <tg_user_id> <task>"),
+    ("/schedule list", "List all scheduled jobs"),
+    ("/schedule run",  "Fire a scheduled job immediately: run <id>"),
+    ("/schedule remove", "Remove a scheduled job: remove <id>"),
 ]
 
 

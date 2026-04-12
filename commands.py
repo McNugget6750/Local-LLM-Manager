@@ -620,6 +620,10 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
             "[bold]/git-status[/bold]              Full git situation report",
             "[bold]/queue-results \\[label\\][/bold]  List recent agent queue runs, or show one by label",
             "[bold]/voice \\[ptt|auto\\] \\[tools\\][/bold]  Start voice sparring mode (tools flag enables tool use)",
+            "[bold]/schedule <when> <tg_id> <task>[/bold]  Add scheduled research job (when: daily, daily:HH:MM, weekly:dow:HH:MM, YYYY-MM-DD)",
+            "[bold]/schedule list[/bold]          List all scheduled jobs",
+            "[bold]/schedule run <id>[/bold]      Fire a job immediately",
+            "[bold]/schedule remove|enable|disable <id>[/bold]  Manage jobs",
             "[bold]/help[/bold]                  Show this message",
             "",
             "[bold]Shift+Tab[/bold]              Cycle mode: normal → plan → normal",
@@ -1071,6 +1075,114 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         voice_mode  = next((f for f in flags if f in ("ptt", "auto")), VOICE_DEFAULT_MODE)
         use_tools   = "tools" in flags
         await _voice_conversation_loop(session, mode=voice_mode, use_tools=use_tools)
+        return True
+
+    elif name == "/schedule":
+        scheduler = getattr(session, "_scheduler", None)
+        if scheduler is None:
+            console.print("[red]Scheduler not running (start via Qt GUI)[/red]")
+            return True
+
+        sub = parts[1].lower() if len(parts) > 1 else "list"
+
+        if sub == "list":
+            jobs = scheduler.list_jobs()
+            if not jobs:
+                console.print("No scheduled jobs.")
+            else:
+                from rich.table import Table
+                tbl = Table(title="Scheduled Jobs", border_style="cyan")
+                tbl.add_column("ID",      style="bold cyan", no_wrap=True)
+                tbl.add_column("Enabled", no_wrap=True)
+                tbl.add_column("When",    no_wrap=True)
+                tbl.add_column("TG User", no_wrap=True)
+                tbl.add_column("Next Run", no_wrap=True)
+                tbl.add_column("Runs", no_wrap=True)
+                tbl.add_column("Task")
+                for j in jobs:
+                    tbl.add_row(
+                        j["id"],
+                        "[green]yes[/green]" if j.get("enabled") else "[red]no[/red]",
+                        j.get("when", ""),
+                        str(j.get("telegram_user_id", "")),
+                        (j.get("next_run") or "[dim]—[/dim]"),
+                        str(j.get("run_count", 0)),
+                        j.get("task", ""),
+                    )
+                console.print(tbl)
+            return True
+
+        if sub == "remove":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /schedule remove <id>[/yellow]")
+                return True
+            job_id = parts[2]
+            if scheduler.remove_job(job_id):
+                console.print(f"[green]Job {job_id} removed.[/green]")
+            else:
+                console.print(f"[red]Job {job_id} not found.[/red]")
+            return True
+
+        if sub == "enable":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /schedule enable <id>[/yellow]")
+                return True
+            job_id = parts[2]
+            if scheduler.set_enabled(job_id, True):
+                console.print(f"[green]Job {job_id} enabled.[/green]")
+            else:
+                console.print(f"[red]Job {job_id} not found.[/red]")
+            return True
+
+        if sub == "disable":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /schedule disable <id>[/yellow]")
+                return True
+            job_id = parts[2]
+            if scheduler.set_enabled(job_id, False):
+                console.print(f"[yellow]Job {job_id} disabled.[/yellow]")
+            else:
+                console.print(f"[red]Job {job_id} not found.[/red]")
+            return True
+
+        if sub == "run":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /schedule run <id>[/yellow]")
+                return True
+            job_id = parts[2]
+            job = scheduler.get_job(job_id)
+            if job is None:
+                console.print(f"[red]Job {job_id} not found.[/red]")
+                return True
+            console.print(f"[cyan]Firing job {job_id} immediately…[/cyan]")
+            asyncio.create_task(scheduler._fire_job(job), name=f"job-manual-{job_id}")
+            return True
+
+        # Otherwise: /schedule <when> <telegram_user_id> <task...>
+        if len(parts) < 4:
+            console.print(
+                "[yellow]Usage: /schedule <when> <telegram_user_id> <task...>\n"
+                "  when examples: daily, daily:09:00, weekly:fri:17:00, 2026-05-01, 2026-05-01:14:30\n"
+                "Sub-commands: list | remove <id> | enable <id> | disable <id> | run <id>[/yellow]"
+            )
+            return True
+        when_str  = parts[1]
+        try:
+            tg_id = int(parts[2])
+        except ValueError:
+            console.print(f"[red]Invalid telegram_user_id: {parts[2]!r} (must be integer)[/red]")
+            return True
+        task_text = " ".join(parts[3:])
+        try:
+            job = scheduler.add_job(when_str, tg_id, task_text)
+            console.print(
+                f"[green]Job [bold]{job['id']}[/bold] created.[/green]\n"
+                f"  When: {job['when']}\n"
+                f"  Next run: {job.get('next_run') or 'N/A'}\n"
+                f"  Task: {task_text}"
+            )
+        except ValueError as e:
+            console.print(f"[red]Invalid schedule: {e}[/red]")
         return True
 
     # Unknown /command — try skill lookup before giving up

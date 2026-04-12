@@ -1801,6 +1801,16 @@ class ChatSession(AgentsMixin):
                 if self.tui_queue:
                     await self.tui_queue.put({"type": "open_in_editor", "path": path, "line": line})
                 return f"[opened {path} at line {line} in editor]"
+            elif name == "send_telegram":
+                if self._subagent_depth > 0:
+                    return "[error: send_telegram not available inside sub-agents]"
+                from scheduler import tg_send, _load_admin_id
+                _tg_uid = args.get("user_id")
+                if _tg_uid is None:
+                    _tg_uid = _load_admin_id()
+                if not _tg_uid:
+                    return "[send_telegram error: no user_id provided and ADMIN_ID not set in telegram_bot/.env]"
+                return await tg_send(int(_tg_uid), args.get("message", ""))
             else:
                 return f"[unknown tool: {name}]"
         except Exception as e:

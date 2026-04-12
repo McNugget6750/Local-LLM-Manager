@@ -17,6 +17,7 @@ Usage from curl (always pass --max-time to avoid client-side timeout):
     -d '{"message": "Please review qt/window.py"}'
 """
 import json
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -31,6 +32,7 @@ class RemoteChatServer:
         self._event         = threading.Event()  # set when 'done' fires
         self._eli_text      = ""                 # captured from text_done (Eli's reply)
         self._agent_results: list[str] = []      # captured from tool_done for agent tools
+        self._telegram_uid: int | None = None    # set when request came via Telegram bot
         self._busy          = False
 
         self._server = HTTPServer(("127.0.0.1", PORT), self._make_handler())
@@ -98,8 +100,21 @@ class RemoteChatServer:
                     self._send_json(400, {"error": "invalid JSON"})
                     return
 
-                message = str(body.get("message", "")).strip()
+                raw     = str(body.get("message", "")).strip()
                 plan    = bool(body.get("plan", False))
+
+                # Extract [TELEGRAM_REQUEST from user_id=N] wrapper if present.
+                # The inner message is passed to Eli clean; routing/delivery is
+                # handled here — Eli doesn't need to know about Telegram at all.
+                telegram_user_id: int | None = None
+                message = raw
+                tg_match = re.search(
+                    r'\[TELEGRAM_REQUEST from user_id=(\d+)\]\s*(.*?)\s*\[/TELEGRAM_REQUEST\]',
+                    raw, re.DOTALL,
+                )
+                if tg_match:
+                    telegram_user_id = int(tg_match.group(1))
+                    message = tg_match.group(2).strip()
 
                 if not message:
                     self._send_json(400, {"error": "empty message"})
@@ -113,15 +128,21 @@ class RemoteChatServer:
                     srv._busy          = True
                     srv._eli_text      = ""
                     srv._agent_results = []
+                    srv._telegram_uid  = telegram_user_id
                     srv._event.clear()
 
                     if message.startswith("/"):
-                        # Slash command — route through submit_slash, no bubble
+                        # Slash command — execute directly; captured output feeds text_done
                         srv._adapter.submit_slash(message)
                     else:
-                        # Normal message — show Remote bubble in GUI, then submit
+                        # Normal message — prepend Telegram identity so Eli knows the sender
+                        eli_message = (
+                            f"[Telegram · user_id={telegram_user_id}] {message}"
+                            if telegram_user_id else message
+                        )
+                        # Show the clean message in the GUI bubble, not the tagged version
                         srv._adapter.remote_message.emit(message)
-                        srv._adapter.submit(message, plan)
+                        srv._adapter.submit(eli_message, plan)
 
                     finished = srv._event.wait(timeout=TIMEOUT)
                     if not finished:

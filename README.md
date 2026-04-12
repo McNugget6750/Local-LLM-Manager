@@ -3,7 +3,7 @@
 A local LLM chat GUI + server manager supporting multiple inference backends:
 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp), [llama.cpp](https://github.com/ggml-org/llama.cpp), and [vLLM](https://github.com/vllm-project/vllm) (via WSL).
 
-Includes **Eli** — a coding assistant with tool use, background agents, agent queues, vision analysis, voice I/O, plan mode, autonomous execute-plan loops, Telegram remote access, slash commands, and persistent session state.
+Includes **Eli** — a coding assistant with tool use, background agents, agent queues, vision analysis, voice I/O, plan mode, autonomous execute-plan loops, Telegram remote access, scheduled background jobs, slash commands, and persistent session state.
 
 ---
 
@@ -15,6 +15,8 @@ Includes **Eli** — a coding assistant with tool use, background agents, agent 
 | `qt/main.py` | Qt chat GUI (primary interface) — launch via `qt/run.bat` or **Open Chat** |
 | `chat.py` | Terminal chat client — same backend as Qt GUI |
 | `commands.json` | Model profiles (gitignored — copy from `commands.example.json`) |
+| `scheduler.py` | Scheduled background job daemon — fires research agents on a cron-like schedule |
+| `schedules.json` | Persisted job definitions (auto-created on first `/schedule` use) |
 | `ELI.md` | Eli's behavioral rules and persona |
 | `behavioral_pulse.md` | Condensed rules injected before every turn for attention retention |
 | `agents/` | Agent persona definitions |
@@ -129,6 +131,10 @@ qt\run.bat --resume name :: resume named session
 | `/model [name]` | List profiles or switch to one |
 | `/role <name>` | Adopt an agent persona (`/role eli` to revert) |
 | `/voice [ptt\|auto] [tools]` | Start voice conversation mode |
+| `/schedule <when> <tg_id> <task>` | Add a recurring or one-time research job delivered via Telegram |
+| `/schedule list` | List all scheduled jobs |
+| `/schedule run <id>` | Fire a job immediately (useful for testing) |
+| `/schedule enable\|disable\|remove <id>` | Manage jobs |
 | `/config` | Show loaded `eli.toml` config |
 | `/cd <path>` | Change working directory |
 | `/think [off\|on\|deep]` | Set thinking level |
@@ -161,7 +167,7 @@ The active voice in the server manager is saved to `ui_prefs.json` and restored 
 
 ## Telegram Bot
 
-Provides remote access to Eli via Telegram. The bot forwards messages to the Qt Chat GUI, which must be running alongside the inference server.
+Provides remote access to Eli via Telegram. The bot forwards messages to the Qt Chat GUI and returns Eli's responses. The GUI must be running alongside the inference server.
 
 **Prerequisites — both must be running before starting the bot:**
 1. **Inference server** — start via Server Manager or `server_manager.py`
@@ -173,8 +179,15 @@ Provides remote access to Eli via Telegram. The bot forwards messages to the Qt 
 
 The Server Manager can handle this automatically: check **Auto-start Telegram** and the bot will start/stop with the inference server. Open the Chat GUI once via "Open Chat" — it persists in the background.
 
+**Supported interactions:**
+- **Chat messages** — forwarded to Eli; response returned via Telegram, split across multiple messages if over 4096 characters
+- **Slash commands** — `/help`, `/status`, `/clear`, `/model`, `/schedule`, and any other GUI slash command work from Telegram and return their output
+- **Long-running tasks** — agent-based tasks that outlast the 120-second HTTP timeout are delivered via `send_telegram` directly to the requesting user's ID
+- **Proactive delivery** — Eli can call `send_telegram` at any time to push a result or notification without waiting to be asked
+
 **Configuration (`.env`):**
 - `BOT_TOKEN`: Telegram Bot API token.
+- `ADMIN_ID`: Your personal Telegram user ID. Used as the default delivery target for `send_telegram` when no specific user is in context, and for scheduled job results.
 - `ALLOWED_USERS`: Comma-separated list of Telegram user IDs allowed to use the bot.
 - `SILENT_REJECTION`: If `true`, the bot will not respond to unauthorized users.
 
@@ -182,6 +195,41 @@ The Server Manager can handle this automatically: check **Auto-start Telegram** 
 - **Allowlist**: Only users in `ALLOWED_USERS` can interact with the bot.
 - **Auto-blocking**: Users not on the allowlist are automatically added to `blocklist.txt` after 10 unauthorized attempts.
 - **Blocklist**: Blocked users are ignored immediately without further processing.
+
+**Telegram delivery for long tasks:**
+
+When a message arrives from Telegram, the bot wraps it with the sender's `user_id`. The remote chat bridge strips this wrapper before Eli sees the message, so Eli receives plain text. For long-running agent tasks that outlast the HTTP connection timeout, Eli (or the scheduler) calls `send_telegram` to push results directly to the requester's `user_id`.
+
+Slash commands sent from Telegram (e.g. `/help`, `/status`) execute as real slash commands and their output is returned in the Telegram response, split across multiple messages if needed.
+
+---
+
+## Scheduled jobs
+
+The scheduler daemon runs inside the Qt GUI as an asyncio task. It fires research agents on a cron-like schedule and pushes results to a Telegram user.
+
+**When formats:**
+
+| Input | Meaning |
+|-------|---------|
+| `daily` | Every day at 08:00 |
+| `daily:14:30` | Every day at 14:30 |
+| `weekly:fri:09:00` | Every Friday at 09:00 |
+| `2026-05-01` | Once on that date at 08:00 |
+| `2026-05-01:14:30` | Once at a specific time |
+
+**Usage:**
+
+```
+/schedule daily:09:00 123456789 research latest AI safety developments
+/schedule weekly:fri:17:00 123456789 research the week's major tech developments
+/schedule list
+/schedule run <id>      ← fire immediately to test
+/schedule disable <id>
+/schedule remove <id>
+```
+
+Jobs are persisted in `schedules.json`. One-time (`once`) jobs are disabled after firing but kept for audit. The scheduler reads the `research` skill prompt from `skills/research.md` so job quality benefits from any improvements to that skill.
 
 ---
 
@@ -307,9 +355,12 @@ Profile metadata (optional `_meta` block):
     "vision_url": "http://localhost:1234",
     "vision_external": false
   },
+  "_default": "My Model · Q6_K",
   "My Model · Q6_K": ["..."]
 }
 ```
+
+The `_default` key sets which profile is pre-selected when the server manager opens. The server manager window remembers its last position and size across restarts (saved to `ui_prefs.json`).
 
 Each profile entry is a list of command tokens (the engine is auto-detected from `entry[0]`). The profile name, strengths, and speed description are injected into Eli's context at startup.
 

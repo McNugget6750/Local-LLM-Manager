@@ -396,6 +396,28 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "send_telegram",
+            "description": (
+                "Send a Telegram message directly to a user. "
+                "Use this to proactively push a result or notification to a Telegram user. "
+                "Omit user_id to deliver to the admin. "
+                "Note: short replies to Telegram messages are delivered automatically — "
+                "only use this tool when you want to push something proactively or when "
+                "a long-running task needs to deliver its result directly."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "integer", "description": "Telegram user_id to send to. Omit to fall back to the configured ADMIN_ID."},
+                    "message": {"type": "string",  "description": "Message text to deliver"},
+                },
+                "required": ["message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "open_in_editor",
             "description": (
                 "Open a file in the GUI editor panel and scroll to a specific line. "

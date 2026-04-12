@@ -399,16 +399,24 @@ class QtChatAdapter(QThread):
                 _ism.on_change(lambda: self.slots_updated.emit(_ism.total_slots(), _ism.in_use()))
                 # Emit initial state now — initialize() already ran, observer wasn't connected yet
                 self.slots_updated.emit(_ism.total_slots(), _ism.in_use())
-                while True:
-                    item = await self._work_queue.get()
-                    if item is None:
-                        break
-                    kind = item[0]
-                    if kind == "__slash__":
-                        await self._run_slash(session, item[1])
-                    else:
-                        text, plan_mode = item
-                        await self._run_turn(session, text, plan_mode)
+                # Start scheduler daemon
+                from scheduler import SchedulerDaemon
+                _scheduler = SchedulerDaemon(session)
+                session._scheduler = _scheduler
+                await _scheduler.start()
+                try:
+                    while True:
+                        item = await self._work_queue.get()
+                        if item is None:
+                            break
+                        kind = item[0]
+                        if kind == "__slash__":
+                            await self._run_slash(session, item[1])
+                        else:
+                            text, plan_mode = item
+                            await self._run_turn(session, text, plan_mode)
+                finally:
+                    await _scheduler.stop()
         except SystemExit:
             self.error_msg.emit("Server not reachable — start the server first.")
             self.done.emit()
@@ -482,7 +490,10 @@ class QtChatAdapter(QThread):
         _drain_queue then handles all events identically to a normal turn.
         """
         import io, re
-        import chat as _chat_mod
+        import constants as _const_mod
+        import chat      as _chat_mod
+        import commands  as _cmd_mod
+        import agents    as _agent_mod
         from commands import handle_slash_command
         from rich.console import Console
 
@@ -492,9 +503,17 @@ class QtChatAdapter(QThread):
             session.tui_queue.get_nowait()
 
         buf = io.StringIO()
-        _old_console = _chat_mod.console
-        _chat_mod.console = Console(file=buf, highlight=False, markup=True,
-                                    no_color=True, width=80)
+        _capture = Console(file=buf, highlight=False, markup=True,
+                           no_color=True, width=80)
+        # All three modules did `from constants import console` and hold their
+        # own local reference — we must patch each one individually.
+        _old_consoles = (
+            _const_mod.console,
+            _chat_mod.console,
+            _cmd_mod.console,
+            _agent_mod.console,
+        )
+        _const_mod.console = _chat_mod.console = _cmd_mod.console = _agent_mod.console = _capture
 
         async def _run_and_signal():
             try:
@@ -502,6 +521,12 @@ class QtChatAdapter(QThread):
             except Exception as exc:
                 await session.tui_queue.put({"type": "error", "text": str(exc)})
             finally:
+                # Inject text_done BEFORE done so remote callers (Telegram, curl)
+                # receive the captured output before the event is set.
+                captured = buf.getvalue()
+                clean = re.sub(r'\x1b\[[0-9;]*[mGKHFABCDsuhl]', '', captured).strip()
+                if clean:
+                    await session.tui_queue.put({"type": "slash_output", "text": clean})
                 await session.tui_queue.put({"type": "done"})
 
         try:
@@ -512,14 +537,9 @@ class QtChatAdapter(QThread):
             self.error_msg.emit(str(exc))
             self.done.emit()
         finally:
-            _chat_mod.console = _old_console
+            _const_mod.console, _chat_mod.console, _cmd_mod.console, _agent_mod.console = _old_consoles
             self._stream_task = None
             self._cancel_requested = False
-
-        captured = buf.getvalue()
-        clean = re.sub(r'\x1b\[[0-9;]*[mGKHFABCDsuhl]', '', captured).strip()
-        if clean:
-            self.system_msg.emit(clean)
 
     async def _drain_queue(self, session: ChatSession,
                            stream_task: asyncio.Task) -> None:
@@ -599,6 +619,11 @@ class QtChatAdapter(QThread):
                 self.cwd_changed.emit(event.get("cwd", ""))
             elif etype == "session_resume_html":
                 self.session_resume_html.emit(event.get("json_path", ""))
+            elif etype == "slash_output":
+                # Captured console output from a slash command.
+                # system_msg → GUI display; text_done → remote callers (Telegram, curl).
+                self.system_msg.emit(event.get("text", ""))
+                self.text_done.emit(event.get("text", ""))
             elif etype == "system":
                 self.system_msg.emit(event.get("text", ""))
             elif etype == "error":

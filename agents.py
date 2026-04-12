@@ -416,8 +416,9 @@ class AgentsMixin:
                 model = profile.get("model")
         # If not found, use the string as-is (may be a short raw prompt)
 
-        # Build tool list — always exclude spawn_agent from sub-agents
-        sub_tools = [t for t in TOOLS if t["function"]["name"] != "spawn_agent"]
+        # Build tool list — always exclude spawn_agent and send_telegram from sub-agents
+        _SUBAGENT_EXCLUDED = {"spawn_agent", "send_telegram"}
+        sub_tools = [t for t in TOOLS if t["function"]["name"] not in _SUBAGENT_EXCLUDED]
         if tools:
             sub_tools = [t for t in sub_tools if t["function"]["name"] in tools]
 
