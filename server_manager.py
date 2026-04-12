@@ -286,23 +286,30 @@ class ServerManager(tk.Tk):
         self._cmd_text.pack(side="left", fill="both", expand=True)
         self._refresh_cmd_text()
 
-        # Buttons
-        btns = tk.Frame(self, bg=BG, padx=14, pady=6)
-        btns.pack(fill="x")
-        self._btn_start = self._btn(btns, "▶  Start", "#27ae60", self._start_server)
+        # Buttons — row 1: server controls
+        btns1 = tk.Frame(self, bg=BG, padx=14, pady=4)
+        btns1.pack(fill="x")
+        self._btn_start = self._btn(btns1, "▶  Start", "#27ae60", self._start_server)
         self._btn_start.pack(side="left", padx=(0, 6))
-        self._btn_stop = self._btn(btns, "■  Stop", "#c0392b", self._stop_server)
+        self._btn_stop = self._btn(btns1, "■  Stop", "#c0392b", self._stop_server)
         self._btn_stop.pack(side="left", padx=(0, 6))
         self._btn_stop.config(state="disabled")
-        self._btn(btns, "⟳  Check Now", "#1a6fa3", self._check_now).pack(side="left", padx=(0, 6))
-        self._btn_chat = self._btn(btns, "💬  Open Chat", "#5a3a7e", self._open_chat)
+        self._btn(btns1, "⟳  Check Now", "#1a6fa3", self._check_now).pack(side="left", padx=(0, 6))
+
+        # Buttons — row 2: clients + telegram
+        btns2 = tk.Frame(self, bg=BG, padx=14, pady=4)
+        btns2.pack(fill="x")
+        self._btn_chat = self._btn(btns2, "💬  Open Chat GUI", "#5a3a7e", self._open_chat)
         self._btn_chat.pack(side="left", padx=(0, 6))
         self._btn_chat.config(state="disabled")
-        self._btn_telegram = self._btn(btns, "🤖  Telegram", "#1a6fa3", self._toggle_telegram)
+        self._btn_chat_tui = self._btn(btns2, "⌨  Open Chat TUI", "#5a3a7e", self._open_chat_tui)
+        self._btn_chat_tui.pack(side="left", padx=(0, 6))
+        self._btn_chat_tui.config(state="disabled")
+        self._btn_telegram = self._btn(btns2, "🤖  Telegram", "#1a6fa3", self._toggle_telegram)
         self._btn_telegram.pack(side="left", padx=(0, 10))
         self._auto_telegram = tk.BooleanVar(value=_load_prefs().get("auto_telegram", False))
         self._chk_telegram = tk.Checkbutton(
-            btns, text="Auto-start Telegram", variable=self._auto_telegram,
+            btns2, text="Auto-start Telegram", variable=self._auto_telegram,
             bg=BG, fg=FG, selectcolor=PANEL, activebackground=BG, activeforeground=FG,
             font=("Segoe UI", 9), relief="flat", bd=0,
             command=self._on_auto_telegram_toggle,
@@ -749,6 +756,7 @@ class ServerManager(tk.Tk):
         self._btn_start.config(state="normal")
         self._btn_stop.config(state="disabled")
         self._btn_chat.config(state="disabled")
+        self._btn_chat_tui.config(state="disabled")
         self._combo.config(state="readonly")
         self._lbl_dot.config(fg=RED)
         self._lbl_status.config(text="  Stopped")
@@ -761,6 +769,7 @@ class ServerManager(tk.Tk):
         self._lbl_dot.config(fg=GREEN)
         self._lbl_status.config(text="  Running")
         self._btn_chat.config(state="normal")
+        self._btn_chat_tui.config(state="normal")
         self._start_voice_server()
         if self._auto_telegram.get():
             self._start_telegram()
@@ -1073,6 +1082,7 @@ class ServerManager(tk.Tk):
             self._lbl_status.config(text="  Running (external)")
             self._btn_stop.config(state="normal")
             self._btn_chat.config(state="normal")
+            self._btn_chat_tui.config(state="normal")
             self._log_put(f"Detected running server: {result['model']}", "beat")
             self._schedule_heartbeat()
         else:
@@ -1210,6 +1220,15 @@ class ServerManager(tk.Tk):
             [python, main, "--continue"],
             cwd=here,
             creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+
+    def _open_chat_tui(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        python = os.path.join(here, ".venv", "Scripts", "python.exe")
+        chat   = os.path.join(here, "chat.py")
+        subprocess.Popen(
+            ["cmd", "/c", "start", "cmd", "/k", python, chat, "--continue"],
+            cwd=here,
         )
 
     # ── Telegram bot lifecycle ───────────────────────────────────────────────
