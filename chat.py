@@ -714,7 +714,7 @@ class ChatSession(AgentsMixin):
         if not self.tui_queue:
             console.print(
                 Panel(
-                    "[bold cyan]Qwen3 Chat[/bold cyan]  —  connected to [green]localhost:1234[/green]\n"
+                    "[bold cyan]Open Harness TUI[/bold cyan]  —  connected to [green]localhost:1234[/green]\n"
                     "Type [bold]/help[/bold] for commands  |  [bold]Alt+Enter[/bold] newline  |  [bold]Shift+Tab[/bold] cycle mode  |  [bold]Ctrl+O[/bold] compact  |  [bold]Ctrl+D[/bold] exit",
                     border_style="cyan",
                 )
