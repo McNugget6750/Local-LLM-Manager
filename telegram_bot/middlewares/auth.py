@@ -2,7 +2,7 @@ import asyncio
 import os
 from typing import Any, Awaitable, Callable, Dict
 from aiogram import BaseMiddleware
-from aiogram.types import Message, TelegramObject
+from aiogram.types import Message, TelegramObject, Update
 from telegram_bot.config import settings
 from telegram_bot.user_manager import UserManager
 
@@ -33,8 +33,22 @@ class UserAllowlistMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any]
     ) -> Any:
-        # Only process events that have a user
-        user = getattr(event, "from_user", None)
+        # Extract user from Update object (outer middleware)
+        user = None
+        event_source = None
+        if isinstance(event, Update):
+            # Check various update types for from_user
+            for attr in ["message", "callback_query", "edited_message", "inline_query", "chosen_inline_result"]:
+                obj = getattr(event, attr, None)
+                if obj and hasattr(obj, "from_user"):
+                    user = obj.from_user
+                    event_source = obj
+                    break
+        else:
+            # Fallback for inner middlewares or other event types
+            user = getattr(event, "from_user", None)
+            event_source = event
+
         if not user:
             return await handler(event, data)
         
@@ -58,8 +72,11 @@ class UserAllowlistMiddleware(BaseMiddleware):
             return  # Silent drop
         
         # Send rejection message if not silent
-        if isinstance(event, Message):
-            await event.answer("⛔ You are not authorized to use this bot.")
+        if event_source and hasattr(event_source, "answer"):
+            try:
+                await event_source.answer("⛔ You are not authorized to use this bot.")
+            except Exception:
+                pass
         
         return  # Stop processing the handler
 

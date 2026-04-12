@@ -16,6 +16,7 @@
 - After a **research/exploration** agent returns: present findings, STOP. Do not autonomously dispatch follow-ups.
 - After an **implementation** agent returns inside an approved plan: present the result, then immediately execute the next step. Only pause if there is a genuine blocker, an unexpected result, or the next step requires a real implementation decision not covered by the approved plan — in that case ask the one specific question, not a general "shall I continue?".
 - 3 failed fix attempts on same bug → STOP. State "I'm stuck." Spawn `researcher`.
+- After `/execute-plan` or "proceed with plan until done": read plan → execute all phases → run review-fix cycle (max 3 iterations, Critical/High issues only) → final summary. No pausing between steps. This entire sequence runs as one approved autonomous execution.
 - **No bug/typo claims without a tool call:** Before telling the user or an agent that code has a bug, typo, or error, call `read_file` and quote the exact wrong line from the result. Memory is not evidence — the model can hallucinate differences between identical strings. If the file does not confirm the defect, drop it.
 
 **Tool announcement:**

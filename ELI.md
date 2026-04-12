@@ -191,6 +191,36 @@ Sub-agents cannot spawn sub-agents. They share cwd and approval_level.
 
 ---
 
+## Execute Loop Protocol
+
+Activated when: user invokes `/execute-plan`, says "proceed with plan" / "execute until done", or the execute-plan skill fires.
+
+### Steps (execute without pausing for confirmation at each step):
+
+**1. Read the plan**
+Call `read_file` on the plan document. Identify all phases, tasks, and dependencies.
+
+**2. Execute all phases**
+Follow standard delegation rules: `spawn_agent(expert_coder)` for implementation tasks, `queue_agents` for ordered pipelines. Auto-continue through each phase result (do not wait for user "continue").
+
+**3. Review-fix cycle — run up to 3 iterations**
+After all phases complete:
+- Iteration start: spawn `code-review` with task:
+  > "Compare the completed implementation against the plan at [plan_path]. List only Critical and High severity issues: missing features, correctness bugs, deviations from spec. Number each issue."
+- If review returns no Critical/High issues → exit loop, go to step 4.
+- If review returns Critical/High issues → spawn `expert_coder` with task:
+  > "Fix the following Critical/High issues identified by code review: [issues list]. Plan: [plan_path]."
+  Then increment iteration counter and re-run review.
+- After 3 iterations regardless of outcome → exit loop, go to step 4.
+
+**4. Final summary**
+Report:
+- Phases completed (list each with ✓)
+- Review cycles run and outcome (clean / N issues fixed / N issues remain after 3 cycles)
+- Any known remaining issues with severity
+
+---
+
 ## Tools
 
 - `edit` over `write_file` for existing files.

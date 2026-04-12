@@ -3,7 +3,7 @@
 A local LLM chat GUI + server manager supporting multiple inference backends:
 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp), [llama.cpp](https://github.com/ggml-org/llama.cpp), and [vLLM](https://github.com/vllm-project/vllm) (via WSL).
 
-Includes **Eli** — a coding assistant with tool use, background agents, agent queues, vision analysis, voice I/O, plan mode, slash commands, and persistent session state.
+Includes **Eli** — a coding assistant with tool use, background agents, agent queues, vision analysis, voice I/O, plan mode, autonomous execute-plan loops, Telegram remote access, slash commands, and persistent session state.
 
 ---
 
@@ -21,6 +21,7 @@ Includes **Eli** — a coding assistant with tool use, background agents, agent 
 | `skills/` | Slash command prompt workflows |
 | `eli.toml` | Project-specific config (gitignored, auto-loaded from cwd) |
 | `USER_PROFILE.md` | Personal info Eli uses to personalize responses (gitignored) |
+| `telegram_bot/` | Telegram bot interface |
 
 ---
 
@@ -50,7 +51,7 @@ chat.bat         :: terminal chat
 
 `run.bat` opens the Tkinter GUI. Select a model profile, click **Start**. Add new profiles with **+ Add Model** — saved to `commands.json`.
 
-Once running, click **Open Chat** to launch the Qt GUI with `--continue` (resumes last session). The voice server starts and stops alongside the inference server.
+Once running, click **Open Chat** to launch the Qt GUI with `--continue` (resumes last session). The voice server starts and stops alongside the inference server. Click **🤖 Telegram** to start or stop the Telegram bot manually, or check **Auto-start Telegram** to have it start and stop with the inference server automatically.
 
 The server manager exposes a loopback control API on port 1235. Eli uses this to switch models automatically when dispatching agents — the GUI tracks state correctly throughout.
 
@@ -121,7 +122,9 @@ qt\run.bat --resume name :: resume named session
 | `/review <file>` | Deep code review sub-agent |
 | `/research <topic>` | 3-pass skeptical research sub-agent |
 | `/plan <feature>` | Implementation planning sub-agent |
+| `/implementation_plan` | Create and validate a structured TDD implementation plan |
 | `/code <task>` | Production code writing sub-agent |
+| `/execute-plan <path>` | Execute a plan end-to-end with automatic review-fix loops (up to 3 cycles) |
 | `/queue-results [label]` | List or show agent queue run results |
 | `/model [name]` | List profiles or switch to one |
 | `/role <name>` | Adopt an agent persona (`/role eli` to revert) |
@@ -156,7 +159,31 @@ The active voice in the server manager is saved to `ui_prefs.json` and restored 
 
 ---
 
-## Agents
+## Telegram Bot
+
+Provides remote access to Eli via Telegram. The bot forwards messages to the Qt Chat GUI, which must be running alongside the inference server.
+
+**Prerequisites — both must be running before starting the bot:**
+1. **Inference server** — start via Server Manager or `server_manager.py`
+2. **Qt Chat GUI** — start via "Open Chat" in Server Manager, or `qt/main.py` directly
+
+```bat
+.venv\Scripts\python.exe -m telegram_bot.main
+```
+
+The Server Manager can handle this automatically: check **Auto-start Telegram** and the bot will start/stop with the inference server. Open the Chat GUI once via "Open Chat" — it persists in the background.
+
+**Configuration (`.env`):**
+- `BOT_TOKEN`: Telegram Bot API token.
+- `ALLOWED_USERS`: Comma-separated list of Telegram user IDs allowed to use the bot.
+- `SILENT_REJECTION`: If `true`, the bot will not respond to unauthorized users.
+
+**Security:**
+- **Allowlist**: Only users in `ALLOWED_USERS` can interact with the bot.
+- **Auto-blocking**: Users not on the allowlist are automatically added to `blocklist.txt` after 10 unauthorized attempts.
+- **Blocklist**: Blocked users are ignored immediately without further processing.
+
+---
 
 Eli dispatches sub-agents for specialized tasks. Agents run on the inference server (with an optional model switch) and report back. The GUI shows a per-agent context bar while it's running.
 
@@ -340,8 +367,10 @@ Your skill prompt here...
 |-------|:-----:|-------------|
 | `/research` | yes | 3-pass skeptical research — sweep, cross-examine, synthesise |
 | `/plan` | yes | Implementation planning — reads codebase, evaluates approaches, produces task checklist |
+| `/implementation_plan` | no | Create and validate structured TDD implementation plans with phase gates |
 | `/code` | yes | Production code — reads first, designs, implements, tests, self-reviews |
 | `/review` | yes | Deep code review — reads code, callers, and tests; reports issues by severity |
+| `/execute-plan <path>` | no | Execute a plan document end-to-end; spawns agents per phase, then runs up to 3 review-fix cycles before reporting |
 | `/commit` | no | Conventional commit message template |
 | `/pr` | no | Pull request description template |
 | `/git-status` | no | Git status summary |

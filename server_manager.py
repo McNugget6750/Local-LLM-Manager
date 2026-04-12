@@ -197,6 +197,7 @@ class ServerManager(tk.Tk):
         self._models, self._default_model = _load_models()
         self._proc        = None
         self._voice_proc  = None
+        self._telegram_proc = None
         self._log_q       = queue.Queue()
         self._running     = False
         self._external    = False
@@ -295,8 +296,18 @@ class ServerManager(tk.Tk):
         self._btn_stop.config(state="disabled")
         self._btn(btns, "⟳  Check Now", "#1a6fa3", self._check_now).pack(side="left", padx=(0, 6))
         self._btn_chat = self._btn(btns, "💬  Open Chat", "#5a3a7e", self._open_chat)
-        self._btn_chat.pack(side="left")
+        self._btn_chat.pack(side="left", padx=(0, 6))
         self._btn_chat.config(state="disabled")
+        self._btn_telegram = self._btn(btns, "🤖  Telegram", "#1a6fa3", self._toggle_telegram)
+        self._btn_telegram.pack(side="left", padx=(0, 10))
+        self._auto_telegram = tk.BooleanVar(value=_load_prefs().get("auto_telegram", False))
+        self._chk_telegram = tk.Checkbutton(
+            btns, text="Auto-start Telegram", variable=self._auto_telegram,
+            bg=BG, fg=FG, selectcolor=PANEL, activebackground=BG, activeforeground=FG,
+            font=("Segoe UI", 9), relief="flat", bd=0,
+            command=self._on_auto_telegram_toggle,
+        )
+        self._chk_telegram.pack(side="left")
 
         # Status card — left: model stats  |  right: system stats
         card = tk.Frame(self, bg=PANEL, padx=14, pady=10)
@@ -716,6 +727,8 @@ class ServerManager(tk.Tk):
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
         self._stop_voice_server()
+        if self._auto_telegram.get():
+            self._stop_telegram()
         self._reset_ui()
         self._log_put("Server stopped", "err")
 
@@ -749,6 +762,8 @@ class ServerManager(tk.Tk):
         self._lbl_status.config(text="  Running")
         self._btn_chat.config(state="normal")
         self._start_voice_server()
+        if self._auto_telegram.get():
+            self._start_telegram()
 
     def _wsl_startup_poll(self):
         """Background thread: poll /v1/models every 15 s until ready or 10 min elapsed."""
@@ -1197,12 +1212,67 @@ class ServerManager(tk.Tk):
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
 
+    # ── Telegram bot lifecycle ───────────────────────────────────────────────
+    def _toggle_telegram(self):
+        if self._telegram_proc and self._telegram_proc.poll() is None:
+            self._stop_telegram()
+        else:
+            self._start_telegram()
+
+    def _start_telegram(self) -> None:
+        if self._telegram_proc and self._telegram_proc.poll() is None:
+            return  # already running
+        here = os.path.dirname(os.path.abspath(__file__))
+        python = os.path.join(here, ".venv", "Scripts", "python.exe")
+        try:
+            self._telegram_proc = subprocess.Popen(
+                [python, "-m", "telegram_bot.main"],
+                cwd=here,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            threading.Thread(target=self._read_telegram_proc, daemon=True).start()
+            self._btn_telegram.config(text="🤖  Stop Telegram")
+            self._log_put("[telegram] Bot started", "ok")
+        except Exception as e:
+            self._log_put(f"[telegram] Failed to start: {e}", "err")
+
+    def _stop_telegram(self) -> None:
+        if self._telegram_proc and self._telegram_proc.poll() is None:
+            self._telegram_proc.terminate()
+            try:
+                self._telegram_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._telegram_proc.kill()
+        self._telegram_proc = None
+        self._btn_telegram.config(text="🤖  Telegram")
+        self._log_put("[telegram] Bot stopped", "warn")
+
+    def _read_telegram_proc(self) -> None:
+        proc = self._telegram_proc
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                self._log_put(f"[telegram] {line}", "info")
+        # process exited
+        if self._telegram_proc is proc:
+            self._telegram_proc = None
+            self.after(0, lambda: self._btn_telegram.config(text="🤖  Telegram"))
+            self._log_put("[telegram] Bot exited", "warn")
+
+    def _on_auto_telegram_toggle(self):
+        prefs = _load_prefs()
+        prefs["auto_telegram"] = self._auto_telegram.get()
+        _save_prefs(prefs)
+
     # ── Close ────────────────────────────────────────────────────────────────
     def _on_close(self):
         if self._running and not self._external:
             self._stop_server()
         else:
             self._stop_voice_server()
+        self._stop_telegram()
         self.destroy()
 
 
