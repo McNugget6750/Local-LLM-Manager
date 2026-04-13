@@ -2090,6 +2090,12 @@ async def main():
     async with ChatSession() as chat:
         chat_ref[0] = chat
 
+        # ── Scheduler daemon (TUI mode) ───────────────────────────────────────
+        from scheduler import SchedulerDaemon as _SchedulerDaemon
+        _tui_scheduler = _SchedulerDaemon(chat)
+        chat._scheduler = _tui_scheduler
+        await _tui_scheduler.start()
+
         # ── --continue: restore all settings + resume last session ────────────
         if do_continue:
             state = _load_state()
@@ -2185,6 +2191,8 @@ async def main():
                 # Auto-reset plan mode after each response so the next message runs normally
                 if was_plan:
                     mode[0] = "normal"
+
+        await _tui_scheduler.stop()
 
 
 if __name__ == "__main__":

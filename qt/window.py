@@ -1511,6 +1511,11 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_text_done(self, full_text: str):
+        # If no tokens were buffered, this text_done came from a slash command output
+        # (emitted so remote/Telegram callers receive the text). Don't render an Eli
+        # bubble here — the slash command's _gui_panel/_gui_text already handled display.
+        if not self._response_buf:
+            return
         rendered = _markdown_to_html(full_text)
         # Use table pattern: narrow colored left cell = border stripe; background on content cell.
         # Qt's QTextDocument does not support border-left or background on <div>.

@@ -1081,6 +1081,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         scheduler = getattr(session, "_scheduler", None)
         if scheduler is None:
             console.print("[red]Scheduler not running (start via Qt GUI)[/red]")
+            await _gui_text(session, "[red]Scheduler not running — start via the Qt GUI.[/red]")
             return True
 
         sub = parts[1].lower() if len(parts) > 1 else "list"
@@ -1089,6 +1090,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
             jobs = scheduler.list_jobs()
             if not jobs:
                 console.print("No scheduled jobs.")
+                await _gui_text(session, "[dim]No scheduled jobs.[/dim]")
             else:
                 from rich.table import Table
                 tbl = Table(title="Scheduled Jobs", border_style="cyan")
@@ -1110,79 +1112,143 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                         j.get("task", ""),
                     )
                 console.print(tbl)
+                # GUI: render a proper styled HTML table instead of the garbled ASCII art
+                _C = "#22d3ee"
+                _hdr = (
+                    f'<tr style="color:#6699cc;font-weight:600;border-bottom:1px solid {_C};">'
+                    '<th style="padding:3px 8px;text-align:left;">ID</th>'
+                    '<th style="padding:3px 8px;text-align:left;">En</th>'
+                    '<th style="padding:3px 8px;text-align:left;">When</th>'
+                    '<th style="padding:3px 8px;text-align:left;">TG</th>'
+                    '<th style="padding:3px 8px;text-align:left;">Next Run</th>'
+                    '<th style="padding:3px 8px;text-align:left;">×</th>'
+                    '<th style="padding:3px 8px;text-align:left;">Task</th>'
+                    '</tr>'
+                )
+                _rows = []
+                for j in jobs:
+                    _en_style = "color:#4ade80;" if j.get("enabled") else "color:#f87171;"
+                    _en = "yes" if j.get("enabled") else "no"
+                    _task = (j.get("task") or "")
+                    if len(_task) > 60:
+                        _task = _task[:57] + "…"
+                    _rows.append(
+                        f'<tr style="border-top:1px solid #1a2a3a;">'
+                        f'<td style="color:{_C};padding:3px 8px;white-space:nowrap;">{j["id"]}</td>'
+                        f'<td style="{_en_style}padding:3px 8px;">{_en}</td>'
+                        f'<td style="padding:3px 8px;">{j.get("when","")}</td>'
+                        f'<td style="padding:3px 8px;">{j.get("telegram_user_id","")}</td>'
+                        f'<td style="padding:3px 8px;white-space:nowrap;">{j.get("next_run") or "—"}</td>'
+                        f'<td style="padding:3px 8px;">{j.get("run_count",0)}</td>'
+                        f'<td style="padding:3px 8px;color:#aaaaaa;">{_task}</td>'
+                        f'</tr>'
+                    )
+                _table_html = (
+                    f'<div style="border-left:3px solid {_C};padding:7px 12px;margin:4px 0 8px 0;'
+                    f'background:rgba(255,255,255,0.03);border-radius:3px;font-family:monospace;font-size:12px;">'
+                    f'<div style="font-weight:600;color:{_C};margin-bottom:5px;letter-spacing:.04em;">Scheduled Jobs</div>'
+                    f'<table style="width:100%;border-collapse:collapse;">{_hdr}{"".join(_rows)}</table>'
+                    f'</div>'
+                )
+                if session.tui_queue is not None:
+                    await session.tui_queue.put({"type": "system_html", "html": _table_html})
             return True
 
         if sub == "remove":
             if len(parts) < 3:
                 console.print("[yellow]Usage: /schedule remove <id>[/yellow]")
+                await _gui_text(session, "[yellow]Usage: /schedule remove <id>[/yellow]")
                 return True
             job_id = parts[2]
             if scheduler.remove_job(job_id):
                 console.print(f"[green]Job {job_id} removed.[/green]")
+                await _gui_text(session, f"[green]Job [bold cyan]{job_id}[/bold cyan] removed.[/green]")
             else:
                 console.print(f"[red]Job {job_id} not found.[/red]")
+                await _gui_text(session, f"[red]Job {job_id} not found.[/red]")
             return True
 
         if sub == "enable":
             if len(parts) < 3:
                 console.print("[yellow]Usage: /schedule enable <id>[/yellow]")
+                await _gui_text(session, "[yellow]Usage: /schedule enable <id>[/yellow]")
                 return True
             job_id = parts[2]
             if scheduler.set_enabled(job_id, True):
                 console.print(f"[green]Job {job_id} enabled.[/green]")
+                await _gui_text(session, f"[green]Job [bold cyan]{job_id}[/bold cyan] enabled.[/green]")
             else:
                 console.print(f"[red]Job {job_id} not found.[/red]")
+                await _gui_text(session, f"[red]Job {job_id} not found.[/red]")
             return True
 
         if sub == "disable":
             if len(parts) < 3:
                 console.print("[yellow]Usage: /schedule disable <id>[/yellow]")
+                await _gui_text(session, "[yellow]Usage: /schedule disable <id>[/yellow]")
                 return True
             job_id = parts[2]
             if scheduler.set_enabled(job_id, False):
                 console.print(f"[yellow]Job {job_id} disabled.[/yellow]")
+                await _gui_text(session, f"[yellow]Job [bold cyan]{job_id}[/bold cyan] disabled.[/yellow]")
             else:
                 console.print(f"[red]Job {job_id} not found.[/red]")
+                await _gui_text(session, f"[red]Job {job_id} not found.[/red]")
             return True
 
         if sub == "run":
             if len(parts) < 3:
                 console.print("[yellow]Usage: /schedule run <id>[/yellow]")
+                await _gui_text(session, "[yellow]Usage: /schedule run <id>[/yellow]")
                 return True
             job_id = parts[2]
             job = scheduler.get_job(job_id)
             if job is None:
                 console.print(f"[red]Job {job_id} not found.[/red]")
+                await _gui_text(session, f"[red]Job {job_id} not found.[/red]")
                 return True
             console.print(f"[cyan]Firing job {job_id} immediately…[/cyan]")
+            await _gui_text(session, f"[cyan]Firing job [bold]{job_id}[/bold] immediately…[/cyan]")
             asyncio.create_task(scheduler._fire_job(job), name=f"job-manual-{job_id}")
             return True
 
         # Otherwise: /schedule <when> <telegram_user_id> <task...>
         if len(parts) < 4:
-            console.print(
+            _usage = (
                 "[yellow]Usage: /schedule <when> <telegram_user_id> <task...>\n"
-                "  when examples: daily, daily:09:00, weekly:fri:17:00, 2026-05-01, 2026-05-01:14:30\n"
+                "  when: daily | daily:HH:MM | weekly:dow:HH:MM | YYYY-MM-DD | YYYY-MM-DD:HH:MM\n"
                 "Sub-commands: list | remove <id> | enable <id> | disable <id> | run <id>[/yellow]"
             )
+            console.print(_usage)
+            await _gui_text(session, _usage)
             return True
         when_str  = parts[1]
         try:
             tg_id = int(parts[2])
         except ValueError:
-            console.print(f"[red]Invalid telegram_user_id: {parts[2]!r} (must be integer)[/red]")
+            _err = f"[red]Invalid telegram_user_id: {parts[2]!r} (must be integer)[/red]"
+            console.print(_err)
+            await _gui_text(session, _err)
             return True
         task_text = " ".join(parts[3:])
         try:
             job = scheduler.add_job(when_str, tg_id, task_text)
+            _msg = (
+                f"[green]Job [bold cyan]{job['id']}[/bold cyan] created.[/green]\n"
+                f"  [dim]When:[/dim] {job['when']}\n"
+                f"  [dim]Next run:[/dim] {job.get('next_run') or 'N/A'}\n"
+                f"  [dim]Task:[/dim] {task_text}"
+            )
             console.print(
                 f"[green]Job [bold]{job['id']}[/bold] created.[/green]\n"
                 f"  When: {job['when']}\n"
                 f"  Next run: {job.get('next_run') or 'N/A'}\n"
                 f"  Task: {task_text}"
             )
+            await _gui_text(session, _msg)
         except ValueError as e:
             console.print(f"[red]Invalid schedule: {e}[/red]")
+            await _gui_text(session, f"[red]Invalid schedule: {e}[/red]")
         return True
 
     # Unknown /command — try skill lookup before giving up

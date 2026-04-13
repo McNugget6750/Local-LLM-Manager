@@ -515,18 +515,40 @@ class QtChatAdapter(QThread):
         )
         _const_mod.console = _chat_mod.console = _cmd_mod.console = _agent_mod.console = _capture
 
+        # Track whether the slash command sent any system_html events (via
+        # _gui_panel/_gui_text). If it did, we suppress the system_msg from
+        # slash_output to avoid the plain-text ASCII duplicate appearing
+        # alongside the already-rendered styled HTML.
+        _system_html_count = [0]
+        _orig_put = session.tui_queue.put
+
+        async def _tracking_put(event):
+            if isinstance(event, dict) and event.get("type") == "system_html":
+                _system_html_count[0] += 1
+            return await _orig_put(event)
+
+        session.tui_queue.put = _tracking_put
+
         async def _run_and_signal():
             try:
                 await handle_slash_command(cmd, session)
             except Exception as exc:
-                await session.tui_queue.put({"type": "error", "text": str(exc)})
+                await _orig_put({"type": "error", "text": str(exc)})
             finally:
+                # Restore queue.put before emitting slash_output/done so the
+                # drain loop receives those events through the real put path.
+                session.tui_queue.put = _orig_put
                 # Inject text_done BEFORE done so remote callers (Telegram, curl)
                 # receive the captured output before the event is set.
                 captured = buf.getvalue()
                 clean = re.sub(r'\x1b\[[0-9;]*[mGKHFABCDsuhl]', '', captured).strip()
                 if clean:
-                    await session.tui_queue.put({"type": "slash_output", "text": clean})
+                    # suppress_gui=True when _gui_panel/_gui_text already sent
+                    # styled HTML — avoids double display in the chat window.
+                    suppress = _system_html_count[0] > 0
+                    await session.tui_queue.put(
+                        {"type": "slash_output", "text": clean, "suppress_gui": suppress}
+                    )
                 await session.tui_queue.put({"type": "done"})
 
         try:
@@ -621,8 +643,11 @@ class QtChatAdapter(QThread):
                 self.session_resume_html.emit(event.get("json_path", ""))
             elif etype == "slash_output":
                 # Captured console output from a slash command.
-                # system_msg → GUI display; text_done → remote callers (Telegram, curl).
-                self.system_msg.emit(event.get("text", ""))
+                # text_done → remote callers (Telegram, curl).
+                # system_msg → GUI display only when the command did NOT already send
+                # styled HTML via _gui_panel/_gui_text (suppress_gui flag).
+                if not event.get("suppress_gui"):
+                    self.system_msg.emit(event.get("text", ""))
                 self.text_done.emit(event.get("text", ""))
             elif etype == "system":
                 self.system_msg.emit(event.get("text", ""))
