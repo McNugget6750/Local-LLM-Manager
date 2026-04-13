@@ -27,6 +27,9 @@ telegram_bot/blocklist.txt
 # Local GUI preferences
 ui_prefs.json
 
+# Scheduler state — contains user Telegram IDs
+schedules.json
+
 # Artifacts
 render_power_curve.py
 audio.raw

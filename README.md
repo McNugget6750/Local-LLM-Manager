@@ -29,10 +29,9 @@ Includes **Eli** — a coding assistant with tool use, background agents, agent 
 
 ## Quick start
 
-```bat
-git clone https://github.com/McNugget6750/Local-LLM-Manager.git
-cd Local-LLM-Manager
+Clone the repository, then:
 
+```bat
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 

@@ -6,8 +6,9 @@ Desktop UI for managing ik_llama.cpp server instances.
 
 import tkinter as tk
 from tkinter import ttk
-import subprocess, threading, queue, json, datetime, shlex, os, re, collections, ctypes
+import subprocess, threading, queue, json, datetime, shlex, os, re, collections, ctypes, sys
 import urllib.request, urllib.error, http.server
+from pathlib import Path
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 BINARY        = "llama-server"  # override: add your llama-server path to commands.json
@@ -806,8 +807,8 @@ class ServerManager(tk.Tk):
         self._schedule_heartbeat()   # switch to normal 5-min heartbeat cycle
 
     # ── Voice server lifecycle ───────────────────────────────────────────────
-    _VOICE_PYTHON = r"C:\Users\timob\claude-projects\qwen3-manager\.venv\Scripts\python.exe"
-    _VOICE_CWD    = r"C:\Users\timob\claude-projects\qwen3-manager"
+    _VOICE_PYTHON = sys.executable
+    _VOICE_CWD    = str(Path(__file__).parent)
 
     def _start_voice_server(self) -> None:
         if self._voice_proc and self._voice_proc.poll() is None:
