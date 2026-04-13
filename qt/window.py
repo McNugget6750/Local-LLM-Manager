@@ -1462,6 +1462,7 @@ class MainWindow(QMainWindow):
         if not self._input_history or self._input_history[0] != text:
             self._input_history.insert(0, text)
         if text.startswith("/"):
+            self._response_buf = ""
             self._adapter.submit_slash(text)
             return
         prefix = (f"[Editor: {self._current_file}]\n"

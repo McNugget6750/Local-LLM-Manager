@@ -1130,8 +1130,6 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
                     _en_style = "color:#4ade80;" if j.get("enabled") else "color:#f87171;"
                     _en = "yes" if j.get("enabled") else "no"
                     _task = (j.get("task") or "")
-                    if len(_task) > 60:
-                        _task = _task[:57] + "…"
                     _rows.append(
                         f'<tr style="border-top:1px solid #1a2a3a;">'
                         f'<td style="color:{_C};padding:3px 8px;white-space:nowrap;">{j["id"]}</td>'

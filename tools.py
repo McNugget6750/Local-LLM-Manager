@@ -418,6 +418,53 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "manage_schedule",
+            "description": (
+                "Create, list, or manage recurring scheduled jobs. "
+                "Each job runs a research task at a fixed schedule and delivers the result via Telegram. "
+                "Use this when the user asks to schedule something periodically "
+                "(e.g. 'remind me every day at 5pm', 'weekly market report', 'one-time task on Friday'). "
+                "Omit telegram_user_id to default to the configured ADMIN_ID."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "list", "remove", "enable", "disable"],
+                        "description": "Operation to perform.",
+                    },
+                    "when": {
+                        "type": "string",
+                        "description": (
+                            "Schedule expression — required for action=add. "
+                            "Examples: 'daily', 'daily:17:00', 'weekly:fri:09:00', "
+                            "'2026-06-01', '2026-06-01:14:30'."
+                        ),
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "What the agent should research/do when the job fires. "
+                            "Be specific — this is the agent's task prompt. Required for action=add."
+                        ),
+                    },
+                    "telegram_user_id": {
+                        "type": "integer",
+                        "description": "Telegram user_id to deliver results to. Omit to use ADMIN_ID from .env.",
+                    },
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job ID — required for remove, enable, disable.",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "open_in_editor",
             "description": (
                 "Open a file in the GUI editor panel and scroll to a specific line. "

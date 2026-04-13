@@ -1811,6 +1811,44 @@ class ChatSession(AgentsMixin):
                 if not _tg_uid:
                     return "[send_telegram error: no user_id provided and ADMIN_ID not set in telegram_bot/.env]"
                 return await tg_send(int(_tg_uid), args.get("message", ""))
+            elif name == "manage_schedule":
+                scheduler = getattr(self, "_scheduler", None)
+                if scheduler is None:
+                    return "[manage_schedule error: scheduler not running]"
+                action = args.get("action", "list")
+                if action == "list":
+                    jobs = scheduler.list_jobs()
+                    if not jobs:
+                        return "No scheduled jobs."
+                    lines = ["ID    En   When            Next Run              Runs  Task"]
+                    for j in jobs:
+                        en = "yes" if j.get("enabled") else "no"
+                        lines.append(f"{j['id']}  {en:4}  {j.get('when',''):15} {j.get('next_run') or '—':21} {j.get('run_count',0):4}  {j.get('task','')[:60]}")
+                    return "\n".join(lines)
+                elif action == "add":
+                    when = args.get("when")
+                    task = args.get("task")
+                    if not when or not task:
+                        return "[manage_schedule error: 'when' and 'task' required for add]"
+                    from scheduler import _load_admin_id
+                    tg_id = args.get("telegram_user_id") or _load_admin_id()
+                    if not tg_id:
+                        return "[manage_schedule error: no telegram_user_id and ADMIN_ID not set]"
+                    try:
+                        job = scheduler.add_job(when, int(tg_id), task)
+                        return f"Job {job['id']} created.\n  When: {job['when']}\n  Next run: {job.get('next_run') or 'N/A'}\n  Telegram: {tg_id}\n  Task: {task}"
+                    except ValueError as e:
+                        return f"[manage_schedule error: {e}]"
+                elif action in ("remove", "enable", "disable"):
+                    job_id = args.get("job_id")
+                    if not job_id:
+                        return f"[manage_schedule error: job_id required for {action}]"
+                    if action == "remove":
+                        return f"Job {job_id} removed." if scheduler.remove_job(job_id) else f"[manage_schedule error: job {job_id} not found]"
+                    ok = scheduler.set_enabled(job_id, action == "enable")
+                    word = "enabled" if action == "enable" else "disabled"
+                    return f"Job {job_id} {word}." if ok else f"[manage_schedule error: job {job_id} not found]"
+                return f"[manage_schedule error: unknown action '{action}']"
             else:
                 return f"[unknown tool: {name}]"
         except Exception as e:
