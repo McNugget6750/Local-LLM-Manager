@@ -1708,7 +1708,7 @@ class MainWindow(QMainWindow):
                 f'{error_span}'
                 f'</td></tr></table>'
             )
-            _target_view = self._agent_view if self._agent_nesting > 0 else self._full_view
+            _target_view = self._full_view
             self._append(_target_view, done_html)
 
             # For edit/write_file, render a unified diff block
