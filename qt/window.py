@@ -539,6 +539,7 @@ class MainWindow(QMainWindow):
 
         self._watcher.set_cwd(self._cwd)
         self._update_status()
+        self._refresh_tasks_view()
 
         # Restore last window geometry and panel layout
         from PySide6.QtCore import QByteArray
@@ -781,9 +782,14 @@ class MainWindow(QMainWindow):
         self._agent_view.viewport().installEventFilter(self)
         self._agent_view.anchorClicked.connect(self._on_anchor_clicked)
 
+        self._tasks_view = QTextBrowser()
+        self._tasks_view.setOpenExternalLinks(False)
+        self._tasks_view.setOpenLinks(False)
+
         self._chat_tabs = QTabWidget()
         self._chat_tabs.addTab(self._full_view, "Chat")
         self._chat_tabs.addTab(self._agent_view, "Agent")
+        self._chat_tabs.addTab(self._tasks_view, "Tasks")
         layout.addWidget(self._chat_tabs, stretch=1)
 
         # Per-slot context bars (above input) — Eli row always visible, agent rows added dynamically
@@ -1645,6 +1651,8 @@ class MainWindow(QMainWindow):
 
     @Slot(str, str, str, bool)
     def _on_tool_done_signal(self, tool_id: str, name: str, result: str, is_error: bool):
+        if name == "task_list" and not is_error:
+            self._refresh_tasks_view()
         if name in ("write_file", "edit") and not is_error:
             self._clear_model_highlight()
         _agent_entry = self._active_agents.pop(tool_id, None)
@@ -1906,6 +1914,7 @@ class MainWindow(QMainWindow):
     def _on_clear_chat(self):
         self._full_view.clear()
         self._agent_view.clear()
+        self._refresh_tasks_view()
 
     def _on_session_saved(self, json_path: str) -> None:
         """Save the current chat view HTML alongside the session JSON."""
@@ -1943,6 +1952,7 @@ class MainWindow(QMainWindow):
         self._cwd_label.setToolTip(f"CWD: {cwd}")
         self._watcher.set_cwd(cwd)
         self._refresh_project_panel()
+        self._refresh_tasks_view()
         # Scroll the explorer tree to show the new CWD
         idx = self._fs_model.index(cwd)
         if idx.isValid():
@@ -2433,6 +2443,19 @@ class MainWindow(QMainWindow):
             self._completer.hide()
 
     # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _refresh_tasks_view(self):
+        """Reload TASKS.md from cwd and render it in the Tasks tab."""
+        tasks_path = Path(self._cwd) / "TASKS.md"
+        if not tasks_path.exists():
+            self._tasks_view.setHtml(
+                f'<p style="color:#555; font-family:Consolas,monospace; font-size:11px;">'
+                f'No TASKS.md in {self._cwd}</p>'
+            )
+            return
+        text = tasks_path.read_text(encoding="utf-8")
+        html = _markdown_to_html(text)
+        self._tasks_view.setHtml(html)
 
     def _refresh_project_panel(self):
         """Walk up from CWD to find eli.toml; populate or hide the PROJECT group."""

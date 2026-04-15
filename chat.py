@@ -234,7 +234,7 @@ def _save_state(**kwargs) -> None:
 
 # ── Compaction constants ──────────────────────────────────────────────────────
 CTX_WINDOW           = 32_768   # fallback if /slots doesn't respond
-CTX_COMPACT_THRESH   = 0.80     # trigger history compaction at this fraction
+CTX_COMPACT_THRESH   = 0.70     # trigger history compaction at this fraction
 CTX_KEEP_RECENT      = 6        # tail messages kept verbatim after compact
 INPUT_COMPRESS_CHARS = 8_000    # auto-compress user input above this char count
 CHARS_PER_TOKEN      = 4        # fallback estimator when server usage unavailable
@@ -247,6 +247,9 @@ from unicode_normalize import normalize_tool_args
 from sanity_detector import SanityDetector, SanityError
 
 _ELI_MAX_SANITY_RETRIES = 1   # Eli gets 1 retry (2 total attempts) per user turn
+
+class ContextWindowError(RuntimeError):
+    """Raised when the server rejects the prompt for exceeding context window."""
 
 from tools import (
     TOOLS, DANGEROUS_PATTERNS, _GATE_REJECTED_PREFIX,
@@ -755,6 +758,13 @@ class ChatSession(AgentsMixin):
         self._bg_agent_tasks:       list[asyncio.Task] = []
         self._pending_bg_results:   list[tuple[str, str]] = []   # (tool_call_id, result_text)
         self._pending_bg_tool_calls: list[dict] = []             # tc dicts for tool_done emit
+        # Background process support
+        self._bg_process_tasks:     list[asyncio.Task] = []
+        self._turn_active:          bool = False
+        self._auto_trigger:         asyncio.Event = asyncio.Event()
+        self._auto_trigger_msg:     str = ""
+        self._auto_turn_count:      int = 0
+        self._auto_turn_limit:      int = 5
         self._write_locks:          dict[str, str] = {}          # abs_path → holder label
         self._last_read:            set[str]       = set()       # abs paths freshly read; cleared after write/edit
         self._eli_slot:             "SlotHandle | None" = None   # held during send_and_stream; released before inline agents
@@ -837,9 +847,11 @@ class ChatSession(AgentsMixin):
             "running a reviewer alongside a designer, or any work with no shared file dependencies.\n\n"
             "Background mode: when the server has spare inference slots, spawn_agent calls are "
             "dispatched as background tasks — you will receive a placeholder result immediately. "
-            "Write a brief acknowledgement (e.g. 'Dispatched N agents in background') and end "
-            "your turn. The full agent results are automatically injected into your context at "
-            "the start of the user's next message so you can discuss them then."
+            "Write a brief acknowledgement (e.g. 'Exploring in background — I'll continue when done.') "
+            "and end your turn. When all background agents complete, the session auto-continues: "
+            "results are injected and a new turn fires automatically without user input. "
+            "You may also discuss other topics with the user while agents are running — the results "
+            "will be injected on the next turn regardless."
         )
         self.messages.insert(self._n_fixed, {"role": "system", "content": msg})
         self._n_fixed += 1
@@ -1095,7 +1107,13 @@ class ChatSession(AgentsMixin):
             self.messages.pop()
 
     async def send_and_stream(self, user_text: str, plan_mode: bool = False,
-                              _sanity_retry: bool = False):
+                              _sanity_retry: bool = False, _is_autonomous: bool = False,
+                              custom_pulse: str | None = None):
+        self._turn_active = True
+        if _is_autonomous:
+            self._auto_turn_count += 1
+        else:
+            self._auto_turn_count = 0
         self._eli_slot = await _ism.acquire("Eli", timeout_secs=None, bypass_capacity=True)
         if not _sanity_retry:
             # Fresh user turn — reset sanity state
@@ -1103,13 +1121,15 @@ class ChatSession(AgentsMixin):
             self._sanity_detector.reset()
             self._telegram_origin = False
         try:
-            # Inject any completed background agent results before Eli sees this message
-            if self._pending_bg_results:
+            # Inject completed background results only when ALL agents/processes are done.
+            # Partial injection (some agents still running) would let Eli write a report
+            # from incomplete data. Hard barrier: inject everything at once or not at all.
+            if self._pending_bg_results and not self._bg_agent_tasks and not self._bg_process_tasks:
                 await self._inject_pending_bg_results()
             user_text = await self._maybe_compact_input(user_text)
             # Inject behavioral pulse right before user message (high attention proximity).
             # Remove previous pulse first so it never accumulates in history.
-            _pulse_text = _load_behavioral_pulse()
+            _pulse_text = custom_pulse if custom_pulse is not None else _load_behavioral_pulse()
             if _pulse_text:
                 if (self.messages and self.messages[-1].get("role") == "system"
                         and self.messages[-1].get("content", "").startswith(_PULSE_PREFIX)):
@@ -1198,6 +1218,12 @@ class ChatSession(AgentsMixin):
                     if response.status_code >= 400:
                         body = await response.aread()
                         body_text = body.decode("utf-8", errors="replace")[:600]
+                        _ctx_keywords = ("context", "too long", "token limit", "kv cache",
+                                         "exceeds", "maximum", "prompt", "capacity")
+                        if any(kw in body_text.lower() for kw in _ctx_keywords):
+                            raise ContextWindowError(
+                                f"HTTP {response.status_code} — context window exceeded: {body_text}"
+                            )
                         raise RuntimeError(
                             f"HTTP {response.status_code} from server: {body_text}"
                         )
@@ -1486,6 +1512,49 @@ class ChatSession(AgentsMixin):
             else:
                 console.print(Rule(style="dim"))
             self._autosave()
+        except ContextWindowError:
+            # Discard the failed user message so it can be re-sent
+            if self.messages and self.messages[-1]["role"] == "user":
+                self.messages.pop()
+            if (self.messages and self.messages[-1].get("role") == "system"
+                    and self.messages[-1].get("content", "").startswith(_PULSE_PREFIX)):
+                self.messages.pop()
+
+            _notice = "⚠ Context window exceeded — forcing history compaction and retrying…"
+            if self.tui_queue:
+                await self.tui_queue.put({"type": "system", "text": _notice})
+            else:
+                console.print(f"[yellow]{_notice}[/yellow]")
+
+            # Force compaction regardless of threshold
+            await self._compact_history(manual=False)
+
+            # If compaction was skipped (history too short), hard-trim oldest non-fixed messages
+            if not self._compacting:
+                trim_target = self._n_fixed + CTX_KEEP_RECENT
+                if len(self.messages) > trim_target:
+                    self.messages = self.messages[:self._n_fixed] + self.messages[-CTX_KEEP_RECENT:]
+
+            # Inject notice so the model understands what happened
+            _warn = (
+                "[CONTEXT WINDOW EXCEEDED — HISTORY COMPACTED]\n"
+                "Your previous request was rejected by the server because the conversation "
+                "history was too long for the context window. The history has been compacted "
+                "automatically. Please retry with a shorter or more focused request if needed."
+            )
+            self.messages.insert(self._n_fixed, {"role": "system", "content": _warn})
+
+            if not getattr(self, "_ctx_retry_active", False):
+                self._ctx_retry_active = True
+                self._eli_slot_ctx_retry = (user_text, plan_mode)
+            else:
+                # Second failure — give up
+                self._ctx_retry_active = False
+                _msg = "[red]Context window still exceeded after compaction. Please /compact or start a shorter task.[/red]"
+                if self.tui_queue:
+                    await self.tui_queue.put({"type": "system", "text": _msg})
+                else:
+                    console.print(_msg)
         except SanityError as _se:
             # Discard partial response — pop last user message so it can be re-sent
             if self.messages and self.messages[-1]["role"] == "user":
@@ -1515,9 +1584,17 @@ class ChatSession(AgentsMixin):
             else:
                 await self._sanity_abort(_trigger)
         finally:
+            self._turn_active = False
             if self._eli_slot is not None:
                 await self._eli_slot.release()
                 self._eli_slot = None
+        # Handle context window retry outside the slot so the new turn can acquire it cleanly
+        if hasattr(self, "_eli_slot_ctx_retry"):
+            _retry_text, _retry_plan = self._eli_slot_ctx_retry
+            del self._eli_slot_ctx_retry
+            await self.send_and_stream(_retry_text, plan_mode=_retry_plan)
+            self._ctx_retry_active = False
+            return
         # Handle sanity retry outside the slot so the new turn can acquire it cleanly
         if hasattr(self, "_eli_slot_sanity_retry"):
             _retry_text, _retry_plan = self._eli_slot_sanity_retry
@@ -1686,7 +1763,7 @@ class ChatSession(AgentsMixin):
             return f"[error: malformed path argument — suspiciously long ({len(raw)} chars): {raw[:80]!r}...]"
         return None
 
-    async def _dispatch_tool(self, name: str, args: dict) -> str:
+    async def _dispatch_tool(self, name: str, args: dict, tc_id: str = "") -> str:
         """Pure tool dispatch — no display, no approval check."""
         try:
             if name == "bash":
@@ -1811,6 +1888,22 @@ class ChatSession(AgentsMixin):
                 if not _tg_uid:
                     return "[send_telegram error: no user_id provided and ADMIN_ID not set in telegram_bot/.env]"
                 return await tg_send(int(_tg_uid), args.get("message", ""))
+            elif name == "run_background":
+                if self._subagent_depth > 0:
+                    return "[error: run_background not available inside sub-agents]"
+                _rb_cmd   = args.get("command", "")
+                _rb_label = args.get("label", "process")
+                _rb_to    = min(int(args.get("timeout", 300)), 3600)
+                _rb_cwd   = str(Path(args["cwd"]) if args.get("cwd") else self.cwd)
+                _rb_tc_id = tc_id  # real tool-call id from the model
+                _task = asyncio.create_task(
+                    self._run_background_process(_rb_tc_id, _rb_cmd, _rb_label, _rb_to, _rb_cwd)
+                )
+                _task.add_done_callback(
+                    lambda t: self._bg_process_tasks.remove(t) if t in self._bg_process_tasks else None
+                )
+                self._bg_process_tasks.append(_task)
+                return "[background: process running — result pending]"
             elif name == "manage_schedule":
                 scheduler = getattr(self, "_scheduler", None)
                 if scheduler is None:
@@ -1963,7 +2056,7 @@ class ChatSession(AgentsMixin):
                 self._approval_notes = _notes
 
         # Dispatch
-        result = await self._dispatch_tool(name, args)
+        result = await self._dispatch_tool(name, args, tc_id=call_id)
 
         # Inject any approval notes (from "yes, but...") into the tool result
         if self._approval_notes:
@@ -2229,6 +2322,25 @@ async def main():
                 # Auto-reset plan mode after each response so the next message runs normally
                 if was_plan:
                     mode[0] = "normal"
+
+            # Auto-trigger: if a background process finished during the turn, continue
+            while chat._auto_trigger.is_set():
+                chat._auto_trigger.clear()
+                _wake_msg = chat._auto_trigger_msg
+                chat._auto_trigger_msg = ""
+                console.print(Rule(style="dim"))
+                _auto_task = asyncio.create_task(
+                    chat.send_and_stream(_wake_msg, _is_autonomous=True)
+                )
+                current_task[0] = _auto_task
+                try:
+                    await _auto_task
+                except asyncio.CancelledError:
+                    console.print("[dim](interrupted)[/dim]")
+                except Exception as _ae:
+                    console.print(f"[red]Error: {_ae}[/red]")
+                finally:
+                    current_task[0] = None
 
         await _tui_scheduler.stop()
 

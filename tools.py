@@ -204,11 +204,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "task_list",
-            "description": "Read, create, or update a TASKS.md task list for tracking multi-step work. Use 'read' to check current tasks, 'create' to start a new list, 'update' to check/uncheck a task by 0-based index.",
+            "description": "Read, create, update, or clear a TASKS.md task list for tracking multi-step work. Use 'read' to check current tasks, 'create' to start a new list, 'update' to check/uncheck a task by 0-based index, 'clear' to delete the list.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "operation": {"type": "string", "description": "'read', 'create', or 'update'"},
+                    "operation": {"type": "string", "description": "'read', 'create', 'update', or 'clear'"},
                     "path": {"type": "string", "description": "Path to TASKS.md (default: TASKS.md in current dir)"},
                     "content": {"type": "string", "description": "Full markdown content for 'create' operation"},
                     "index": {"type": "integer", "description": "0-based task index for 'update' operation"},
@@ -270,6 +270,29 @@ TOOLS = [
                     },
                 },
                 "required": ["system_prompt", "task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_background",
+            "description": (
+                "Launch a shell command in the background without blocking. Returns immediately. "
+                "Combined stdout+stderr (last 200 lines) plus exit code are injected automatically "
+                "at the start of your next turn, and the session auto-continues if idle. "
+                "Use for long-running processes: compilation, test suites, data pipelines, server starts. "
+                "The user is notified in real time when the job completes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string",  "description": "Shell command to run"},
+                    "label":   {"type": "string",  "description": "Human-readable job name, e.g. 'cmake build'"},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 300, max 3600)"},
+                    "cwd":     {"type": "string",  "description": "Working directory (defaults to session cwd)"},
+                },
+                "required": ["command", "label"],
             },
         },
     },
@@ -768,6 +791,10 @@ def _build_approval_check(
     if approval_level == "yolo":
         return False, "", "", "yellow"
 
+    # task_list is always auto-approved regardless of approval level
+    if name == "task_list":
+        return False, "", "", "yellow"
+
     cmd = args.get("command", "") if name == "bash" else ""
     ask_needed = False
     ask_title = f"{prefix}Approval Required"
@@ -820,7 +847,7 @@ def _build_approval_check(
         ask_msg = f"Tool: {name}\n\n{_fmt_tool_args(name, args)}"
     elif approval_level == "ask-writes":
         WRITE_TOOLS = {"bash", "write_file", "edit"}
-        if name in WRITE_TOOLS or (name == "task_list" and args.get("operation") != "read"):
+        if name in WRITE_TOOLS:
             ask_needed = True
             ask_title = f"{prefix}Write Operation — {name}"
             ask_msg = f"Write operation — {name}:\n\n{_fmt_tool_args(name, args)}"
@@ -1442,6 +1469,10 @@ async def tool_task_list(
         p.write_text("\n".join(lines) + "\n", encoding="utf-8")
         action = "checked" if checked else "unchecked"
         return f"Task {index} {action}: {new_line.strip()}"
+    elif operation == "clear":
+        if p.exists():
+            p.unlink()
+        return f"Cleared {path}"
     else:
         return f"[unknown operation: {operation}]"
 

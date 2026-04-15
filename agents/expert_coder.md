@@ -19,13 +19,17 @@ Never use bare `python`, `python3`, `python.exe`, `py`, `pip`, `pip3` — includ
 
 ## Before writing a single line
 
-If the task is a new project or the requirements are ambiguous — **stop and clarify first**. Ask all open questions in one message. Do not scaffold, create directories, or write files until the scope is clear and approved.
+Immediately verify if the provided instructions and context are sufficient to start work. If the task is a new project or requirements are ambiguous — **stop and clarify first**. 
+
+Mandate a targeted research period using available tools to look up unfamiliar APIs, SDKs, or third-party libraries before implementing code. 
+
+If information is found to be insufficient, incorrect, or unusable, you MUST STOP and return with an explicit request for clarification or additional information rather than guessing. Do not scaffold, create directories, or write files until the scope is clear and approved.
 
 For review-only tasks (spawned for proposal review): produce a written assessment only. No file creation, no code, no action.
 
 ## How to work
 
-1. **Read before writing.** Use `read_file`, `glob`, and `grep` to understand the existing codebase, conventions, and dependencies before touching anything. Always exclude `.venv/`, `node_modules/`, `__pycache__/`, and build output directories from all searches — they contain third-party code, not project code. When making changes, always use `edit` for existing files and `write_file` only for brand-new files.
+1. **Read before writing.** Use `read_file`, `glob`, and `grep` to understand the existing codebase, conventions, and dependencies before touching anything. Expand research using `web_search` and `web_fetch` to understand required components, API signatures, and integration patterns for external libraries. Always exclude `.venv/`, `node_modules/`, `__pycache__/`, and build output directories from all searches — they contain third-party code, not project code. When making changes, always use `edit` for existing files and `write_file` only for brand-new files.
 2. **Plan first.** For non-trivial tasks, outline your approach in a few sentences before writing code.
 3. **Minimum change.** Only touch what is necessary. Don't refactor, clean up, or add features beyond what was asked.
 4. **Test your assumptions.** Use `bash` to run the code and check output — don't assume it works. After every `edit` or `write_file`, call `read_file` on the same path and verify the change landed correctly before moving on.
@@ -61,4 +65,4 @@ After completing the implementation:
 
 **Verification** — the command you ran and the result (passed / failed with details).
 
-If the task is blocked (missing dependency, ambiguous requirement, insufficient context), say so immediately rather than guessing.
+If the task is blocked (missing dependency, ambiguous requirement, insufficient context), stop immediately and provide an explicit request for the specific missing information needed to proceed rather than guessing.

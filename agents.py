@@ -157,16 +157,18 @@ class AgentsMixin:
 
         self._pending_bg_tool_calls.clear()
 
-        # Only close the cycle if no placeholders remain (all agents in this batch done).
+        # Only close the cycle if no placeholders remain (agents or processes still running).
         still_pending = any(
-            msg.get("role") == "tool" and msg.get("content") == _PLACEHOLDER
+            msg.get("role") == "tool"
+            and isinstance(msg.get("content"), str)
+            and msg["content"].startswith("[background:")
             for msg in self.messages
         )
         if injected_count and not still_pending:
-            noun = "agent" if injected_count == 1 else f"{injected_count} agents"
+            noun = "1 background task" if injected_count == 1 else f"{injected_count} background tasks"
             self.messages.append({
                 "role": "assistant",
-                "content": f"[Background {noun} complete — results available in context]",
+                "content": f"[{noun} complete — results available in context]",
             })
             log.debug("_inject_pending_bg_results: closed %d tool result(s) with synthetic ack", injected_count)
 
@@ -203,6 +205,37 @@ class AgentsMixin:
             result = f"[background agent error: {exc}]"
             log.warning("BgAgent[%s]: error — %s", label, exc)
         self._pending_bg_results.append((tc["id"], result))
+
+        # Yield one tick so done-callbacks for OTHER just-finished tasks can run.
+        # Note: this task's own done-callback fires only after this coroutine returns,
+        # so we must explicitly exclude it from the "still running" check below.
+        await asyncio.sleep(0)
+
+        _current = asyncio.current_task()
+        _others_running = any(t for t in self._bg_agent_tasks if t is not _current)
+
+        # Auto-trigger only when this is the last agent and no processes are pending.
+        # GUI mode: _drain_bg_agents already handles auto-continuation via the work_queue —
+        # creating an orphaned send_and_stream task here would race against it, consuming
+        # tui_queue events and generating a ghost turn whose output gets dropped.
+        # TUI mode: no _drain_bg_agents; use _auto_trigger to wake the input loop.
+        if not _others_running and not self._bg_process_tasks and not self._turn_active:
+            if self._auto_turn_count >= self._auto_turn_limit:
+                _limit_msg = (
+                    f"[system: auto-turn limit ({self._auto_turn_limit}) reached — "
+                    "pausing autonomous continuation. Waiting for user input.]"
+                )
+                if self.tui_queue:
+                    await self.tui_queue.put({"type": "system", "text": _limit_msg, "agent_label": label})
+                else:
+                    print(f"\n{_limit_msg}", flush=True)
+            elif not self.tui_queue:
+                # TUI only — GUI delegates to _drain_bg_agents
+                self._auto_trigger_msg = (
+                    "[system: all background agents complete. Results injected. Continue work.]"
+                )
+                self._auto_trigger.set()
+
         if self.tui_queue:
             await self.tui_queue.put({
                 "type": "tool_done",
@@ -212,6 +245,82 @@ class AgentsMixin:
                 "is_error": result.startswith(("[error", "[background agent error", "[agent evicted")),
                 "agent_label": label,
             })
+
+    async def _run_background_process(
+        self, tc_id: str, command: str, label: str, timeout: int, cwd: str | None
+    ) -> None:
+        """Run a shell command as a background asyncio Task. No slot used.
+
+        Captures combined stdout+stderr (last 200 lines). Stores result in
+        _pending_bg_results. Emits a system event to tui_queue on completion.
+        Auto-triggers a new send_and_stream turn if the session is idle.
+        """
+        _TAIL = 200
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=cwd,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                rc = proc.returncode
+                lines = stdout.decode(errors="replace").splitlines()
+                total = len(lines)
+                tail = lines[-_TAIL:] if total > _TAIL else lines
+                header = f"[truncated: showing last {_TAIL} of {total} lines]\n" if total > _TAIL else ""
+                body = "\n".join(tail).rstrip()
+                result = (
+                    f"[background job '{label}' — exit {rc}]\n{header}{body}"
+                    if body else
+                    f"[background job '{label}' — exit {rc}] (no output)"
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                result = f"[background job '{label}' — timeout after {timeout}s]"
+                rc = -1
+        except Exception as exc:
+            result = f"[background job '{label}' — error: {exc}]"
+            rc = -1
+
+        # Small yield so other tasks that finished simultaneously can also append their results
+        # before the auto-turn fires — batch-injected in one turn.
+        await asyncio.sleep(0)
+
+        self._pending_bg_results.append((tc_id, result))
+
+        notify = f"Background job '{label}' complete — exit {rc}"
+        if self.tui_queue:
+            await self.tui_queue.put({"type": "system", "text": notify, "agent_label": label})
+        else:
+            print(f"\n[{notify}]", flush=True)
+
+        # Auto-trigger a new turn if all background tasks are done and session is idle.
+        # Exclude the current process task — its done-callback fires after this coroutine returns.
+        # GUI mode: _drain_bg_agents (now watching _bg_process_tasks too) handles this.
+        # TUI mode: no drain loop; use _auto_trigger to wake the input loop.
+        _current_proc = asyncio.current_task()
+        _other_procs = any(t for t in self._bg_process_tasks if t is not _current_proc)
+        if not self._bg_agent_tasks and not _other_procs and not self._turn_active:
+            if self._auto_turn_count >= self._auto_turn_limit:
+                _limit_msg = (
+                    f"[system: auto-turn limit ({self._auto_turn_limit}) reached — "
+                    "pausing autonomous continuation. Waiting for user input.]"
+                )
+                if self.tui_queue:
+                    await self.tui_queue.put({"type": "system", "text": _limit_msg, "agent_label": label})
+                else:
+                    print(f"\n{_limit_msg}", flush=True)
+            elif not self.tui_queue:
+                # TUI only — GUI delegates to _drain_bg_agents
+                _wake_msg = (
+                    f"[system: background job '{label}' complete — exit {rc}. "
+                    "Result injected. Continue work.]"
+                )
+                # TUI: signal the input loop to break out of prompt_async
+                self._auto_trigger_msg = _wake_msg
+                self._auto_trigger.set()
 
     async def _flush_agent_batch(self, batch: list, emit_fn: Callable) -> None:
         """Run spawn_agent calls, grouping by target model, parallelising within each group when domain-safe.
@@ -403,7 +512,7 @@ class AgentsMixin:
         agent_label: display label for the Agent tab (e.g. "Agent 1"). Empty = unlabeled.
         current_model_hint: pre-fetched active profile name; skips _find_active_profile() call.
         """
-        from chat import stream_events, _try_parse_text_tool_calls, _tool_announce, _NullLive, COMPACT_QUOTES
+        from chat import stream_events, _try_parse_text_tool_calls, _tool_announce, _NullLive, COMPACT_QUOTES, ContextWindowError
 
         # Increment depth immediately before any await so parallel gather is safe
         self._subagent_depth += 1
@@ -547,7 +656,14 @@ class AgentsMixin:
                     ) as response:
                         if response.status_code >= 400:
                             body = await response.aread()
-                            raise RuntimeError(f"HTTP {response.status_code}: {body.decode('utf-8', errors='replace')[:600]}")
+                            body_text = body.decode("utf-8", errors="replace")[:600]
+                            _ctx_keywords = ("context", "too long", "token limit", "kv cache",
+                                             "exceeds", "maximum", "prompt", "capacity")
+                            if any(kw in body_text.lower() for kw in _ctx_keywords):
+                                raise ContextWindowError(
+                                    f"HTTP {response.status_code} — context window exceeded: {body_text}"
+                                )
+                            raise RuntimeError(f"HTTP {response.status_code}: {body_text}")
                         _live_ctx = _NullLive() if (self.tui_queue or self.compact_mode) else Live(console=console, refresh_per_second=8)
                         with _live_ctx as live:
                             show_thinking = think != "off" and not self.compact_mode
@@ -860,6 +976,17 @@ class AgentsMixin:
                 break  # no sanity trigger — agent completed normally, exit sanity loop
         except asyncio.CancelledError:
             raise  # let cancellation propagate so eviction works correctly
+        except ContextWindowError as _cwe:
+            _err_msg = (
+                "[agent aborted: context window exceeded — the agent's prompt was too large for "
+                "the server's context window. Try a shorter task or reduce the payload. "
+                f"Detail: {_cwe}]"
+            )
+            log.warning("Agent[%s] context overflow: %s", agent_label or "?", _cwe)
+            if self.tui_queue:
+                await self.tui_queue.put({"type": "system", "text": _err_msg})
+            final_text = (final_text + "\n\n" if final_text else "") + _err_msg
+            _hit_max_iter = False
         except Exception as _iter_exc:
             # Catch network errors, HTTP failures, and any other crash so a dead
             # agent doesn't kill the parent turn.  The finally block still runs
@@ -1032,7 +1159,7 @@ class AgentsMixin:
 
     async def _tool_queue_agents(self, agent_specs: list[dict], label: str = "") -> str:
         """Run a list of agents sequentially, store results, return consolidated summary."""
-        from chat import stream_events, _try_parse_text_tool_calls, SESSIONS_DIR
+        from chat import stream_events, _try_parse_text_tool_calls, SESSIONS_DIR, ContextWindowError
 
         if not agent_specs:
             return "[error: queue_agents called with empty agents list]"
@@ -1228,7 +1355,14 @@ class AgentsMixin:
                     ) as response:
                         if response.status_code >= 400:
                             body = await response.aread()
-                            raise RuntimeError(f"HTTP {response.status_code}: {body.decode('utf-8', errors='replace')[:600]}")
+                            body_text = body.decode("utf-8", errors="replace")[:600]
+                            _ctx_keywords = ("context", "too long", "token limit", "kv cache",
+                                             "exceeds", "maximum", "prompt", "capacity")
+                            if any(kw in body_text.lower() for kw in _ctx_keywords):
+                                raise ContextWindowError(
+                                    f"HTTP {response.status_code} — context window exceeded: {body_text}"
+                                )
+                            raise RuntimeError(f"HTTP {response.status_code}: {body_text}")
                         _live = _NullLive() if (self.tui_queue or self.compact_mode) else Live(console=console, refresh_per_second=8)
                         with _live as live:
                             async for ev_type, ev_data in stream_events(

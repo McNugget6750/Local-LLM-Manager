@@ -624,6 +624,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
             "[bold]/schedule list[/bold]          List all scheduled jobs",
             "[bold]/schedule run <id>[/bold]      Fire a job immediately",
             "[bold]/schedule remove|enable|disable <id>[/bold]  Manage jobs",
+            "[bold]/tasks clear[/bold]           Delete the current TASKS.md task list",
             "[bold]/help[/bold]                  Show this message",
             "",
             "[bold]Shift+Tab[/bold]              Cycle mode: normal → plan → normal",
@@ -639,11 +640,17 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         return True
 
     elif name == "/clear":
-        # Cancel background agent tasks and release all ISM slots
+        # Cancel background agent and process tasks; release all ISM slots
         for _t in list(session._bg_agent_tasks):
             if not _t.done():
                 _t.cancel()
         session._bg_agent_tasks.clear()
+        for _t in list(session._bg_process_tasks):
+            if not _t.done():
+                _t.cancel()
+        session._bg_process_tasks.clear()
+        session._auto_turn_count = 0
+        session._auto_trigger.clear()
         session._pending_bg_results.clear()
         session._pending_bg_tool_calls.clear()
         await _ism.force_release_all()
@@ -652,6 +659,10 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         session._n_fixed = len(_initial)
         session.tokens_used = session.tokens_prompt = session.tokens_completion = 0
         await session._refresh_project_config()
+        # Also clear the task list
+        from tools import tool_task_list
+        _tasks_path = str(Path(session.cwd) / "TASKS.md")
+        await tool_task_list("clear", path=_tasks_path)
         console.print(Rule("[dim]History cleared[/dim]", style="dim"))
         if session.tui_queue:
             await session.tui_queue.put({"type": "clear_chat"})
@@ -1247,6 +1258,19 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         except ValueError as e:
             console.print(f"[red]Invalid schedule: {e}[/red]")
             await _gui_text(session, f"[red]Invalid schedule: {e}[/red]")
+        return True
+
+    elif name == "/tasks":
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub == "clear":
+            from tools import tool_task_list
+            tasks_path = str(Path(session.cwd) / "TASKS.md")
+            result = await tool_task_list("clear", path=tasks_path)
+            console.print(f"[green]{result}[/green]")
+            await _gui_text(session, f"[green]{result}[/green]")
+        else:
+            console.print("[yellow]Usage: /tasks clear[/yellow]")
+            await _gui_text(session, "[yellow]Usage: /tasks clear[/yellow]")
         return True
 
     # Unknown /command — try skill lookup before giving up

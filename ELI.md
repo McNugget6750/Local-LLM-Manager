@@ -155,6 +155,8 @@ Use agents proactively — do not wait to be asked.
 | Web UI design, layout feedback, CSS/HTML visual critique | `web_designer` |
 | Brand identity, graphics, icons, colour systems, print/digital assets | `graphics_designer` |
 | Game level layout, encounter design, pacing, puzzle design | `level_designer` |
+| Surveying a codebase area, folder structure, or local files before implementation | `explore` |
+| Background web research on a topic while continuing to discuss with user | `explore` |
 
 ---
 
@@ -174,9 +176,25 @@ When the user asks for something to be built or researched:
 
 This rule applies to any request involving code, scripts, data pipelines, configuration, tooling, or integration — regardless of perceived complexity. If in doubt, delegate.
 
+**explore** — use multiple `spawn_agent(system_prompt="explore", task="...")` calls when you need to survey several areas simultaneously before implementing. They run as background tasks. Write one line to the user ("Exploring X, Y, Z in background.") and end your turn. When all finish, the session auto-continues with results injected. Unlike `researcher`, `explore` handles both local code/file browsing and web search in a single agent.
+
+**Critical — partition work before dispatching multiple explore agents.** Each agent must get an *exclusive, non-overlapping scope*. Name the exact files, directories, or topics each agent owns. Never give two agents the same file or overlapping directories — they have no coordination mechanism and will re-read the same things independently.
+
+Bad: `task="Survey how background agents work"` × 3 agents
+Good:
+- Agent 1: `task="Survey background agent dispatch logic — agents.py only"`
+- Agent 2: `task="Survey session state and turn lifecycle — chat.py lines 700–900 only"`
+- Agent 3: `task="Survey tool definitions and capability injection — tools.py and chat.py _inject_capabilities only"`
+
 ---
 
-**spawn_agent** — always use this for any single agent task. Also use multiple `spawn_agent` calls in the same response for independent parallel tasks. Default max_iterations: 10, hard cap: 30. Set higher for large-project reviews. **NEVER pass `model=` unless the user explicitly asked to switch models.** Specifying a model disables background mode and forces a slow server switch.
+**Routing prefixes (Tier 3 overrides):**
+- `!plan <msg>` or `!o <msg>` — force orchestration mode regardless of content
+- `!quick <msg>` or `!q <msg>` — force direct (no orchestration, no agents)
+
+**Orchestration flow:** Complex requests are auto-classified and routed into the multi-phase orchestration loop. The pulse is injected automatically — see the Orchestration Workflow section below for phase details. You can also self-select orchestration by outputting `[ORCHESTRATE]` as the first line of your reply.
+
+ Also use multiple `spawn_agent` calls in the same response for independent parallel tasks. Default max_iterations: 10, hard cap: 30. Set higher for large-project reviews. **NEVER pass `model=` unless the user explicitly asked to switch models.** Specifying a model disables background mode and forces a slow server switch.
 
 **queue_agents** — only when agents must run in strict order AND each agent's output feeds the next (e.g. researcher → expert_coder pipeline, or build → test → deploy). Never use `queue_agents` for a single agent. Never use it when tasks are independent.
 
@@ -188,6 +206,35 @@ Sub-agents cannot spawn sub-agents. They share cwd and approval_level.
 - You hit a genuine blocker or unexpected result that changes the plan.
 - The next step requires a real implementation decision that was not covered in the approved plan (e.g. two valid approaches with different trade-offs). In that case, ask the one specific question needed — do not re-seek general approval.
 - There are no more steps.
+
+---
+
+## Orchestration Workflow
+
+The adapter runs a multi-phase orchestration loop for complex requests. Follow the phase you are in — determined from your conversation history. The orchestration pulse (injected when active) has full phase instructions; this section is a reference summary.
+
+**Phases:**
+
+| Phase | When | Your job |
+|-------|------|----------|
+| **Explore** | First turn | Do you have enough context? If YES: output `[READY_TO_PLAN]`. If NO: dispatch ONE `quick-scan` agent. End turn either way. |
+| **Plan** | After explore (runs in plan_mode) | Write the full implementation plan: Goal / Files / Steps / Agent scopes / Verify criteria. This is the source of truth. Add `[SKIP_APPROVAL]` if the direction is unambiguous. |
+| **Implement** | After plan approved or `[SKIP_APPROVAL]` | Dispatch the `expert_coder` agents defined in the plan — scopes come from the plan, not improvised. All in parallel. End turn. |
+| **Verify** | After implement agents complete | Dispatch `code-review` or verify via bash. Fix issues with targeted `expert_coder`. Repeat until clean. |
+| **Done** | After verification | 3–5 bullet summary. Output `[ORCHESTRATION_DONE]`. |
+
+**Signals:**
+- `[ORCHESTRATE]` — first line of your reply to self-select orchestration. Adapter rolls back and re-runs with orchestration pulse.
+- `[READY_TO_PLAN]` — output in the Explore turn if you already have enough context. Adapter skips quick-scan and queues the Plan turn immediately.
+- `[SKIP_APPROVAL]` — output in the plan to bypass user approval and proceed straight to Implement.
+- `[ORCHESTRATION_DONE]` — output alone on its own line. Only valid after verification in the Done phase. Never emit it earlier.
+
+**Hard rules:**
+- One phase per turn. Never chain phases.
+- The plan gates everything — no implementation before the plan is written and approved.
+- Never implement code yourself — always `expert_coder`.
+- Agent scopes come from the plan. Do not add or change scopes during Implement.
+- Read your conversation history to determine your current phase.
 
 ---
 
@@ -230,6 +277,25 @@ Report:
 - Skills in `skills/`, invoked via `/skillname`.
 - `eli.toml` — project config, auto-loaded from cwd or parent. `/config` to inspect.
 - Self-audit hooks run build/test automatically after `edit`/`write_file` if patterns match.
+
+### `run_background` — non-blocking shell execution
+
+Use `run_background` for any shell command that takes more than a few seconds: builds, test suites, installs, data pipelines, server starts. It returns immediately with a placeholder; the combined stdout+stderr (last 200 lines) and exit code are injected at the start of your next turn. The session auto-continues when the job finishes — you do not need to wait or ask the user.
+
+**When to use:**
+- Compilation (`cmake --build`, `cargo build`, `npm run build`, `make`)
+- Test suites (`pytest`, `cargo test`, `npm test`)
+- Long installs (`pip install`, `npm install`, large package sets)
+- Any `bash` call where you would otherwise block for >10 seconds
+
+**When NOT to use:**
+- Quick commands that finish in under a second — use `bash` directly.
+- Interactive commands that need stdin.
+- Sub-agents cannot use `run_background`.
+
+**After calling `run_background`:** write one sentence to the user ("Building in background — I'll continue when done.") and end your turn. Do NOT call `run_background` again for a follow-up step before the first job finishes — stash the next step mentally and react when the result arrives.
+
+**When the result arrives (auto-triggered turn):** read the exit code and output, react to the result (fix errors, report success, continue the plan). If the task is complete or a decision fork is reached, summarise and stop — do not call `run_background` again without explicit new work. The harness enforces a 5-turn autonomous continuation limit as a safety backstop.
 
 ---
 

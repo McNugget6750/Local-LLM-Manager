@@ -22,6 +22,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 from PySide6.QtCore import QThread, Signal
 from chat import ChatSession, BASE_URL
 from session_state import load_state
+from qt.request_classifier import classify as _classify_request
 
 
 # ── Voice thread ──────────────────────────────────────────────────────────────
@@ -342,6 +343,7 @@ class QtChatAdapter(QThread):
     highlight_in_editor = Signal(str, int, int, int, int)  # path, start_line, end_line, start_col, end_col
     bg_agents_complete  = Signal(int)    # all background agents finished; count = number that ran
     slots_updated       = Signal(int, int)  # total_slots, in_use
+    orchestration_awaiting_approval = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -362,6 +364,28 @@ class QtChatAdapter(QThread):
 
         # Background agent drain task
         self._bg_drain_task: asyncio.Task | None = None
+
+        # Orchestration session state
+        self._orch_active: bool = False
+        self._orch_phase: str = "idle"   # explore | planning | implementing | verifying | done
+        self._orch_pulse: str = ""       # loaded at startup from orchestration_pulse.md
+        self._orch_original_request: str = ""  # persisted for compaction recovery
+
+    # ── Orchestration state persistence ─────────────────────────────────────
+
+    def _save_orch_state(self) -> None:
+        """Persist current orchestration state so it survives context compaction."""
+        from qt.session_state import save_state
+        save_state(
+            orch_active=self._orch_active,
+            orch_phase=self._orch_phase,
+            orch_original_request=self._orch_original_request,
+        )
+
+    def _clear_orch_state(self) -> None:
+        """Remove persisted orchestration state after clean completion."""
+        from qt.session_state import save_state
+        save_state(orch_active=False, orch_phase="idle", orch_original_request="")
 
     # ── Worker thread (asyncio / chat) ───────────────────────────────────────
 
@@ -387,11 +411,26 @@ class QtChatAdapter(QThread):
                     session.tui_queue = asyncio.Queue()
                 # Restore persisted settings into the live session
                 _state = load_state()
+                _orch_pulse_path = pathlib.Path(__file__).parent.parent / "agents" / "orchestration_pulse.md"
+                self._orch_pulse = _orch_pulse_path.read_text(encoding="utf-8") if _orch_pulse_path.exists() else ""
                 session.approval_level        = _state.get("approval_level", "auto")
                 session.think_level           = _state.get("think_level", "on")
                 session.compact_threshold     = float(_state.get("compact_threshold", 80)) / 100.0
                 session.keep_recent           = int(_state.get("keep_recent", 6))
                 session.input_compress_limit  = int(_state.get("input_compress_limit", 8000))
+
+                # Restore orchestration state if a session was interrupted mid-flow
+                if _state.get("orch_active"):
+                    self._orch_active           = True
+                    self._orch_phase            = _state.get("orch_phase", "explore")
+                    self._orch_original_request = _state.get("orch_original_request", "")
+                    _recovery = (
+                        f"[orchestration] Session resumed after context compaction. "
+                        f"You are in the '{self._orch_phase}' phase. "
+                        f"Original request: {self._orch_original_request!r}. "
+                        f"Continue from where you left off — do not restart from Phase 1."
+                    )
+                    self._work_queue.put_nowait((_recovery, False))
                 if session._startup_files:
                     self.system_msg.emit("Context loaded:\n" + "\n".join(session._startup_files))
                 # ISM observer — fires on any slot acquire/release and drives the panel
@@ -414,7 +453,7 @@ class QtChatAdapter(QThread):
                             await self._run_slash(session, item[1])
                         else:
                             text, plan_mode = item
-                            await self._run_turn(session, text, plan_mode)
+                            await self._dispatch_turn(session, text, plan_mode)
                 finally:
                     await _scheduler.stop()
         except SystemExit:
@@ -426,7 +465,14 @@ class QtChatAdapter(QThread):
 
     # ── Per-turn logic ───────────────────────────────────────────────────────
 
-    async def _run_turn(self, session: ChatSession, text: str, plan_mode: bool) -> None:
+    async def _run_turn(
+        self,
+        session: ChatSession,
+        text: str,
+        plan_mode: bool,
+        system_override: str | None = None,
+        custom_pulse: str | None = None,
+    ) -> None:
         # Cancel persistent bg drain if running between turns
         if self._bg_drain_task and not self._bg_drain_task.done():
             n_bg = len(session._bg_agent_tasks)
@@ -455,9 +501,14 @@ class QtChatAdapter(QThread):
             self.done.emit()
             return
 
+        _orig_system: str | None = None
+        if system_override is not None:
+            _orig_system = session.messages[0]["content"]
+            session.messages[0]["content"] = system_override
+
         try:
             self._stream_task = asyncio.create_task(
-                session.send_and_stream(text, plan_mode=plan_mode)
+                session.send_and_stream(text, plan_mode=plan_mode, custom_pulse=custom_pulse)
             )
             self.stream_started.emit()
             await self._drain_queue(session, self._stream_task)
@@ -478,6 +529,8 @@ class QtChatAdapter(QThread):
             self.error_msg.emit(str(exc))
             self.done.emit()
         finally:
+            if _orig_system is not None:
+                session.messages[0]["content"] = _orig_system
             self._stream_task = None
             self._cancel_requested = False
 
@@ -622,7 +675,55 @@ class QtChatAdapter(QThread):
                 self.system_html.emit(event["html"])
             elif etype == "text_done":
                 if event.get("source") != "agent":   # sub-agent text shown via tool_done result
-                    self.text_done.emit(event["text"])
+                    _txt = event["text"]
+                    self.text_done.emit(_txt)
+
+                    # Tier 2: Eli self-selects orchestration
+                    if not self._orch_active and _txt.lstrip().startswith("[ORCHESTRATE]"):
+                        self._orch_active = True
+                        self._orch_phase = "explore"
+                        # Capture original user request for compaction recovery
+                        _last_user = next(
+                            (m["content"] for m in reversed(session.messages) if m["role"] == "user"),
+                            ""
+                        )
+                        self._orch_original_request = (_last_user[:300] if isinstance(_last_user, str) else "")
+                        self._save_orch_state()
+                        if session.messages and session.messages[-1]["role"] == "assistant":
+                            session.messages.pop()
+                        last_user = next(
+                            (m["content"] for m in reversed(session.messages) if m["role"] == "user"), None
+                        )
+                        if last_user:
+                            self._work_queue.put_nowait((last_user, False))
+
+                    if self._orch_active and "[ORCHESTRATION_DONE]" in _txt:
+                        self._orch_active = False
+                        self._orch_phase = "idle"
+                        self._orch_original_request = ""
+                        self._clear_orch_state()
+
+                    # [SKIP_APPROVAL] in plan output — auto-advance to implementing
+                    if (self._orch_active and self._orch_phase == "planning"
+                            and "[SKIP_APPROVAL]" in _txt):
+                        self._orch_phase = "implementing"
+                        self._save_orch_state()
+                        self._work_queue.put_nowait((
+                            "[orchestration] Plan approved automatically ([SKIP_APPROVAL] set). "
+                            "Proceed to the implementing phase now.",
+                            False,
+                        ))
+
+                    # [READY_TO_PLAN] — Eli has enough context, skip quick-scan
+                    if (self._orch_active and self._orch_phase == "explore"
+                            and "[READY_TO_PLAN]" in _txt):
+                        self._orch_phase = "planning"
+                        self._save_orch_state()
+                        self._work_queue.put_nowait((
+                            "[orchestration] Context sufficient. Write the implementation plan now. "
+                            "This turn runs in plan_mode.",
+                            False,
+                        ))
             elif etype == "usage":
                 tool_id_ev = event.get("tool_id", "")
                 if tool_id_ev:
@@ -669,19 +770,76 @@ class QtChatAdapter(QThread):
                 self.bg_agents_complete.emit(event.get("count", 0))
             elif etype == "done":
                 self.done.emit()
-                if session._bg_agent_tasks:
+                if session._bg_agent_tasks or session._bg_process_tasks:
                     self._bg_drain_task = asyncio.create_task(
                         self._drain_bg_agents(session)
                     )
+                elif session._pending_bg_results:
+                    # All tasks finished during this turn (before the "done" event was processed).
+                    # Results are waiting — schedule continuation immediately.
+                    n = len(session._pending_bg_results)
+                    noun = "task" if n == 1 else f"{n} tasks"
+                    self._work_queue.put_nowait((
+                        f"[System: Background {noun} completed. "
+                        f"Results are now in context. "
+                        f"Synthesize and respond to the user now. Do NOT dispatch more agents.]",
+                        False,
+                    ))
                 return
 
+    # ── Routing and orchestration ────────────────────────────────────────────
+
+    async def _dispatch_turn(self, session: ChatSession, text: str, plan_mode: bool) -> None:
+        """Classify and route a user message to the appropriate turn handler."""
+        # Mid-wait injection: user spoke while background tasks are still running
+        _bg_running = len(session._bg_agent_tasks) + len(session._bg_process_tasks)
+        _is_system = text.startswith(("[System:", "[system:", "[background:", "[Background:", "[orchestration"))
+        if _bg_running and not _is_system:
+            noun = "agent" if _bg_running == 1 else f"{_bg_running} background tasks"
+            text = (
+                f"[context: {_bg_running} background {noun} still running — "
+                f"user message arrived mid-wait. Acknowledge briefly.]\n{text}"
+            )
+            pulse = self._orch_pulse if self._orch_active else None
+            await self._run_turn(session, text, plan_mode, custom_pulse=pulse)
+            return
+
+        if self._orch_active:
+            if self._orch_phase == "planning" and not _is_system:
+                # User approved the plan — advance phase and run normally with orch pulse
+                self._orch_phase = "implementing"
+                self._save_orch_state()
+                await self._run_turn(session, text, plan_mode=False, custom_pulse=self._orch_pulse)
+            elif self._orch_phase == "planning":
+                # System-injected planning notification — run in plan_mode (no custom pulse)
+                await self._run_turn(session, text, plan_mode=True, custom_pulse=None)
+            else:
+                await self._run_turn(session, text, plan_mode=False, custom_pulse=self._orch_pulse)
+            return
+
+        cls = _classify_request(text)
+        if cls == "orchestrate" and not plan_mode:
+            self._orch_active = True
+            self._orch_phase = "explore"
+            self._orch_original_request = text[:300]
+            self._save_orch_state()
+            await self._run_turn(session, text, plan_mode=False, custom_pulse=self._orch_pulse)
+        else:
+            # "direct", "ambiguous", and plan_mode all run via normal turn
+            await self._run_turn(session, text, plan_mode)
+
     async def _drain_bg_agents(self, session: "ChatSession") -> None:
-        """Drain tui_queue between turns while background agents are still running."""
+        """Drain tui_queue between turns while background agents/processes are still running.
+
+        Loops until both _bg_agent_tasks and _bg_process_tasks are empty.
+        Only counts spawn_agent tool_done events as agent completions — internal
+        tool calls within agents are forwarded but not counted.
+        """
         _completed = 0
         _completed_labels: list[str] = []
         _cancelled = False
         try:
-            while session._bg_agent_tasks:
+            while session._bg_agent_tasks or session._bg_process_tasks:
                 try:
                     event = await asyncio.wait_for(session.tui_queue.get(), timeout=0.1)
                 except asyncio.TimeoutError:
@@ -704,9 +862,11 @@ class QtChatAdapter(QThread):
                     else:
                         self.usage.emit(int(event.get("slot_index", 0)), int(event.get("tokens", 0)), int(event.get("ctx", 0)))
                 elif etype == "tool_done":
-                    _completed += 1
-                    lbl = event.get("agent_label") or f"agent {_completed}"
-                    _completed_labels.append(lbl)
+                    # Only count top-level spawn_agent completions, not internal agent tool calls
+                    if event.get("name") == "spawn_agent":
+                        _completed += 1
+                        lbl = event.get("agent_label") or f"agent {_completed}"
+                        _completed_labels.append(lbl)
                     self.tool_done.emit(event.get("id", ""), event.get("name", ""),
                                         event.get("result", ""), bool(event.get("is_error", False)))
                 elif etype == "system":
@@ -736,17 +896,52 @@ class QtChatAdapter(QThread):
             self._pending_future = None
             raise
         finally:
-            if not _cancelled and _completed:
-                self.bg_agents_complete.emit(_completed)
-                label_list = ", ".join(f"'{l}'" for l in _completed_labels)
-                noun = "agent" if _completed == 1 else f"{_completed} agents"
-                notification = (
-                    f"[System: Background {noun} completed ({label_list}). "
-                    f"Results are now in context.\n"
-                    f"Check your current task list. If any items were explicitly waiting on "
-                    f"{'this agent' if _completed == 1 else 'these agents'}, proceed with those now. "
-                    f"If nothing was pending, no action is needed.]"
-                )
+            if not _cancelled and session._pending_bg_results:
+                n_results = len(session._pending_bg_results)
+                if _completed:
+                    self.bg_agents_complete.emit(_completed)
+                    label_list = ", ".join(f"'{l}'" for l in _completed_labels)
+                    noun = "agent" if _completed == 1 else f"{_completed} agents"
+                    if self._orch_active:
+                        if self._orch_phase == "explore":
+                            self._orch_phase = "planning"
+                            self._save_orch_state()
+                            notification = (
+                                f"[orchestration] Exploration complete ({label_list}). "
+                                f"Results in context. Synthesize into an implementation plan now. "
+                                f"This turn runs in plan_mode."
+                            )
+                        elif self._orch_phase == "implementing":
+                            self._orch_phase = "verifying"
+                            self._save_orch_state()
+                            notification = (
+                                f"[orchestration] Implementation complete ({label_list}). "
+                                f"Results in context. Verify the work now."
+                            )
+                        elif self._orch_phase == "verifying":
+                            notification = (
+                                f"[orchestration] Verification complete ({label_list}). "
+                                f"Results in context. Determine if the workflow is done or if fixes are needed."
+                            )
+                        else:
+                            notification = (
+                                f"[orchestration] Background {noun} completed ({label_list}). "
+                                f"Results in context. Continue the workflow."
+                            )
+                    else:
+                        notification = (
+                            f"[System: Background {noun} completed ({label_list}). "
+                            f"Results are now in context. "
+                            f"Synthesize the findings and present your response to the user now. "
+                            f"Do NOT dispatch more agents — consolidate and respond directly.]"
+                        )
+                else:
+                    # Background processes completed (no spawn_agent agents)
+                    noun = "task" if n_results == 1 else f"{n_results} tasks"
+                    notification = (
+                        f"[System: Background {noun} completed. "
+                        "Results are now in context. Continue work.]"
+                    )
                 self._work_queue.put_nowait((notification, False))
             self._bg_drain_task = None
 
