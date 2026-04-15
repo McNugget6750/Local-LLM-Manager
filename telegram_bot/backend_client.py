@@ -29,7 +29,7 @@ class BackendClient:
         if not self.base_url.endswith('/'):
             self.base_url += '/'
         
-        self.timeout = httpx.Timeout(120.0, connect=5.0)
+        self.timeout = httpx.Timeout(900.0, connect=5.0)
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout)
 
     async def send_message(self, token: str, message: str) -> str:
@@ -108,6 +108,24 @@ class BackendClient:
         except Exception as e:
             logger.debug(f"Token validation failed: {e}")
             return False
+
+    async def post_approve(self, response: str) -> dict:
+        """
+        Send an approval response to the bridge's /approve endpoint.
+
+        Args:
+            response: "1" (allow once), "2" (allow session), or "3" (deny).
+
+        Returns:
+            Parsed JSON dict from bridge, e.g. {"ok": true} or {"ok": false, "reason": "..."}.
+        """
+        try:
+            resp = await self._client.post("/approve", json={"response": response})
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.warning(f"post_approve failed: {e}")
+            return {"ok": False, "reason": str(e)}
 
     async def check_status(self) -> bool:
         """

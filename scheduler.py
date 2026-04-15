@@ -73,6 +73,43 @@ async def tg_send(user_id: int, text: str) -> str:
         return f"[send_telegram error: {e}]"
 
 
+async def tg_send_approval(user_id: int, text: str, keyboard: list) -> int | None:
+    """Send a message with an inline keyboard. Returns message_id or None on error."""
+    token = _load_bot_token()
+    if not token:
+        return None
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json={
+                "chat_id": user_id,
+                "text": text,
+                "reply_markup": {"inline_keyboard": keyboard},
+            })
+            if resp.status_code == 200:
+                return resp.json()["result"]["message_id"]
+    except Exception as e:
+        log.warning("tg_send_approval error: %s", e)
+    return None
+
+
+async def tg_edit_message(user_id: int, message_id: int, text: str) -> None:
+    """Edit the text of a previously sent message (best-effort, silently ignores errors)."""
+    token = _load_bot_token()
+    if not token:
+        return
+    url = f"https://api.telegram.org/bot{token}/editMessageText"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(url, json={
+                "chat_id": user_id,
+                "message_id": message_id,
+                "text": text,
+            })
+    except Exception:
+        pass
+
+
 # ── Schedule parsing ───────────────────────────────────────────────────────────
 
 _DAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}

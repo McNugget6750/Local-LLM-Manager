@@ -1,9 +1,9 @@
 import asyncio
 from typing import Optional
 
-from aiogram import Router, types, Bot
+from aiogram import Router, types, Bot, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery
 
 from telegram_bot.backend_client import BackendClient, BackendBusyError, BackendTimeoutError, BackendError
 from telegram_bot.user_manager import UserManager
@@ -113,3 +113,34 @@ async def handle_message(message: Message, bot: Bot, user_manager: UserManager, 
             await typing_task
         except asyncio.CancelledError:
             pass
+
+
+_APPROVAL_LABELS = {"1": "✅ Allowed once", "2": "🔒 Allowed for session", "3": "❌ Denied"}
+
+@router.callback_query(F.data.startswith("approve:"))
+async def handle_approval_callback(
+    callback: CallbackQuery,
+    backend_client: BackendClient,
+):
+    response = callback.data.split(":", 1)[1]   # "1", "2", or "3"
+    logger.info(f"[TG bot] approval callback received: response={response!r} from user={callback.from_user.id}")
+    if response not in _APPROVAL_LABELS:
+        await callback.answer("Unknown option.", show_alert=True)
+        return
+
+    logger.info(f"[TG bot] calling post_approve({response!r})")
+    result = await backend_client.post_approve(response)
+    logger.info(f"[TG bot] post_approve result: {result}")
+
+    if result.get("ok"):
+        label = _APPROVAL_LABELS[response]
+        await callback.answer(label)
+        try:
+            await callback.message.edit_text(
+                callback.message.text + f"\n\n{label}"
+            )
+        except Exception:
+            pass  # editing can fail if message is too old or unchanged
+    else:
+        reason = result.get("reason", "unknown")
+        await callback.answer(f"Could not apply: {reason}", show_alert=True)

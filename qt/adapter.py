@@ -318,7 +318,8 @@ class QtChatAdapter(QThread):
     text_token      = Signal(str)
     tool_start      = Signal(str, str, str)        # id, name, args_json
     tool_done       = Signal(str, str, str, bool)  # id, name, result, is_error
-    approval_needed = Signal(str, str, str, str)    # title, message, tool_name, args_str
+    approval_needed       = Signal(str, str, str, str)  # title, message, tool_name, args_str
+    approval_auto_resolved = Signal()                   # approval resolved outside the GUI dialog
     text_done       = Signal(str)
     usage           = Signal(int, int, int)         # slot_index, tokens_used, ctx_window
     agent_usage     = Signal(int, str, str, int, int)  # slot_index, tool_id, agent_label, tokens_used, ctx_window
@@ -400,6 +401,7 @@ class QtChatAdapter(QThread):
         self.text_token.connect(self._remote.on_text_token)
         self.text_done.connect(self._remote.on_text_done)
         self.tool_done.connect(self._remote.on_tool_done)
+        self.approval_needed.connect(self._remote.on_approval_needed)
         self.done.connect(self._remote.on_done)
         self._ready.set()
         self._remote.start()
@@ -975,8 +977,16 @@ class QtChatAdapter(QThread):
             self._loop.call_soon_threadsafe(self._safe_resolve, fut, approved, notes)
 
     def _safe_resolve(self, fut: asyncio.Future, approved: bool, notes: str) -> None:
+        import sys, threading as _thr
+        print(f"[DBG approval] _safe_resolve — approved={approved} fut.done()={fut.done()} thread={_thr.current_thread().name!r}", file=sys.stderr, flush=True)
         if not fut.done():
             fut.set_result((approved, notes))
+            label = "allowed" if approved else "denied"
+            self.system_msg.emit(f"[Telegram approval: {label}]")
+            self.approval_auto_resolved.emit()
+            if self._remote is not None:
+                self._remote.on_approval_resolved()
+            print(f"[DBG approval] _safe_resolve done — future resolved, signals emitted", file=sys.stderr, flush=True)
 
     def shutdown(self) -> None:
         if self._remote is not None:

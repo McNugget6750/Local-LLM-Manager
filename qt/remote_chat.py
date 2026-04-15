@@ -20,7 +20,7 @@ import asyncio
 import json
 import re
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 PORT    = 1237
 TIMEOUT = 900   # 15 minutes server-side; use --max-time 960 on the curl side
@@ -34,11 +34,16 @@ class RemoteChatServer:
         self._eli_text      = ""                 # captured from text_done (Eli's reply)
         self._agent_results: list[str] = []      # captured from tool_done for agent tools
         self._telegram_uid: int | None = None    # set when request came via Telegram bot
-        self._busy          = False
-        self.mirror_enabled  = True              # mirror all Eli replies to ADMIN_ID
-        self._had_text_tokens = False            # True only when real LLM tokens arrived
+        self._busy               = False
+        self.mirror_enabled      = True          # mirror all Eli replies to ADMIN_ID
+        self._had_text_tokens    = False         # True only when real LLM tokens arrived
+        self._pending_approval   = False         # True while waiting for tool approval
+        self._approval_rule      = ""            # session-allow rule for the pending approval
+        self._approval_admin_id: int | None = None
+        self._approval_tg_mid:   int | None = None  # message_id of the TG approval prompt
+        self._tg_approval:       tuple | None = None  # (approved, notes) set by /approve, consumed by QTimer
 
-        self._server = HTTPServer(("127.0.0.1", PORT), self._make_handler())
+        self._server = ThreadingHTTPServer(("127.0.0.1", PORT), self._make_handler())
         self._thread = threading.Thread(
             target=self._server.serve_forever,
             daemon=True,
@@ -74,6 +79,69 @@ class RemoteChatServer:
                         target=lambda: asyncio.run(tg_send(admin_id, text)),
                         daemon=True,
                     ).start()
+
+    def on_approval_needed(self, title: str, message: str, tool_name: str, args_str: str) -> None:
+        """Send a Telegram approval prompt to ADMIN_ID with inline buttons."""
+        from scheduler import tg_send_approval, _load_admin_id
+        admin_id = _load_admin_id()
+        if not admin_id:
+            return
+        # Compute session-allow rule (mirrors window.py logic, minus CWD path_prefix)
+        import json as _json, os as _os
+        try:
+            args = _json.loads(args_str) if args_str else {}
+        except Exception:
+            args = {}
+        cmd = args.get("command", "")
+        if tool_name == "bash" and cmd:
+            first = cmd.strip().split()[0]
+            self._approval_rule = f"cmd_pattern:{first}*"
+        elif tool_name in ("edit", "write_file"):
+            path = args.get("path", "")
+            self._approval_rule = f"path_prefix:{_os.path.dirname(path)}" if path else f"tool:{tool_name}"
+        else:
+            self._approval_rule = f"tool:{tool_name}" if tool_name else ""
+
+        # Build message text
+        detail = cmd if (tool_name == "bash" and cmd) else args.get("path", args_str or "")
+        tg_text = (
+            f"⚠️ Approval Required\n\n"
+            f"Tool: {tool_name}\n"
+            + (f"{detail[:300]}\n" if detail else "")
+            + f"\n{message[:600]}"
+        )
+        keyboard = [[
+            {"text": "✅ Allow once",    "callback_data": "approve:1"},
+            {"text": "🔒 Allow session", "callback_data": "approve:2"},
+            {"text": "❌ Deny",          "callback_data": "approve:3"},
+        ]]
+        self._pending_approval = True
+        self._approval_admin_id = admin_id
+        self._approval_tg_mid = None
+
+        def _send():
+            import asyncio as _aio
+            mid = _aio.run(tg_send_approval(admin_id, tg_text, keyboard))
+            self._approval_tg_mid = mid
+
+        threading.Thread(target=_send, daemon=True).start()
+
+    def on_approval_resolved(self) -> None:
+        """Called when approval is resolved (from GUI or Telegram) — clean up state."""
+        if not self._pending_approval:
+            return
+        self._pending_approval = False
+        admin_id = self._approval_admin_id
+        mid = self._approval_tg_mid
+        if admin_id and mid:
+            from scheduler import tg_edit_message
+            threading.Thread(
+                target=lambda: asyncio.run(tg_edit_message(admin_id, mid, "✅ Approval resolved.")),
+                daemon=True,
+            ).start()
+        self._approval_admin_id = None
+        self._approval_tg_mid = None
+        self._approval_rule = ""
 
     def on_done(self) -> None:
         self._push_to_admin()
@@ -126,11 +194,48 @@ class RemoteChatServer:
                 if self.path == "/status":
                     with srv._lock:
                         busy = srv._busy
-                    self._send_json(200, {"busy": busy, "port": PORT})
+                    self._send_json(200, {
+                        "busy": busy,
+                        "port": PORT,
+                        "pending_approval": srv._pending_approval,
+                    })
                 else:
                     self._send_json(404, {"error": "not found"})
 
             def do_POST(self):
+                if self.path == "/approve":
+                    length = int(self.headers.get("Content-Length", 0))
+                    try:
+                        body = json.loads(self.rfile.read(length))
+                    except Exception:
+                        self._send_json(400, {"error": "invalid JSON"})
+                        return
+                    if not srv._pending_approval:
+                        self._send_json(200, {"ok": False, "reason": "no pending approval"})
+                        return
+                    response = str(body.get("response", "")).strip()
+                    if response == "1":
+                        approved, notes = True, ""
+                    elif response == "2":
+                        approved, notes = True, (f"session_allow:{srv._approval_rule}"
+                                                  if srv._approval_rule else "")
+                    elif response == "3":
+                        approved, notes = False, ""
+                    else:
+                        self._send_json(400, {"error": "response must be '1', '2', or '3'"})
+                        return
+                    import sys, threading as _thr
+                    print(f"[/approve] received approved={approved} notes={notes!r} thread={_thr.current_thread().name!r}", flush=True, file=sys.stderr)
+                    print(f"[/approve] pending_future={srv._adapter._pending_future}", flush=True, file=sys.stderr)
+                    # Store for the main-thread QTimer to consume; also call resolve_approval
+                    # so the asyncio future is resolved via call_soon_threadsafe.
+                    srv._tg_approval = (approved, notes)
+                    print(f"[/approve] _tg_approval set to {srv._tg_approval!r}", flush=True, file=sys.stderr)
+                    srv._adapter.resolve_approval(approved, notes)
+                    print(f"[/approve] resolve_approval() called", flush=True, file=sys.stderr)
+                    self._send_json(200, {"ok": True})
+                    return
+
                 if self.path != "/chat":
                     self._send_json(404, {"error": "not found"})
                     return

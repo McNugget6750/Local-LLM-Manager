@@ -507,6 +507,7 @@ class MainWindow(QMainWindow):
         self._input_history_draft: str = ""        # saved draft while browsing
         self._plan_mode: bool = False
         self._busy: bool = False
+        self._approval_dlg = None    # active approval dialog, if any
         self._message_queue: list[tuple[str, bool]] = []  # (submit_text, plan_mode)
         self._agent_header_pending: bool = False
         self._response_anchor: int = 0   # char position after agent header in full_view
@@ -1158,7 +1159,9 @@ class MainWindow(QMainWindow):
         self._adapter.text_done.connect(self._on_text_done)
         self._adapter.tool_start.connect(self._on_tool_start)
         self._adapter.tool_done.connect(self._on_tool_done_signal)
-        self._adapter.approval_needed.connect(self._on_approval_needed)
+        self._adapter.approval_needed.connect(
+            self._on_approval_needed, Qt.ConnectionType.QueuedConnection
+        )
         self._adapter.usage.connect(self._on_usage)
         self._adapter.agent_usage.connect(self._on_agent_usage)
         self._adapter.system_msg.connect(self._on_system_msg)
@@ -1801,6 +1804,8 @@ class MainWindow(QMainWindow):
 
     @Slot(str, str, str, str)
     def _on_approval_needed(self, title: str, message: str, tool_name: str, args_str: str):
+        import threading as _threading
+        print(f"[DBG approval] _on_approval_needed fired — thread={_threading.current_thread().name!r} tool={tool_name!r}", file=sys.stderr, flush=True)
         import json as _json
         from PySide6.QtWidgets import (
             QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit,
@@ -1860,13 +1865,56 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(btn_session)
         layout.addLayout(btn_row)
 
-        result = {"approved": False, "notes": ""}
-        btn_once.clicked.connect(lambda: (result.update({"approved": True, "notes": ""}), dlg.accept()))
-        btn_session.clicked.connect(lambda: (result.update({"approved": True, "notes": f"session_allow:{rule}"}), dlg.accept()))
-        btn_deny.clicked.connect(dlg.reject)
+        _resolved = [False]
 
-        dlg.exec()
-        self._adapter.resolve_approval(result["approved"], result["notes"])
+        def _resolve(approved: bool, notes: str) -> None:
+            import threading as _t
+            print(f"[DBG approval] _resolve called — approved={approved} notes={notes!r} thread={_t.current_thread().name!r} already_resolved={_resolved[0]}", file=sys.stderr, flush=True)
+            if _resolved[0]:
+                return
+            _resolved[0] = True
+            self._adapter.resolve_approval(approved, notes)
+            print(f"[DBG approval] calling dlg.close()", file=sys.stderr, flush=True)
+            dlg.close()
+
+        btn_once.clicked.connect(lambda: _resolve(True, ""))
+        btn_session.clicked.connect(lambda: _resolve(True, f"session_allow:{rule}"))
+        btn_deny.clicked.connect(lambda: _resolve(False, ""))
+
+        # Poll every 100 ms for Telegram approval arriving via /approve endpoint.
+        # _tg_approval is set by the HTTP thread; we consume it here on the main thread
+        # and call _resolve() directly — no cross-thread asyncio magic needed.
+        from PySide6.QtCore import QTimer
+        _poll = QTimer(dlg)
+        _poll.setInterval(100)
+        _poll_count = [0]
+        def _check_external():
+            _poll_count[0] += 1
+            if _poll_count[0] == 1:
+                import threading as _t
+                print(f"[DBG approval] QTimer first tick — thread={_t.current_thread().name!r}", file=sys.stderr, flush=True)
+            remote = self._adapter._remote
+            if remote is None:
+                return
+            tg = remote._tg_approval
+            if tg is not None:
+                print(f"[DBG approval] QTimer saw _tg_approval={tg!r} — consuming", file=sys.stderr, flush=True)
+                remote._tg_approval = None   # consume
+                _poll.stop()
+                _resolve(tg[0], tg[1])       # calls resolve_approval + dlg.close()
+        _poll.timeout.connect(_check_external)
+        _poll.start()
+
+        def _cleanup():
+            _poll.stop()
+            self._approval_dlg = None
+
+        dlg.finished.connect(_cleanup)
+
+        self._approval_dlg = dlg
+        dlg.show()          # non-blocking — keeps the normal Qt event loop running
+        dlg.raise_()
+        dlg.activateWindow()
 
     @Slot(int, int, int)
     def _on_usage(self, slot_index: int, tokens: int, ctx: int):
@@ -2214,12 +2262,12 @@ class MainWindow(QMainWindow):
             self._stat_status.setStyleSheet("color: #7dff7d;")
             self._server_status.setStyleSheet("color: #7dff7d; font-size: 14px;")
             if ctx > 0:
-                self._ctx_bars.update_eli(used, ctx)
+                self._ctx_bars.update_slot(0, "", "Eli", used, ctx)
         else:
             self._stat_status.setText("● Offline")
             self._stat_status.setStyleSheet("color: #ef4444;")
             self._server_status.setStyleSheet("color: #ef4444; font-size: 14px;")
-            self._ctx_bars.update_eli(0, 0)
+            self._ctx_bars.update_slot(0, "", "Eli", 0, 0)
         self._stat_speed.setText(speed_text)
 
     @Slot(str)
