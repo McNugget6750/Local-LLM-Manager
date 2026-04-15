@@ -16,6 +16,7 @@ Usage from curl (always pass --max-time to avoid client-side timeout):
     -H "Content-Type: application/json" \\
     -d '{"message": "Please review qt/window.py"}'
 """
+import asyncio
 import json
 import re
 import threading
@@ -34,6 +35,8 @@ class RemoteChatServer:
         self._agent_results: list[str] = []      # captured from tool_done for agent tools
         self._telegram_uid: int | None = None    # set when request came via Telegram bot
         self._busy          = False
+        self.mirror_enabled  = True              # mirror all Eli replies to ADMIN_ID
+        self._had_text_tokens = False            # True only when real LLM tokens arrived
 
         self._server = HTTPServer(("127.0.0.1", PORT), self._make_handler())
         self._thread = threading.Thread(
@@ -52,16 +55,55 @@ class RemoteChatServer:
 
     # ── Signal callbacks (called from adapter's asyncio/Qt thread) ────────────
 
+    def on_text_token(self, _token: str) -> None:
+        self._had_text_tokens = True
+
     def on_text_done(self, text: str) -> None:
         self._eli_text = text
 
     def on_tool_done(self, tool_id: str, name: str, result: str, is_error: bool) -> None:
-        """Capture agent output so the caller gets the full review, not just Eli's summary."""
+        """Capture agent output and immediately mirror it to ADMIN_ID."""
         if name in ("spawn_agent", "queue_agents") and result.strip() and not is_error:
             self._agent_results.append(result)
+            if self.mirror_enabled:
+                from scheduler import tg_send, _load_admin_id
+                admin_id = _load_admin_id()
+                if admin_id and not (self._busy and self._telegram_uid == admin_id):
+                    text = f"[Agent]\n{result}"
+                    threading.Thread(
+                        target=lambda: asyncio.run(tg_send(admin_id, text)),
+                        daemon=True,
+                    ).start()
 
     def on_done(self) -> None:
+        self._push_to_admin()
+        self._had_text_tokens = False
         self._event.set()
+
+    def _push_to_admin(self) -> None:
+        """Mirror Eli's reply + agent results to ADMIN_ID via Telegram (fire-and-forget).
+
+        Only pushes when real LLM tokens were streamed (suppresses slash-command noise)
+        or when agent results are present.
+        """
+        if not self.mirror_enabled:
+            return
+        from scheduler import tg_send, _load_admin_id
+        admin_id = _load_admin_id()
+        if not admin_id:
+            return
+        # If an HTTP request is still live it will deliver via the normal bot path —
+        # skip the push only for that turn when the sender is already ADMIN_ID.
+        if self._busy and self._telegram_uid == admin_id:
+            return
+        # Only push if real LLM tokens were streamed (not slash-command output)
+        if not (self._eli_text and self._had_text_tokens):
+            return
+        _text = self._eli_text
+        threading.Thread(
+            target=lambda: asyncio.run(tg_send(admin_id, _text)),
+            daemon=True,
+        ).start()
 
     # ── HTTP handler ─────────────────────────────────────────────────────────
 
@@ -125,10 +167,11 @@ class RemoteChatServer:
                     return
 
                 try:
-                    srv._busy          = True
-                    srv._eli_text      = ""
-                    srv._agent_results = []
-                    srv._telegram_uid  = telegram_user_id
+                    srv._busy             = True
+                    srv._eli_text         = ""
+                    srv._agent_results    = []
+                    srv._telegram_uid     = telegram_user_id
+                    srv._had_text_tokens  = False
                     srv._event.clear()
 
                     if message.startswith("/"):

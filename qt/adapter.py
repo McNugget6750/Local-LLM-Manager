@@ -397,6 +397,7 @@ class QtChatAdapter(QThread):
         # Qt main thread which disrupts the loopback health-check poll on Windows.
         from qt.remote_chat import RemoteChatServer
         self._remote = RemoteChatServer(self)
+        self.text_token.connect(self._remote.on_text_token)
         self.text_done.connect(self._remote.on_text_done)
         self.tool_done.connect(self._remote.on_tool_done)
         self.done.connect(self._remote.on_done)

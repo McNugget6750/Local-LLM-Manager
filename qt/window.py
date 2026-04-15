@@ -715,6 +715,12 @@ class MainWindow(QMainWindow):
         self._auto_scroll_cb.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px;")
         tb.addWidget(self._auto_scroll_cb)
 
+        self._tg_mirror_cb = QCheckBox("TG Mirror")
+        self._tg_mirror_cb.setChecked(True)
+        self._tg_mirror_cb.setToolTip("Mirror all Eli replies and agent outputs to ADMIN_ID via Telegram")
+        self._tg_mirror_cb.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px;")
+        tb.addWidget(self._tg_mirror_cb)
+
         # Keep hidden server_url for compatibility with poll logic
         self._server_url = QLineEdit("localhost:1234")
         self._server_url.hide()
@@ -1163,6 +1169,10 @@ class MainWindow(QMainWindow):
         self._adapter.cwd_changed.connect(self._on_cwd_changed)
         self._adapter.session_saved.connect(self._on_session_saved)
         self._adapter.session_resume_html.connect(self._on_session_resume_html)
+
+        self._tg_mirror_cb.toggled.connect(
+            lambda checked: setattr(self._adapter._remote, "mirror_enabled", checked)
+        )
 
         # Align session CWD with GUI initial CWD on startup
         self._adapter.submit_slash(f"/cd {self._cwd}")
