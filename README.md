@@ -3,7 +3,7 @@
 A local LLM chat GUI + server manager supporting multiple inference backends:
 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp), [llama.cpp](https://github.com/ggml-org/llama.cpp), and [vLLM](https://github.com/vllm-project/vllm) (via WSL).
 
-Includes **Eli** — a coding assistant with tool use, background agents, agent queues, vision analysis, voice I/O, plan mode, autonomous execute-plan loops, Telegram remote access, scheduled background jobs, slash commands, and persistent session state.
+Includes **Eli** — a coding assistant with tool use, background agents, agent queues, vision analysis, voice I/O, plan mode, multi-phase orchestration loops, autonomous execute-plan loops, Telegram remote access, scheduled background jobs, slash commands, and persistent session state.
 
 ---
 
@@ -19,6 +19,7 @@ Includes **Eli** — a coding assistant with tool use, background agents, agent 
 | `schedules.json` | Persisted job definitions (auto-created on first `/schedule` use) |
 | `ELI.md` | Eli's behavioral rules and persona |
 | `behavioral_pulse.md` | Condensed rules injected before every turn for attention retention |
+| `agents/orchestration_pulse.md` | System context injected during orchestration turns |
 | `agents/` | Agent persona definitions |
 | `skills/` | Slash command prompt workflows |
 | `eli.toml` | Project-specific config (gitignored, auto-loaded from cwd) |
@@ -274,9 +275,12 @@ You are an expert software engineer...
 | `code-review` | — | Review code for correctness, safety, and design issues |
 | `doc-writer` | docs | Write docstrings or README sections |
 | `expert_coder` | python_files | Production code implementation |
+| `explore` | — | General codebase exploration for non-orchestrated requests |
 | `generic` | — | General-purpose tasks, quick tests, system checks |
 | `graphics_designer` | — | Brand identity, icons, colour systems |
 | `level_designer` | — | Game level layout, encounter design, puzzle design |
+| `orchestrator` | — | (Deprecated) Single-turn recon — superseded by orchestration loop |
+| `quick-scan` | — | Lightweight context gatherer used in orchestration Phase 1 |
 | `researcher` | — | Research a library, API, or technical question |
 | `test-writer` | test_files | Write unit tests |
 | `voice` | — | Voice interaction persona |
@@ -300,6 +304,54 @@ queue_agents(tasks=[
 ```
 
 Results from completed background agents are injected into Eli's context before the next user turn. Eli is then notified with a system message listing which agents finished, so it can continue any pending task list items that were waiting.
+
+---
+
+## Orchestration
+
+For complex multi-step requests, Eli enters an orchestration loop that breaks work into phases and drives them to completion automatically using background agents.
+
+### How it starts
+
+| Entry path | Trigger |
+|-----------|---------|
+| **Auto-classify (Tier 1)** | Request is classified as complex; adapter sets orchestration mode and routes to Eli |
+| **Eli self-select (Tier 2)** | Eli outputs `[ORCHESTRATE]` as the first line; adapter rolls back the message and re-runs in orchestration mode |
+| **Explicit prefix (Tier 3)** | `!plan` or `!o` prefix forces orchestration mode |
+
+### Phases
+
+```
+User request
+    │
+    ▼
+Phase 1 — Explore
+    Eli dispatches a quick-scan agent to gather context, or emits
+    [READY_TO_PLAN] if it already has enough.
+    │
+    ▼
+Phase 2 — Plan  (plan_mode)
+    Eli writes a structured plan: Goal / Files / Steps / Agent scopes / Verify criteria.
+    Shown to user for approval, or auto-advanced with [SKIP_APPROVAL].
+    │
+    ▼
+Phase 3 — Implement
+    One expert_coder agent dispatched per scope defined in the plan.
+    Agents run in parallel.
+    │
+    ▼
+Phase 4 — Verify
+    Code-review agent or direct bash verification.
+    Issues found → targeted fix → re-verify.
+    │
+    ▼
+Phase 5 — Done
+    3–5 bullet summary. [ORCHESTRATION_DONE] exits orchestration mode.
+```
+
+### Compaction survival
+
+Orchestration state (`phase`, `active`, `original_request`) is persisted to `sessions/state.json` on every phase transition. If context compaction fires mid-session, the state is restored on the next startup and Eli is injected with a recovery message telling it which phase to resume from — no restart from Phase 1.
 
 ---
 
@@ -435,6 +487,7 @@ The following are saved per session and restored on `--continue` or `/resume`:
 - Active model and role
 - Working directory
 - Full message history (with compaction summary if `/compact` was used)
+- Orchestration state (active phase and original request) — restored automatically after context compaction
 
 Sessions are stored in `sessions/` as JSON.
 
