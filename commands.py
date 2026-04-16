@@ -781,7 +781,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
 
     elif name == "/resume":
         resume_name = parts[1] if len(parts) > 1 else None
-        saved_msgs, sess_path, saved_cwd = _load_session(resume_name)
+        saved_msgs, sess_path, saved_cwd, saved_name = _load_session(resume_name)
         if not saved_msgs:
             hint = resume_name or "latest"
             console.print(f"[yellow]No session found matching '{hint}'[/yellow]")
@@ -790,6 +790,7 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         session.messages = _initial + saved_msgs
         session._n_fixed = len(_initial)
         session._session_path = sess_path
+        session._session_name = saved_name
         session.tokens_used = session.tokens_prompt = session.tokens_completion = 0
         if saved_cwd and Path(saved_cwd).is_dir():
             session.cwd = Path(saved_cwd)

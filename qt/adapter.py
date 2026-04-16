@@ -332,6 +332,7 @@ class QtChatAdapter(QThread):
     cwd_changed     = Signal(str)          # new CWD path after /resume or /cd
     session_saved   = Signal(str)          # full path to the saved JSON file
     session_resume_html = Signal(str)      # full path to JSON; window loads sibling .html
+    session_renamed = Signal(str, str)     # (stem, new_name) after auto-naming
 
     # Voice signals (emitted by _VoiceThread directly)
     voice_activity      = Signal(str)
@@ -365,12 +366,15 @@ class QtChatAdapter(QThread):
 
         # Background agent drain task
         self._bg_drain_task: asyncio.Task | None = None
+        self._current_session = None   # set during run() so cancel() can reach bg tasks
+        self._turn_count: int = 0      # tracks turns for auto-naming
 
         # Orchestration session state
         self._orch_active: bool = False
         self._orch_phase: str = "idle"   # explore | planning | implementing | verifying | done
         self._orch_pulse: str = ""       # loaded at startup from orchestration_pulse.md
         self._orch_original_request: str = ""  # persisted for compaction recovery
+        self._orch_awaiting_resume: bool = False  # True after GUI restart with stale orch state
 
     # ── Orchestration state persistence ─────────────────────────────────────
 
@@ -410,6 +414,7 @@ class QtChatAdapter(QThread):
     async def _main(self) -> None:
         try:
             async with ChatSession() as session:
+                self._current_session = session
                 if session.tui_queue is None:
                     session.tui_queue = asyncio.Queue()
                 # Restore persisted settings into the live session
@@ -422,18 +427,48 @@ class QtChatAdapter(QThread):
                 session.keep_recent           = int(_state.get("keep_recent", 6))
                 session.input_compress_limit  = int(_state.get("input_compress_limit", 8000))
 
-                # Restore orchestration state if a session was interrupted mid-flow
+                # Restore orchestration state if a session was interrupted mid-flow.
+                # Do NOT auto-resume on GUI restart — require explicit user approval.
                 if _state.get("orch_active"):
-                    self._orch_active           = True
                     self._orch_phase            = _state.get("orch_phase", "explore")
                     self._orch_original_request = _state.get("orch_original_request", "")
-                    _recovery = (
-                        f"[orchestration] Session resumed after context compaction. "
-                        f"You are in the '{self._orch_phase}' phase. "
-                        f"Original request: {self._orch_original_request!r}. "
-                        f"Continue from where you left off — do not restart from Phase 1."
+                    self._orch_awaiting_resume  = True
+                    # Clear persisted flag so a second restart doesn't re-prompt
+                    self._clear_orch_state()
+                    _req_preview = (self._orch_original_request[:120] + "…"
+                                    if len(self._orch_original_request) > 120
+                                    else self._orch_original_request)
+                    _req_msg = (
+                        f"GUI restarted while orchestration was active.\n\n"
+                        f"Phase: {self._orch_phase}\n"
+                        f"Request: {_req_preview}\n\n"
+                        f"Resume the interrupted orchestration run?"
                     )
-                    self._work_queue.put_nowait((_recovery, False))
+                    _resume_fut = self._loop.create_future()
+                    self._pending_future = _resume_fut
+                    self.approval_needed.emit(
+                        "Resume Orchestration?",
+                        _req_msg,
+                        "orchestration_resume",
+                        "",
+                    )
+                    approved, _ = await _resume_fut
+                    self._pending_future = None
+                    if approved:
+                        self._orch_active          = True
+                        self._orch_awaiting_resume = False
+                        self._save_orch_state()
+                        _recovery = (
+                            f"[orchestration] Session resumed by user after GUI restart. "
+                            f"You are in the '{self._orch_phase}' phase. "
+                            f"Original request: {self._orch_original_request!r}. "
+                            f"Continue from where you left off — do not restart from Phase 1."
+                        )
+                        self._work_queue.put_nowait((_recovery, False))
+                    else:
+                        self._orch_awaiting_resume  = False
+                        self._orch_phase            = "idle"
+                        self._orch_original_request = ""
                 if session._startup_files:
                     self.system_msg.emit("Context loaded:\n" + "\n".join(session._startup_files))
                 # ISM observer — fires on any slot acquire/release and drives the panel
@@ -521,6 +556,9 @@ class QtChatAdapter(QThread):
                     self.session_saved.emit(str(session._session_path))
             except Exception:
                 pass
+            self._turn_count += 1
+            if self._turn_count == 5 and session._session_name is None:
+                asyncio.create_task(self._auto_name_session(session))
         except _httpx.ConnectError:
             # Server went down mid-turn — remove the dangling user message so
             # retrying doesn't corrupt history with duplicates.
@@ -740,10 +778,12 @@ class QtChatAdapter(QThread):
                 else:
                     self.usage.emit(int(event.get("slot_index", 0)), int(event.get("tokens", 0)), int(event.get("ctx", 0)))
             elif etype == "clear_chat":
+                self._turn_count = 0
                 self.clear_chat.emit()
             elif etype == "cwd_changed":
                 self.cwd_changed.emit(event.get("cwd", ""))
             elif etype == "session_resume_html":
+                self._turn_count = 0
                 self.session_resume_html.emit(event.get("json_path", ""))
             elif etype == "slash_output":
                 # Captured console output from a slash command.
@@ -830,6 +870,55 @@ class QtChatAdapter(QThread):
         else:
             # "direct", "ambiguous", and plan_mode all run via normal turn
             await self._run_turn(session, text, plan_mode)
+
+    async def _auto_name_session(self, session: "ChatSession") -> None:
+        """Generate a short title for the session after turn 5, then save and signal."""
+        try:
+            import httpx as _httpx
+            msgs = session.messages[session._n_fixed:]
+            # Extract up to 10 messages (5 exchanges) for context
+            snippet = msgs[:10]
+            convo = "\n".join(
+                f"{m['role'].upper()}: {(m.get('content') or '')[:300]}"
+                for m in snippet
+                if isinstance(m.get("content"), str)
+            )
+            payload = {
+                "model": session.model,
+                "max_tokens": 32,
+                "messages": [
+                    {"role": "user", "content": (
+                        f"Conversation:\n{convo}\n\n"
+                        "Give this conversation a short title of 5-7 words. "
+                        "Reply with only the title, no punctuation."
+                    )}
+                ],
+            }
+            async with _httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.post(f"{BASE_URL}/v1/messages", json=payload)
+                r.raise_for_status()
+                data = r.json()
+                title = data["content"][0]["text"].strip().strip("\"'")
+            if title:
+                session._session_name = title
+                session._autosave()
+                stem = session._session_path.stem if session._session_path else ""
+                if stem:
+                    self.session_renamed.emit(stem, title)
+        except Exception:
+            pass
+
+    @property
+    def current_session_stem(self) -> str:
+        s = self._current_session
+        if s and s._session_path:
+            return s._session_path.stem
+        return ""
+
+    def set_session_name(self, name: str) -> None:
+        s = self._current_session
+        if s:
+            s._session_name = name
 
     async def _drain_bg_agents(self, session: "ChatSession") -> None:
         """Drain tui_queue between turns while background agents/processes are still running.
@@ -963,13 +1052,27 @@ class QtChatAdapter(QThread):
         )
 
     def cancel(self) -> None:
-        """Cancel the in-flight stream or voice loop."""
-        task = self._stream_task
-        if task and self._loop:
+        """Cancel all in-flight work: main stream, bg drain, all agent tasks."""
+        if self._loop:
             self._cancel_requested = True
-            self._loop.call_soon_threadsafe(task.cancel)
-        elif self._voice_thread is not None and self._voice_thread.isRunning():
+            self._loop.call_soon_threadsafe(self._cancel_all)
+        if self._voice_thread is not None and self._voice_thread.isRunning():
             self._voice_thread.stop_voice()
+
+    def _cancel_all(self) -> None:
+        """Cancel every running task from the asyncio thread."""
+        if self._stream_task and not self._stream_task.done():
+            self._stream_task.cancel()
+        if self._bg_drain_task and not self._bg_drain_task.done():
+            self._bg_drain_task.cancel()
+        session = self._current_session
+        if session is not None:
+            for t in list(getattr(session, "_bg_agent_tasks", [])):
+                if not t.done():
+                    t.cancel()
+            for t in list(getattr(session, "_bg_process_tasks", [])):
+                if not t.done():
+                    t.cancel()
 
     def resolve_approval(self, approved: bool, notes: str = "") -> None:
         fut = self._pending_future

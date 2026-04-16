@@ -34,10 +34,10 @@ from file_watcher import DirWatcher
 from adapter import QtChatAdapter
 
 try:
-    from session_state import load_state, save_state, list_sessions, load_session, get_agent_name
+    from session_state import load_state, save_state, list_sessions, load_session, get_agent_name, rename_session
     from slash_completer import SlashCompleter, load_skill_commands
 except ImportError:
-    from qt.session_state import load_state, save_state, list_sessions, load_session, get_agent_name
+    from qt.session_state import load_state, save_state, list_sessions, load_session, get_agent_name, rename_session
     from qt.slash_completer import SlashCompleter, load_skill_commands
 
 HOME_DIR   = str(Path.home() / "claude-projects")
@@ -541,6 +541,7 @@ class MainWindow(QMainWindow):
         self._watcher.set_cwd(self._cwd)
         self._update_status()
         self._refresh_tasks_view()
+        QTimer.singleShot(200, self._refresh_session_panel)
 
         # Restore last window geometry and panel layout
         from PySide6.QtCore import QByteArray
@@ -730,7 +731,15 @@ class MainWindow(QMainWindow):
 
     def _build_panels(self):
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._splitter.addWidget(self._build_explorer())
+
+        # Left pane: session list above file explorer
+        self._session_panel = _SessionListPanel()
+        left_splitter = QSplitter(Qt.Orientation.Vertical)
+        left_splitter.addWidget(self._session_panel)
+        left_splitter.addWidget(self._build_explorer())
+        left_splitter.setSizes([160, 380])
+        self._splitter.addWidget(left_splitter)
+
         self._splitter.addWidget(self._build_chat_area())
         self._splitter.addWidget(self._build_editor())
         self._splitter.addWidget(self._build_server_stats())
@@ -1172,6 +1181,11 @@ class MainWindow(QMainWindow):
         self._adapter.cwd_changed.connect(self._on_cwd_changed)
         self._adapter.session_saved.connect(self._on_session_saved)
         self._adapter.session_resume_html.connect(self._on_session_resume_html)
+        self._adapter.session_renamed.connect(self._on_session_renamed)
+
+        self._session_panel.load_requested.connect(self._on_session_load)
+        self._session_panel.rename_requested.connect(self._on_session_rename)
+        self._session_panel.new_requested.connect(self._on_new_session)
 
         self._tg_mirror_cb.toggled.connect(
             lambda checked: setattr(self._adapter._remote, "mirror_enabled", checked)
@@ -1498,9 +1512,7 @@ class MainWindow(QMainWindow):
             return
         self._set_input_enabled(False)
         self._append_user(text)
-        self._full_view.verticalScrollBar().setValue(
-            self._full_view.verticalScrollBar().maximum()
-        )
+        self._auto_scroll(self._full_view)
         self._response_buf = ""
         self._agent_buf = ""
         self._current_agent_label = ""
@@ -1550,7 +1562,7 @@ class MainWindow(QMainWindow):
             f'</td></tr></table>'
         )
         self._append(self._full_view, "")   # escape trailing table frames
-        self._full_view.verticalScrollBar().setValue(self._full_view.verticalScrollBar().maximum())
+        self._auto_scroll(self._full_view)
 
     @Slot(str, str, str)
     def _on_tool_start(self, tool_id: str, name: str, args: str):
@@ -1729,7 +1741,7 @@ class MainWindow(QMainWindow):
                 f'{error_span}'
                 f'</td></tr></table>'
             )
-            _target_view = self._full_view
+            _target_view = self._agent_view if self._agent_nesting > 0 else self._full_view
             self._append(_target_view, done_html)
 
             # For edit/write_file, render a unified diff block
@@ -1981,6 +1993,7 @@ class MainWindow(QMainWindow):
             html_path.write_text(self._full_view.toHtml(), encoding="utf-8")
         except Exception:
             pass
+        self._refresh_session_panel()
 
     def _on_session_resume_html(self, json_path: str) -> None:
         """Restore chat view from saved HTML on session resume."""
@@ -2001,6 +2014,7 @@ class MainWindow(QMainWindow):
         # Scroll to bottom so the resume point is visible
         sb = self._full_view.verticalScrollBar()
         sb.setValue(sb.maximum())
+        self._refresh_session_panel()
 
     def _on_cwd_changed(self, cwd: str):
         if not cwd or not Path(cwd).is_dir():
@@ -2022,9 +2036,10 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_turn_done(self):
         self._append(self._full_view, "<br>")
-        self._plan_mode = False
-        self._plan_btn.setChecked(False)
-        self._stop_btn.setEnabled(False)
+        # Keep stop button active while background agents are still draining
+        drain = self._adapter._bg_drain_task
+        if drain is None or drain.done():
+            self._stop_btn.setEnabled(False)
         self._update_status()
         self._refresh_session_panel()
         if self._message_queue:
@@ -2040,13 +2055,6 @@ class MainWindow(QMainWindow):
             # stay busy — _set_input_enabled(False) was already called
         else:
             self._set_input_enabled(True)
-        # If voice mode ended internally (error/stop), un-check the button
-        if self._voice_btn.isChecked():
-            self._voice_btn.blockSignals(True)
-            self._voice_btn.setChecked(False)
-            self._voice_btn.blockSignals(False)
-            self._mic_btn.setEnabled(False)
-            self._voice_mode_combo.setEnabled(True)
 
     # ── Voice slots ──────────────────────────────────────────────────────────
 
@@ -2086,8 +2094,12 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_voice_transcript(self, text: str):
-        """Put transcript in the chat input field; auto-send if checkbox is checked."""
-        self._input.setPlainText(text)
+        """Append transcript to the chat input field; auto-send if checkbox is checked."""
+        existing = self._input.toPlainText()
+        if existing and not existing.endswith(" "):
+            text = " " + text
+        self._input.setPlainText(existing + text)
+        self._input.moveCursor(self._input.textCursor().MoveOperation.End)
         if self._voice_autosend_cb.isChecked():
             self._send_btn.click()
 
@@ -2466,6 +2478,24 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_name:
             self._adapter.submit_slash(f"/resume {dlg.selected_name}")
 
+    @Slot(str)
+    def _on_session_load(self, stem: str) -> None:
+        """Double-click on session panel — save current and resume selected."""
+        self._adapter.submit_slash(f"/resume {stem}")
+
+    @Slot(str, str)
+    def _on_session_rename(self, stem: str, new_name: str) -> None:
+        """Inline rename committed in session panel — persist and refresh."""
+        rename_session(stem, new_name)
+        if stem == self._adapter.current_session_stem:
+            self._adapter.set_session_name(new_name)
+        self._refresh_session_panel()
+
+    @Slot(str, str)
+    def _on_session_renamed(self, stem: str, name: str) -> None:
+        """Auto-naming signal from adapter — refresh panel."""
+        self._refresh_session_panel()
+
     @Slot()
     def _on_browse_queue_results(self):
         QMessageBox.information(self, "Queue Results", "Queue results viewer coming in SP5.")
@@ -2597,12 +2627,11 @@ class MainWindow(QMainWindow):
             self._highlight_timer.stop()
 
     def _refresh_session_panel(self):
-        """Update SESSION group with current message count."""
+        """Refresh the session list panel with latest sessions."""
         try:
-            from chat import _load_state as _ls
-            st = _ls()
-            msgs = st.get("message_count", "—")
-            self._stat_msgs.setText(f"Messages: {msgs}")
+            sessions = list_sessions()
+            current_stem = self._adapter.current_session_stem
+            self._session_panel.refresh(sessions, current_stem)
         except Exception:
             pass
 
@@ -2658,6 +2687,7 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _on_bg_agents_complete(self, count: int) -> None:
+        self._stop_btn.setEnabled(False)
         noun = "agent" if count == 1 else "agents"
         html = (
             '<table width="100%" style="border-spacing:0;border-collapse:collapse;'
@@ -2794,6 +2824,97 @@ class MainWindow(QMainWindow):
             self._send_btn.setEnabled(True)   # always clickable — queues when busy
             self._kr_bar.start()
         self._input.setFocus()
+
+
+class _SessionListPanel(QWidget):
+    """Persistent left-panel session list with inline rename and double-click to load."""
+
+    load_requested   = Signal(str)    # stem
+    rename_requested = Signal(str, str)  # stem, new_name
+    new_requested    = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        header = QWidget()
+        header.setFixedHeight(24)
+        header.setStyleSheet("background: #111111;")
+        hdr_layout = QHBoxLayout(header)
+        hdr_layout.setContentsMargins(6, 0, 4, 0)
+        hdr_layout.setSpacing(0)
+        lbl = QLabel("SESSIONS")
+        lbl.setStyleSheet(f"color: {ACCENT}; font-size: 10px; letter-spacing: 1px; background: transparent;")
+        self._new_btn = QPushButton("New Chat")
+        self._new_btn.setFixedHeight(18)
+        self._new_btn.setStyleSheet(
+            "QPushButton { background: #1e1e1e; color: #aaaaaa; border: 1px solid #333; font-size: 10px; padding: 0 6px; border-radius: 3px; }"
+            "QPushButton:hover { background: #2a2a2a; color: #ffffff; }"
+        )
+        self._new_btn.setToolTip("New session (/clear)")
+        self._new_btn.clicked.connect(self.new_requested)
+        hdr_layout.addWidget(lbl)
+        hdr_layout.addStretch()
+        hdr_layout.addWidget(self._new_btn)
+        layout.addWidget(header)
+
+        hint = QLabel("F2 or slow-click to rename")
+        hint.setStyleSheet("color: #444444; font-size: 9px; padding: 1px 6px;")
+        layout.addWidget(hint)
+
+        self._list = QListWidget()
+        self._list.setStyleSheet(
+            "QListWidget { background: #0b0b0b; border: none; font-size: 10px; color: #cccccc; }"
+            "QListWidget::item { padding: 3px 6px; border-bottom: 1px solid #1a1a1a; }"
+            "QListWidget::item:selected { background: #1a2a1a; color: #ffffff; }"
+            "QListWidget::item:hover { background: #141414; }"
+        )
+        self._list.setEditTriggers(
+            QListWidget.EditTrigger.SelectedClicked | QListWidget.EditTrigger.EditKeyPressed
+        )
+        self._list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._list.itemDoubleClicked.connect(self._on_double_click)
+        self._list.itemChanged.connect(self._on_item_changed)
+        layout.addWidget(self._list)
+
+        self._current_stem: str = ""
+        self._editing: bool = False   # guard against spurious itemChanged
+
+    def refresh(self, sessions: list[dict], current_stem: str) -> None:
+        self._editing = True
+        self._current_stem = current_stem
+        self._list.clear()
+        for s in sessions:
+            stem = s["stem"]
+            name = s.get("name") or stem
+            item = QListWidgetItem(name)
+            item.setData(Qt.ItemDataRole.UserRole, stem)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+            tooltip = f"{s.get('saved_at', '')}  •  ~{s.get('token_estimate', 0)} tok  •  {s.get('n_messages', 0)} msgs"
+            item.setToolTip(tooltip)
+            if stem == current_stem:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                item.setForeground(QColor(ACCENT))
+            self._list.addItem(item)
+        self._editing = False
+
+    def _on_double_click(self, item: QListWidgetItem) -> None:
+        stem = item.data(Qt.ItemDataRole.UserRole)
+        if stem and stem != self._current_stem:
+            self.load_requested.emit(stem)
+
+    def _on_item_changed(self, item: QListWidgetItem) -> None:
+        if self._editing:
+            return
+        stem = item.data(Qt.ItemDataRole.UserRole)
+        new_name = item.text().strip()
+        if stem and new_name:
+            self.rename_requested.emit(stem, new_name)
 
 
 class _SessionPickerDialog(QDialog):

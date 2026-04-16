@@ -39,7 +39,7 @@ def save_state(**kwargs) -> None:
 
 
 def list_sessions() -> list[dict]:
-    """Return up to 10 recent sessions, newest first. Excludes state.json."""
+    """Return up to 50 recent sessions, newest first. Excludes state.json."""
     if not _SESSIONS_DIR.exists():
         return []
     entries = []
@@ -50,6 +50,7 @@ def list_sessions() -> list[dict]:
             data = json.loads(p.read_text(encoding="utf-8"))
             entries.append({
                 "stem": p.stem,
+                "name": data.get("name") or p.stem,
                 "saved_at": data.get("saved_at", "")[:16].replace("T", " "),
                 "token_estimate": data.get("token_estimate", 0),
                 "n_messages": len(data.get("messages", [])),
@@ -57,10 +58,26 @@ def list_sessions() -> list[dict]:
             })
         except Exception:
             entries.append({
-                "stem": p.stem, "saved_at": "", "token_estimate": 0,
+                "stem": p.stem,
+                "name": p.stem,
+                "saved_at": "", "token_estimate": 0,
                 "n_messages": 0, "path": p,
             })
-    return entries[:10]
+    return entries[:50]
+
+
+def rename_session(stem: str, new_name: str) -> bool:
+    """Update the 'name' field in the session JSON. Returns True on success."""
+    for path in _SESSIONS_DIR.glob("*.json"):
+        if path.stem == stem and path.stem != "state":
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                data["name"] = new_name.strip()
+                path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                return True
+            except Exception:
+                return False
+    return False
 
 
 def load_session(name: str | None = None):

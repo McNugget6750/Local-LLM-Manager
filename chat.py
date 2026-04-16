@@ -156,7 +156,7 @@ def _build_initial_messages() -> tuple[list[dict], list[str]]:
 def _session_token_estimate(messages: list[dict]) -> int:
     return sum(len(m.get("content") or "") for m in messages) // CHARS_PER_TOKEN
 
-def _save_session(messages: list[dict], n_fixed: int, session_path: Path | None = None, cwd: Path | None = None) -> Path:
+def _save_session(messages: list[dict], n_fixed: int, session_path: Path | None = None, cwd: Path | None = None, name: str | None = None) -> Path:
     SESSIONS_DIR.mkdir(exist_ok=True)
     if session_path is None:
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -166,6 +166,7 @@ def _save_session(messages: list[dict], n_fixed: int, session_path: Path | None 
         "saved_at": datetime.now().isoformat(),
         "token_estimate": _session_token_estimate(conversation),
         "cwd": str(cwd) if cwd else None,
+        "name": name,
         "messages": conversation,
     }
     session_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -184,16 +185,16 @@ def _save_session(messages: list[dict], n_fixed: int, session_path: Path | None 
     _save_state(last_session=session_path.stem)
     return session_path
 
-def _load_session(name: str | None = None) -> tuple[list[dict], Path, str | None] | tuple[None, None, None]:
+def _load_session(name: str | None = None) -> tuple[list[dict], Path, str | None, str | None] | tuple[None, None, None, None]:
     if not SESSIONS_DIR.exists():
-        return None, None, None
+        return None, None, None, None
     all_sessions = sorted(p for p in SESSIONS_DIR.glob("*.json") if p.name != "state.json")
     if not all_sessions:
-        return None, None, None
+        return None, None, None, None
     if name:
         candidates = [s for s in all_sessions if name in s.stem]
         if not candidates:
-            return None, None, None
+            return None, None, None, None
         target = candidates[-1]
     else:
         # Prefer last-used session from state; fall back to newest file
@@ -206,9 +207,9 @@ def _load_session(name: str | None = None) -> tuple[list[dict], Path, str | None
             target = all_sessions[-1]
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
-        return data.get("messages", []), target, data.get("cwd")
+        return data.get("messages", []), target, data.get("cwd"), data.get("name")
     except Exception:
-        return None, None, None
+        return None, None, None, None
 
 def _load_state() -> dict:
     """Load persisted session settings (think level, role, etc.)."""
@@ -241,7 +242,7 @@ CHARS_PER_TOKEN      = 4        # fallback estimator when server usage unavailab
 
 SESSIONS_DIR = Path(__file__).parent / "sessions"
 STATE_FILE   = SESSIONS_DIR / "state.json"
-MAX_SESSIONS = 10
+MAX_SESSIONS = 50
 
 from unicode_normalize import normalize_tool_args
 from sanity_detector import SanityDetector, SanityError
@@ -742,6 +743,7 @@ class ChatSession(AgentsMixin):
         self.cwd: Path              = Path.cwd()
         self.approval_level: str    = "auto"
         self._session_path: Path | None = None
+        self._session_name: str | None  = None
         self._subagent_depth: int   = 0    # nesting depth; >0 blocks nested spawn
         self.server_parallel_slots: int = 1  # filled by _detect_ctx_window
         self._capabilities_injected: bool = False
@@ -1087,7 +1089,7 @@ class ChatSession(AgentsMixin):
 
     def _autosave(self) -> None:
         try:
-            self._session_path = _save_session(self.messages, self._n_fixed, self._session_path, cwd=self.cwd)
+            self._session_path = _save_session(self.messages, self._n_fixed, self._session_path, cwd=self.cwd, name=self._session_name)
         except Exception:
             pass
 
@@ -2236,10 +2238,11 @@ async def main():
             chat.model         = state.get("model",         MODEL)
             chat.role          = state.get("role",          "eli")
             last_name          = state.get("last_session")  # stem, e.g. "2025-01-01_12-00-00"
-            saved_msgs, sess_path, saved_cwd = _load_session(last_name)
+            saved_msgs, sess_path, saved_cwd, saved_name = _load_session(last_name)
             if saved_msgs:
                 chat.messages.extend(saved_msgs)
                 chat._session_path = sess_path
+                chat._session_name = saved_name
                 if saved_cwd and Path(saved_cwd).is_dir():
                     chat.cwd = Path(saved_cwd)
                 role_note = f"  role: {chat.role}" if chat.role != "eli" else ""
@@ -2253,10 +2256,11 @@ async def main():
 
         # ── --resume: load named (or latest) session only ─────────────────────
         elif do_resume:
-            saved_msgs, sess_path, saved_cwd = _load_session(resume_name)
+            saved_msgs, sess_path, saved_cwd, saved_name = _load_session(resume_name)
             if saved_msgs:
                 chat.messages.extend(saved_msgs)
                 chat._session_path = sess_path
+                chat._session_name = saved_name
                 if saved_cwd and Path(saved_cwd).is_dir():
                     chat.cwd = Path(saved_cwd)
                 console.print(Rule(f"[cyan]Session resumed: {sess_path.name}[/cyan]", style="cyan"))
