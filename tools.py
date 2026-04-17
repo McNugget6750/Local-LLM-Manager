@@ -84,8 +84,8 @@ TOOLS = [
             "name": "write_file",
             "description": (
                 "Write content to a file, creating parent directories as needed. "
-                "Only use this for NEW files that do not exist yet. "
-                "Will FAIL with an error if the file already exists — use `edit` to modify existing files. "
+                "Only use this for NEW files or files that are empty (0 bytes). "
+                "Will FAIL with an error if the file already exists and is non-empty — use read_file and then edit to modify existing files. "
                 "After a successful write, call read_file on the same path to verify the content landed correctly."
             ),
             "parameters": {
@@ -1009,6 +1009,11 @@ async def tool_read_file(path: str, offset: int = 1, limit: int = 200) -> str:
 
 async def tool_write_file(path: str, content: str) -> str:
     p = Path(path)
+    if p.exists() and p.stat().st_size > 0:
+        return (
+            f"[error: write_file refused — '{path}' already exists and is non-empty "
+            f"({p.stat().st_size} bytes). Use read_file and then edit to modify existing files.]"
+        )
     if p.exists():
         old = p.read_text(encoding="utf-8", errors="replace")
         old_lines = old.splitlines()

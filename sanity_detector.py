@@ -1,10 +1,12 @@
 """
 sanity_detector.py — Stream-time LLM degenerate output detector.
 
-Detects five failure modes in real time as tokens arrive:
+Detects six failure modes in real time as tokens arrive:
   D1   Same completed line repeated consecutively
   D1w  Same word repeated consecutively within a line (e.g. "apple apple apple...")
   D2   Cycling block of lines (N-line pattern repeating)
+  D2n  Cycling block detected on *normalized* lines — catches numbered-list loops
+       where incrementing counters (1702., 1706., 1710.) defeat exact D2 matching
   D3   Single character flood within one line
   D4   Inline phrase loop (short phrase repeating within one line, no newlines)
 
@@ -23,11 +25,17 @@ Usage:
 import re
 from collections import deque
 
+# Pre-compiled patterns for _normalize_line
+_RE_NUMBERED  = re.compile(r'^\d+[.)]\s*')   # "1702. " or "1702) "
+_RE_BULLET    = re.compile(r'^[-*+]\s*')      # "- " or "* "
+_RE_BOLD_ITAL = re.compile(r'\*{1,3}([^*]+)\*{1,3}')  # **bold**, *italic*, ***both***
+_RE_SPACES    = re.compile(r'\s+')
+
 # ── Thresholds ────────────────────────────────────────────────────────────────
 
 # Text mode (strict)
 SD_SAME_LINE_REPEATS   = 5      # D1: identical lines in a row
-SD_CYCLE_BLOCK_MAX     = 5      # D2: max lines in a detectable cycling block
+SD_CYCLE_BLOCK_MAX     = 30     # D2/D2n: max lines in a detectable cycling block
 SD_CYCLE_REPETITIONS   = 4      # D2: full cycles before trigger
 SD_CHAR_FLOOD_MIN      = 150    # D3: same non-whitespace char run length
 SD_INLINE_PHRASE_MIN   = 2      # D4: min words in a repeating phrase
@@ -44,7 +52,7 @@ SD_THINK_INLINE_REPETITIONS = 12
 SD_THINK_WORD_REPEATS       = 15   # D1w: same word N times in think mode
 
 # History window for D2
-_HISTORY_SIZE = 60
+_HISTORY_SIZE = 200
 
 
 class SanityError(Exception):
@@ -61,6 +69,7 @@ class SanityDetector:
     def __init__(self):
         self._line_buf: str = ""
         self._recent_lines: deque = deque(maxlen=_HISTORY_SIZE)
+        self._recent_lines_norm: deque = deque(maxlen=_HISTORY_SIZE)  # D2n normalized history
         self._same_line_window: deque = deque()
         self._word_buf: str = ""          # current word being accumulated
         self._word_window: deque = deque()  # last N completed words
@@ -68,6 +77,7 @@ class SanityDetector:
     def reset(self):
         self._line_buf = ""
         self._recent_lines.clear()
+        self._recent_lines_norm.clear()
         self._same_line_window.clear()
         self._word_buf = ""
         self._word_window.clear()
@@ -119,11 +129,20 @@ class SanityDetector:
                 if trigger:
                     return trigger
 
-                # D2 — cycling block
+                # D2 — cycling block (exact)
                 self._recent_lines.append(line)
                 trigger = _check_d2(self._recent_lines, thresholds)
                 if trigger:
                     return trigger
+
+                # D2n — cycling block on normalized lines (catches numbered-list loops
+                # where incrementing counters defeat exact D2 matching)
+                norm = _normalize_line(line)
+                if norm:
+                    self._recent_lines_norm.append(norm)
+                    trigger = _check_d2(self._recent_lines_norm, thresholds)
+                    if trigger:
+                        return "D2n:normalized-cycling-block"
 
         return None
 
@@ -156,6 +175,20 @@ _think_thresholds = {
 
 
 # ── Detector functions ────────────────────────────────────────────────────────
+
+def _normalize_line(line: str) -> str:
+    """
+    Strip numeric list prefixes, bullets, and markdown formatting so that
+    lines differing only by an incrementing counter compare as equal.
+    E.g. "1702. **Reading foo.md**" → "reading foo.md"
+    """
+    s = line.strip()
+    s = _RE_NUMBERED.sub('', s)       # strip "1702. "
+    s = _RE_BULLET.sub('', s)         # strip "- " / "* "
+    s = _RE_BOLD_ITAL.sub(r'\1', s)   # strip **bold** / *italic*
+    s = _RE_SPACES.sub(' ', s).strip().lower()
+    return s
+
 
 def _check_d1w(word: str, window: deque, t: dict) -> str | None:
     """D1w: same word repeated consecutively N times (e.g. apple apple apple...)."""
