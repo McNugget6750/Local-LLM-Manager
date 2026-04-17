@@ -70,3 +70,4 @@ Only emit `[ORCHESTRATION_DONE]` here, after verification is complete. Never emi
 - Never implement code yourself — always `expert_coder`.
 - Agent scopes come from the plan. Do not invent new scopes during implementation.
 - `[ORCHESTRATION_DONE]` only in Phase 5, after verification.
+- If you need the user to make a decision or approve something mid-orchestration, output `[WAITING_FOR_USER]` on its own line before your question. This prevents the system from auto-continuing and gives the user time to respond.

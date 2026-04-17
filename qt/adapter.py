@@ -377,6 +377,7 @@ class QtChatAdapter(QThread):
         self._orch_awaiting_resume: bool = False  # True after GUI restart with stale orch state
         self._force_orch_continue: bool = True   # GUI checkbox: nudge model if it stops mid-orch
         self._orch_done_this_turn: bool = False  # set when [ORCHESTRATION_DONE] seen in current turn
+        self._orch_waiting_for_user: bool = False  # set when model signals it needs user input
 
     # ── Orchestration state persistence ─────────────────────────────────────
 
@@ -768,6 +769,14 @@ class QtChatAdapter(QThread):
                             "This turn runs in plan_mode.",
                             False,
                         ))
+
+                    # Suppress force-continue if model explicitly pauses for user input,
+                    # or as a heuristic if the response ends with a question.
+                    if self._orch_active:
+                        if "[WAITING_FOR_USER]" in _txt:
+                            self._orch_waiting_for_user = True
+                        elif _txt.rstrip().endswith("?"):
+                            self._orch_waiting_for_user = True
             elif etype == "usage":
                 tool_id_ev = event.get("tool_id", "")
                 if tool_id_ev:
@@ -831,7 +840,10 @@ class QtChatAdapter(QThread):
                         f"Synthesize and respond to the user now. Do NOT dispatch more agents.]",
                         False,
                     ))
-                elif self._orch_active and self._force_orch_continue and not self._orch_done_this_turn:
+                elif (self._orch_active and self._force_orch_continue
+                        and not self._orch_done_this_turn
+                        and not self._orch_waiting_for_user
+                        and self._work_queue.empty()):
                     self.system_msg.emit("Orchestrator poked model to continue...")
                     self._work_queue.put_nowait((
                         "[orchestration] You stopped without signaling [ORCHESTRATION_DONE]. "
@@ -840,6 +852,7 @@ class QtChatAdapter(QThread):
                         False,
                     ))
                 self._orch_done_this_turn = False
+                self._orch_waiting_for_user = False
                 return
 
     # ── Routing and orchestration ────────────────────────────────────────────
