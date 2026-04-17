@@ -375,6 +375,8 @@ class QtChatAdapter(QThread):
         self._orch_pulse: str = ""       # loaded at startup from orchestration_pulse.md
         self._orch_original_request: str = ""  # persisted for compaction recovery
         self._orch_awaiting_resume: bool = False  # True after GUI restart with stale orch state
+        self._force_orch_continue: bool = True   # GUI checkbox: nudge model if it stops mid-orch
+        self._orch_done_this_turn: bool = False  # set when [ORCHESTRATION_DONE] seen in current turn
 
     # ── Orchestration state persistence ─────────────────────────────────────
 
@@ -739,6 +741,7 @@ class QtChatAdapter(QThread):
                             self._work_queue.put_nowait((last_user, False))
 
                     if self._orch_active and "[ORCHESTRATION_DONE]" in _txt:
+                        self._orch_done_this_turn = True
                         self._orch_active = False
                         self._orch_phase = "idle"
                         self._orch_original_request = ""
@@ -828,6 +831,15 @@ class QtChatAdapter(QThread):
                         f"Synthesize and respond to the user now. Do NOT dispatch more agents.]",
                         False,
                     ))
+                elif self._orch_active and self._force_orch_continue and not self._orch_done_this_turn:
+                    self.system_msg.emit("Orchestrator poked model to continue...")
+                    self._work_queue.put_nowait((
+                        "[orchestration] You stopped without signaling [ORCHESTRATION_DONE]. "
+                        f"You are in the '{self._orch_phase}' phase. "
+                        "Continue — execute the next step only. Do NOT restart from Phase 1.",
+                        False,
+                    ))
+                self._orch_done_this_turn = False
                 return
 
     # ── Routing and orchestration ────────────────────────────────────────────
@@ -1050,6 +1062,10 @@ class QtChatAdapter(QThread):
         self._loop.call_soon_threadsafe(
             self._work_queue.put_nowait, ("__slash__", cmd)
         )
+
+    def set_force_orch_continue(self, enabled: bool) -> None:
+        """Enable/disable auto-nudge when orchestration stalls mid-turn."""
+        self._force_orch_continue = bool(enabled)
 
     def cancel(self) -> None:
         """Cancel all in-flight work: main stream, bg drain, all agent tasks."""

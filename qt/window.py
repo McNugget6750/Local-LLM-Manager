@@ -649,6 +649,16 @@ class MainWindow(QMainWindow):
         self._compact_btn.toggled.connect(self._on_compact_toggled)
         tb.addWidget(self._compact_btn)
 
+        self._force_continue_cb = QCheckBox("Force-Continue")
+        self._force_continue_cb.setChecked(True)
+        self._force_continue_cb.setToolTip(
+            "Force-Continue: when orchestration is active, automatically nudge the model\n"
+            "to keep going if it ends a turn without signaling [ORCHESTRATION_DONE]."
+        )
+        self._force_continue_cb.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px;")
+        self._force_continue_cb.toggled.connect(self._adapter.set_force_orch_continue)
+        tb.addWidget(self._force_continue_cb)
+
         self._stop_btn = QPushButton("Abort Output")
         self._stop_btn.setFixedWidth(100)
         self._stop_btn.setEnabled(False)
