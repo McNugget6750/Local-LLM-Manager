@@ -844,7 +844,7 @@ class QtChatAdapter(QThread):
                         and not self._orch_done_this_turn
                         and not self._orch_waiting_for_user
                         and self._work_queue.empty()):
-                    self.system_msg.emit("Orchestrator poked model to continue...")
+                    self.system_msg.emit("Continuing...")
                     self._work_queue.put_nowait((
                         "[orchestration] You stopped without signaling [ORCHESTRATION_DONE]. "
                         f"You are in the '{self._orch_phase}' phase. "

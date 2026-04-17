@@ -56,16 +56,21 @@ _DIRECT_OPENER = re.compile(
     re.IGNORECASE,
 )
 
-# ── Tier 1: task verbs that signal implementation/analysis work ───────────────
-_TASK_VERB = re.compile(
+# ── Tier 1: implementation verbs (code changes) → orchestrate ────────────────
+_IMPL_VERB = re.compile(
     r'\b(implement|build|create|add|write|make|develop|'
     r'refactor|rewrite|redesign|restructure|rework|clean\s*up|'
     r'fix|debug|diagnose|investigate|trace|root.?cause|'
-    r'analyze|analyse|audit|review|inspect|examine|profile|benchmark|'
-    r'explore|survey|map\s+out|understand\s+how|walk\s+(me\s+)?through|'
     r'migrate|port|convert|upgrade|replace|swap|'
     r'optimize|improve|speed\s*up|reduce|eliminate|'
-    r'integrate|connect|wire\s*up|set\s*up|configure|'
+    r'integrate|connect|wire\s*up|set\s*up|configure)\b',
+    re.IGNORECASE,
+)
+
+# ── Tier 1: review/analysis verbs (read/assess only) → ambiguous ─────────────
+_REVIEW_VERB = re.compile(
+    r'\b(analyze|analyse|audit|review|inspect|examine|profile|benchmark|'
+    r'explore|survey|map\s+out|understand\s+how|walk\s+(me\s+)?through|'
     r'test|verify|validate|check|ensure)\b',
     re.IGNORECASE,
 )
@@ -111,24 +116,28 @@ def classify(text: str) -> Literal["direct", "orchestrate", "ambiguous"]:
 
     # ── Very short messages with no task verb are almost always conversational ─
     words = stripped.split()
-    if len(words) <= 10 and "\n" not in stripped and not _TASK_VERB.search(stripped):
+    if len(words) <= 10 and "\n" not in stripped and not _IMPL_VERB.search(stripped) and not _REVIEW_VERB.search(stripped):
         return "direct"
 
     # ── Tier 1: conversational opener ────────────────────────────────────────
     if _DIRECT_OPENER.match(stripped):
-        # Still could be a task if it references the codebase with a task verb
+        # Still could be a task if it references the codebase with an impl verb
         # e.g. "explain how to refactor the auth module" — that's ambiguous.
         # "explain what git rebase does" — direct.
-        if _TASK_VERB.search(stripped) and _CODEBASE_REF.search(stripped):
+        if _IMPL_VERB.search(stripped) and _CODEBASE_REF.search(stripped):
             return "ambiguous"
         return "direct"
 
-    # ── Tier 1: task verb + codebase reference → orchestrate ─────────────────
-    if _TASK_VERB.search(stripped) and _CODEBASE_REF.search(stripped):
+    # ── Tier 1: implementation verb + codebase ref → orchestrate ─────────────
+    if _IMPL_VERB.search(stripped) and _CODEBASE_REF.search(stripped):
         return "orchestrate"
 
-    # ── Task verb alone (no explicit codebase ref) → ambiguous ───────────────
-    if _TASK_VERB.search(stripped):
+    # ── Review/analysis verb + codebase ref → ambiguous (Eli decides) ────────
+    if _REVIEW_VERB.search(stripped) and _CODEBASE_REF.search(stripped):
+        return "ambiguous"
+
+    # ── Any task verb alone (no codebase ref) → ambiguous ────────────────────
+    if _IMPL_VERB.search(stripped) or _REVIEW_VERB.search(stripped):
         return "ambiguous"
 
     return "direct"
