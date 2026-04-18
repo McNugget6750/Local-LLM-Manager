@@ -1,7 +1,7 @@
 """
 sanity_detector.py — Stream-time LLM degenerate output detector.
 
-Detects six failure modes in real time as tokens arrive:
+Detects seven failure modes in real time as tokens arrive:
   D1   Same completed line repeated consecutively
   D1w  Same word repeated consecutively within a line (e.g. "apple apple apple...")
   D2   Cycling block of lines (N-line pattern repeating)
@@ -9,6 +9,8 @@ Detects six failure modes in real time as tokens arrive:
        where incrementing counters (1702., 1706., 1710.) defeat exact D2 matching
   D3   Single character flood within one line
   D4   Inline phrase loop (short phrase repeating within one line, no newlines)
+  D5   Character-level cycle within one line (e.g. "'-'-'-'..." or "{}{}{}{}...")
+       — catches patterns with no spaces and no single-char flood, which evade D3/D4/D1w
 
 Think tokens use looser thresholds (thinking is naturally more repetitive).
 Text tokens use strict thresholds.
@@ -39,10 +41,13 @@ SD_CYCLE_BLOCK_MAX     = 30     # D2/D2n: max lines in a detectable cycling bloc
 SD_CYCLE_REPETITIONS   = 4      # D2: full cycles before trigger
 SD_CHAR_FLOOD_MIN      = 150    # D3: same non-whitespace char run length
 SD_INLINE_PHRASE_MIN   = 2      # D4: min words in a repeating phrase
-SD_INLINE_PHRASE_MAX   = 8      # D4: max words in a repeating phrase
+SD_INLINE_PHRASE_MAX   = 16     # D4: max words in a repeating phrase
 SD_INLINE_REPETITIONS  = 8      # D4: repetitions before trigger
 SD_INLINE_MIN_LEN      = 120    # D4: min line length before checking
 SD_WORD_REPEATS        = 10    # D1w: same word repeated N times in a row
+SD_CHAR_CYCLE_PAT_MAX  = 8      # D5: max char-pattern length to check
+SD_CHAR_CYCLE_REPS     = 15     # D5: full cycles before trigger (text)
+SD_CHAR_CYCLE_MIN_LEN  = 60     # D5: min line-buf length before checking
 
 # Think mode (looser)
 SD_THINK_SAME_LINE_REPEATS  = 8
@@ -50,6 +55,7 @@ SD_THINK_CYCLE_REPETITIONS  = 6
 SD_THINK_CHAR_FLOOD_MIN     = 150   # same — no legitimate reason for char floods
 SD_THINK_INLINE_REPETITIONS = 12
 SD_THINK_WORD_REPEATS       = 15   # D1w: same word N times in think mode
+SD_THINK_CHAR_CYCLE_REPS    = 20   # D5: think mode is naturally more repetitive
 
 # History window for D2
 _HISTORY_SIZE = 200
@@ -104,10 +110,11 @@ class SanityDetector:
             else:
                 self._word_buf += ch
 
-        # Check D3 and D4 on current line buffer
+        # Check D3, D4, D5 on current line buffer
         trigger = (
             _check_d3(self._line_buf, thresholds) or
-            _check_d4(self._line_buf, thresholds)
+            _check_d4(self._line_buf, thresholds) or
+            _check_d5(self._line_buf, thresholds)
         )
         if trigger:
             return trigger
@@ -150,27 +157,33 @@ class SanityDetector:
 # ── Threshold dicts ───────────────────────────────────────────────────────────
 
 _text_thresholds = {
-    "same_line_repeats":  SD_SAME_LINE_REPEATS,
-    "cycle_block_max":    SD_CYCLE_BLOCK_MAX,
-    "cycle_repetitions":  SD_CYCLE_REPETITIONS,
-    "char_flood_min":     SD_CHAR_FLOOD_MIN,
-    "inline_phrase_min":  SD_INLINE_PHRASE_MIN,
-    "inline_phrase_max":  SD_INLINE_PHRASE_MAX,
-    "inline_repetitions": SD_INLINE_REPETITIONS,
-    "inline_min_len":     SD_INLINE_MIN_LEN,
-    "word_repeats":       SD_WORD_REPEATS,
+    "same_line_repeats":   SD_SAME_LINE_REPEATS,
+    "cycle_block_max":     SD_CYCLE_BLOCK_MAX,
+    "cycle_repetitions":   SD_CYCLE_REPETITIONS,
+    "char_flood_min":      SD_CHAR_FLOOD_MIN,
+    "inline_phrase_min":   SD_INLINE_PHRASE_MIN,
+    "inline_phrase_max":   SD_INLINE_PHRASE_MAX,
+    "inline_repetitions":  SD_INLINE_REPETITIONS,
+    "inline_min_len":      SD_INLINE_MIN_LEN,
+    "word_repeats":        SD_WORD_REPEATS,
+    "char_cycle_pat_max":  SD_CHAR_CYCLE_PAT_MAX,
+    "char_cycle_reps":     SD_CHAR_CYCLE_REPS,
+    "char_cycle_min_len":  SD_CHAR_CYCLE_MIN_LEN,
 }
 
 _think_thresholds = {
-    "same_line_repeats":  SD_THINK_SAME_LINE_REPEATS,
-    "cycle_block_max":    SD_CYCLE_BLOCK_MAX,
-    "cycle_repetitions":  SD_THINK_CYCLE_REPETITIONS,
-    "char_flood_min":     SD_THINK_CHAR_FLOOD_MIN,
-    "inline_phrase_min":  SD_INLINE_PHRASE_MIN,
-    "inline_phrase_max":  SD_INLINE_PHRASE_MAX,
-    "inline_repetitions": SD_THINK_INLINE_REPETITIONS,
-    "inline_min_len":     SD_INLINE_MIN_LEN,
-    "word_repeats":       SD_THINK_WORD_REPEATS,
+    "same_line_repeats":   SD_THINK_SAME_LINE_REPEATS,
+    "cycle_block_max":     SD_CYCLE_BLOCK_MAX,
+    "cycle_repetitions":   SD_THINK_CYCLE_REPETITIONS,
+    "char_flood_min":      SD_THINK_CHAR_FLOOD_MIN,
+    "inline_phrase_min":   SD_INLINE_PHRASE_MIN,
+    "inline_phrase_max":   SD_INLINE_PHRASE_MAX,
+    "inline_repetitions":  SD_THINK_INLINE_REPETITIONS,
+    "inline_min_len":      SD_INLINE_MIN_LEN,
+    "word_repeats":        SD_THINK_WORD_REPEATS,
+    "char_cycle_pat_max":  SD_CHAR_CYCLE_PAT_MAX,
+    "char_cycle_reps":     SD_THINK_CHAR_CYCLE_REPS,
+    "char_cycle_min_len":  SD_CHAR_CYCLE_MIN_LEN,
 }
 
 
@@ -256,4 +269,26 @@ def _check_d4(line_buf: str, t: dict) -> str | None:
         chunks = [tuple(tail[i * phrase_len:(i + 1) * phrase_len]) for i in range(reps)]
         if len(set(chunks)) == 1:
             return "D4:inline-phrase-loop"
+    return None
+
+
+def _check_d5(line_buf: str, t: dict) -> str | None:
+    """D5: character-level cycling pattern within a line.
+
+    Catches space-free alternating sequences like '-''-''-'' or {}{}{}{}
+    that evade D3 (multi-char), D4 (no spaces → single word), and D1w
+    (quote/dash are not word-flush punctuation).
+    """
+    if len(line_buf) < t["char_cycle_min_len"]:
+        return None
+    reps = t["char_cycle_reps"]
+    for pat_len in range(2, t["char_cycle_pat_max"] + 1):
+        needed = pat_len * reps
+        if len(line_buf) < needed:
+            continue
+        tail = line_buf[-needed:]
+        chunks = [tail[i * pat_len:(i + 1) * pat_len] for i in range(reps)]
+        if len(set(chunks)) == 1 and len(set(chunks[0])) > 1:
+            # require ≥2 distinct chars in the pattern — single-char floods belong to D3
+            return "D5:char-cycle"
     return None

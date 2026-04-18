@@ -40,17 +40,67 @@ Do not implement anything. Do not call any tools other than web_search or web_fe
 
 ## Phase 3 — Implement (after plan approved or [SKIP_APPROVAL])
 
-Dispatch the `expert_coder` agents defined in the plan. Each gets its scope and task from the plan — do not improvise new scopes or add agents not in the plan.
+**Turn 1:** Dispatch ALL expert_coder agents defined in the plan in parallel (one turn, as before).
+Tell the user what is running. End your turn.
 
-All agents dispatch in the same turn and run in parallel. Tell the user what's running in one line. End your turn. Do not implement anything yourself.
+**Subsequent turns — reactive dispatch:**
+Each turn you may receive a mix of completions from coders, reviewers, and fix agents.
+Process all completions in the same turn and dispatch all follow-up agents in the same turn:
+
+- **Coder just finished for scope S:**
+  Dispatch one `code-review` agent for scope S with this mandate:
+    - The plan step(s) for scope S (quoted verbatim from the Phase 2 plan)
+    - Path to MISSION_OBJECTIVE.md (always include — reviewer must read it)
+    - List of files changed by the scope S coder
+    - Instruction: "Perform a thorough review of the implementation for this scope.
+      Verify every requirement listed in the plan step(s) is fully and correctly implemented —
+      not stubbed, not partial, not approximate. Read MISSION_OBJECTIVE.md and confirm the
+      code is consistent with it. Check for correctness: logic errors, edge cases, missing
+      error handling, and any code that would fail or behave incorrectly at runtime.
+      Classify every finding by severity: Critical, High, Medium, Low, or Info.
+      Output [REVIEW_PASS] if there are no Critical or High findings, or
+      [REVIEW_FAIL] followed by findings grouped by severity. Medium, Low, and Info
+      findings are reported but do not block [REVIEW_PASS]."
+  Track: scope S → in-review (cycle 1).
+
+- **Reviewer returned [REVIEW_PASS] for scope S:**
+  Mark scope S → done. No further action for this scope.
+
+- **Reviewer returned [REVIEW_FAIL] for scope S, cycle < 5:**
+  Dispatch one `expert_coder` for scope S with **only the Critical and High findings** as the task.
+  Medium, Low, and Info findings are surfaced to the user but not assigned for fixing.
+  Track: scope S → fixing (cycle N+1).
+
+- **Reviewer returned [REVIEW_FAIL] for scope S, cycle = 5:**
+  Output [WAITING_FOR_USER] and surface the gap list for scope S.
+  Do not advance to Phase 4 until the user responds.
+
+Dispatch all follow-up agents for all completed scopes in the same turn — use parallel slots fully.
+Tell the user which scopes are pending / in-review / done. End your turn.
+
+Proceed to Phase 4 only when every scope is marked done (all have [REVIEW_PASS]).
 
 ---
 
-## Phase 4 — Verify (after implement agents complete)
+## Phase 4 — Verify (after all Phase 3 scopes are done)
 
-Dispatch one `code-review` agent. OR verify directly via bash (read changed files, run tests).
+Dispatch one final `code-review` agent with this mandate:
+- The full Phase 2 plan
+- MISSION_OBJECTIVE.md (always include)
+- All files changed across all Phase 3 scopes
+- Instruction: "Verify that the complete implementation matches all plan requirements and
+  does not contradict the mission objective. Check for integration issues between scopes
+  that individual reviews may have missed. Classify every finding by severity: Critical,
+  High, Medium, Low, or Info. Output [REVIEW_PASS] if there are no Critical or High
+  findings, or [REVIEW_FAIL] followed by findings grouped by severity. Medium, Low,
+  and Info findings are reported but do not block [REVIEW_PASS]."
 
-If the review finds issues: dispatch one `expert_coder` per targeted fix, with the specific correction. Repeat until clean.
+You may also run bash (read files, run tests) to supplement — but bash does not replace this review.
+
+On [REVIEW_FAIL]: dispatch one `expert_coder` per Critical/High gap, then re-review. Medium and below are surfaced to the user but not assigned. Max 5 cycles total.
+After 5 cycles without [REVIEW_PASS]: output [WAITING_FOR_USER] and surface the remaining gaps.
+
+[ORCHESTRATION_DONE] may only be emitted after [REVIEW_PASS] from this phase.
 
 ---
 
@@ -71,3 +121,5 @@ Only emit `[ORCHESTRATION_DONE]` here, after verification is complete. Never emi
 - Agent scopes come from the plan. Do not invent new scopes during implementation.
 - `[ORCHESTRATION_DONE]` only in Phase 5, after verification.
 - If you need the user to make a decision or approve something mid-orchestration, output `[WAITING_FOR_USER]` on its own line before your question. This prevents the system from auto-continuing and gives the user time to respond.
+- Scope reviews in Phase 3 are mandatory. No scope advances to done without [REVIEW_PASS].
+- [ORCHESTRATION_DONE] is gated on [REVIEW_PASS] from Phase 4. Never emit it without one.

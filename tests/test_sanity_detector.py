@@ -1,4 +1,4 @@
-"""Tests for sanity_detector.py — verifies all four failure modes and key false-positive guards."""
+"""Tests for sanity_detector.py — verifies all failure modes and key false-positive guards."""
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -93,7 +93,9 @@ def test_think_mode_d3():
 # ── False-positive guards ─────────────────────────────────────────────────────
 
 def test_section_divider_no_trigger():
-    """Section divider with ~85 ─ chars must NOT trigger D3."""
+    """Section divider with ~85 ─ chars must NOT trigger D3 or D5.
+    D3 needs 150 of the same char. D5 requires ≥2 distinct chars in the pattern,
+    so a run of identical ─ chars is correctly ignored."""
     line = "# ── Imports ───────────────────────────────────────────────────────────────────\n"
     assert len([c for c in line if c == "─"]) < 150, "Test line too long"
     result = _feed_string(line)
@@ -135,6 +137,55 @@ def test_normal_prose_no_trigger():
     ) * 3
     result = _feed_string(prose)
     assert result is None, f"False positive on normal prose: {result}"
+
+# ── D5: character-level cycle ────────────────────────────────────────────────
+
+def test_d5_quote_dash_cycle():
+    """The reported failure: '-'-'-'... slips D3/D4/D1w but D5 catches it."""
+    text = "'-'" * 30  # 2-char pattern "'-" repeating, no spaces
+    result = _feed_string(text)
+    assert result == "D5:char-cycle", f"Expected D5, got: {result}"
+
+def test_d5_brace_cycle():
+    """{}{}{}... — punctuation pair with no spaces."""
+    text = "{}" * 35
+    result = _feed_string(text)
+    assert result == "D5:char-cycle", f"Expected D5, got: {result}"
+
+def test_d5_unicode_emoji_alternation():
+    """Alternating emoji — multi-codepoint, no spaces, slips D3/D4/D1w."""
+    text = "😀😭" * 35
+    result = _feed_string(text)
+    assert result == "D5:char-cycle", f"Expected D5, got: {result}"
+
+def test_d5_xml_angle_cycle():
+    """XML-like degeneracy: ><><><... — 2-char cycle, no spaces."""
+    text = "><" * 35
+    result = _feed_string(text)
+    assert result == "D5:char-cycle", f"Expected D5, got: {result}"
+
+def test_d5_no_fp_short():
+    """A short alternating sequence under the min-length gate must NOT trigger."""
+    text = "'-'" * 10  # 30 chars, below SD_CHAR_CYCLE_MIN_LEN=60
+    result = _feed_string(text)
+    assert result is None, f"False positive on short char cycle: {result}"
+
+def test_d5_no_fp_code_fence():
+    """Triple backtick still must not trigger (already covered but re-verify with D5 live)."""
+    text = "```python\nfor i in range(10):\n    print(i)\n```\n"
+    result = _feed_string(text)
+    assert result is None, f"False positive on code fence with D5 active: {result}"
+
+
+# ── D4 extended: inline phrase > 8 words ─────────────────────────────────────
+
+def test_d4_long_phrase_loop():
+    """9-word repeating inline phrase — previously slipped D4 when phrase_max was 8."""
+    phrase = "the quick brown fox jumps over the lazy dog "  # 9 words
+    text = phrase * 20  # 180 words, well over inline_min_len
+    result = _feed_string(text)
+    assert result == "D4:inline-phrase-loop", f"Expected D4 for 9-word phrase, got: {result}"
+
 
 def test_reset_clears_state():
     """reset() should clear all state so a new turn starts clean."""
