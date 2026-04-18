@@ -2472,7 +2472,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_new_session(self):
         self._file_touch_history.clear()
-        self._adapter.submit_slash("/clear")
+        self._adapter.submit_slash("/new")
 
     @Slot()
     def _on_resume_last(self):
@@ -2863,7 +2863,7 @@ class _SessionListPanel(QWidget):
             "QPushButton { background: #1e1e1e; color: #aaaaaa; border: 1px solid #333; font-size: 10px; padding: 0 6px; border-radius: 3px; }"
             "QPushButton:hover { background: #2a2a2a; color: #ffffff; }"
         )
-        self._new_btn.setToolTip("New session (/clear)")
+        self._new_btn.setToolTip("Save current session and start a new one (/new)")
         self._new_btn.clicked.connect(self.new_requested)
         hdr_layout.addWidget(lbl)
         hdr_layout.addStretch()

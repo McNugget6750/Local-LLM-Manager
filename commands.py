@@ -592,7 +592,8 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
 
     if name == "/help":
         _help_lines = [
-            "[bold]/clear[/bold]                 Reset message history",
+            "[bold]/new[/bold]                   Save current session and start a fresh one",
+            "[bold]/clear[/bold]                 Reset message history (no save)",
             "[bold]/tools[/bold]                 List available tools",
             "[bold]/think \\[off|on|deep\\][/bold]   Set thinking level (or cycle)",
             "[bold]/save \\[path\\][/bold]           Save conversation to JSON",
@@ -664,6 +665,46 @@ async def handle_slash_command(cmd: str, session: ChatSession) -> bool:
         _tasks_path = str(Path(session.cwd) / "TASKS.md")
         await tool_task_list("clear", path=_tasks_path)
         console.print(Rule("[dim]History cleared[/dim]", style="dim"))
+        if session.tui_queue:
+            await session.tui_queue.put({"type": "clear_chat"})
+        return True
+
+    elif name == "/new":
+        # Save current session before wiping, then detach so next autosave
+        # creates a fresh timestamped file (true new session, not a clear).
+        had_conversation = len(session.messages) > session._n_fixed
+        if had_conversation:
+            try:
+                session._autosave()
+                if session._session_path and session.tui_queue:
+                    await session.tui_queue.put({"type": "session_saved", "json_path": str(session._session_path)})
+            except Exception:
+                pass
+        session._session_path = None
+        session._session_name = None
+        # Same cleanup as /clear
+        for _t in list(session._bg_agent_tasks):
+            if not _t.done():
+                _t.cancel()
+        session._bg_agent_tasks.clear()
+        for _t in list(session._bg_process_tasks):
+            if not _t.done():
+                _t.cancel()
+        session._bg_process_tasks.clear()
+        session._auto_turn_count = 0
+        session._auto_trigger.clear()
+        session._pending_bg_results.clear()
+        session._pending_bg_tool_calls.clear()
+        await _ism.force_release_all()
+        _initial, _ = _build_initial_messages()
+        session.messages = _initial
+        session._n_fixed = len(_initial)
+        session.tokens_used = session.tokens_prompt = session.tokens_completion = 0
+        await session._refresh_project_config()
+        from tools import tool_task_list
+        _tasks_path = str(Path(session.cwd) / "TASKS.md")
+        await tool_task_list("clear", path=_tasks_path)
+        console.print(Rule("[dim]New session started[/dim]", style="dim"))
         if session.tui_queue:
             await session.tui_queue.put({"type": "clear_chat"})
         return True

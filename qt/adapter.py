@@ -789,6 +789,10 @@ class QtChatAdapter(QThread):
                     )
                 else:
                     self.usage.emit(int(event.get("slot_index", 0)), int(event.get("tokens", 0)), int(event.get("ctx", 0)))
+            elif etype == "session_saved":
+                path = event.get("json_path", "")
+                if path:
+                    self.session_saved.emit(path)
             elif etype == "clear_chat":
                 self._turn_count = 0
                 self.clear_chat.emit()
